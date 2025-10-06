@@ -13,6 +13,7 @@ import os
 from ..config import logger
 from ..rag.retrieval import retrieve_relevant_chunks_async
 from ..ai.databricks_llm import DatabricksLLMClient
+from ..utils.interaction_logger import log_rag_parameters
 
 
 class RAGContext(BaseModel):
@@ -180,20 +181,32 @@ class RAGRetryTool:
         try:
             # Get optimization recommendations
             analysis = await self.optimization_agent.analyze_and_recommend(context)
-            
+
             logger.info(f"RAG optimization analysis: {analysis.reasoning}")
-            
+            logger.info(f"Recommended weights - BM25: {analysis.recommended_bm25_weight:.2f}, Semantic: {analysis.recommended_semantic_weight:.2f}")
+            logger.info(f"Query type identified: {analysis.query_type}")
+
+            # Log RAG parameters from retry agent
+            log_rag_parameters(
+                sub_prompt_title=f"Retry: {context.query[:50]}...",
+                sub_prompt=context.query,
+                bm25_weight=analysis.recommended_bm25_weight,
+                semantic_weight=analysis.recommended_semantic_weight,
+                reasoning=analysis.reasoning,
+                source="retry_agent"
+            )
+
             # Apply recommended parameters
             optimized_context = context.model_copy()
             optimized_context.bm25_weight = analysis.recommended_bm25_weight
             optimized_context.semantic_weight = analysis.recommended_semantic_weight
             optimized_context.top_k = analysis.recommended_top_k
-            
+
             # Retry RAG with optimized parameters
             new_results = await self._retrieve_with_weights(optimized_context)
-            
-            logger.info(f"RAG retry completed: {len(new_results)} results with optimized parameters")
-            
+
+            logger.info(f"RAG retry completed: {len(new_results)} results with optimized parameters (BM25: {analysis.recommended_bm25_weight:.2f}, Semantic: {analysis.recommended_semantic_weight:.2f})")
+
             return new_results, analysis
             
         except Exception as e:

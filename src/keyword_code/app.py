@@ -62,7 +62,8 @@ from .utils.memory_monitor import (
     monitor_memory_usage, cleanup_memory, get_memory_usage, format_bytes
 )
 from .utils.interaction_logger import (
-    setup_interaction_logging, disable_interaction_logging, INTERACTION_LOGGING_ENABLED
+    setup_interaction_logging, disable_interaction_logging, INTERACTION_LOGGING_ENABLED,
+    log_rag_parameters
 )
 from .utils.spacy_utils import ensure_spacy_model
 from .models.embedding import load_embedding_model, load_reranker_model
@@ -342,10 +343,29 @@ def process_file_wrapper(args):
             sub_prompt = sub_prompt_data["sub_prompt"]
             sub_prompt_title = sub_prompt_data["title"]
 
+            # Extract RAG parameters from decomposition (with defaults if missing)
+            rag_params = sub_prompt_data.get("rag_params", {})
+            bm25_weight = rag_params.get("bm25_weight", 0.5)
+            semantic_weight = rag_params.get("semantic_weight", 0.5)
+            rag_reasoning = rag_params.get("reasoning", "No reasoning provided")
+
             logger.info(f"Retrieving relevant chunks for sub-prompt '{sub_prompt_title}' for {filename}")
+            logger.info(f"Using RAG weights - BM25: {bm25_weight:.2f}, Semantic: {semantic_weight:.2f}")
+            logger.info(f"RAG weight reasoning: {rag_reasoning}")
+
+            # Log RAG parameters to interaction logger
+            log_rag_parameters(
+                sub_prompt_title=sub_prompt_title,
+                sub_prompt=sub_prompt,
+                bm25_weight=bm25_weight,
+                semantic_weight=semantic_weight,
+                reasoning=rag_reasoning,
+                source="decomposition"
+            )
 
             # Use retrieve_relevant_chunks with preprocessed embeddings if available
             # Use local reranker model instead of LLM ranking
+            # Now using optimized weights from decomposition
             if preprocessed_data:
                 relevant_chunks = retrieve_relevant_chunks(
                     prompt=sub_prompt,
@@ -354,7 +374,9 @@ def process_file_wrapper(args):
                     top_k=RAG_TOP_K,
                     precomputed_embeddings=preprocessed_data["chunk_embeddings"],
                     valid_chunk_indices=preprocessed_data["valid_chunk_indices"],
-                    reranker_model=reranker_model  # Use local reranker model
+                    reranker_model=reranker_model,  # Use local reranker model
+                    bm25_weight=bm25_weight,  # Use optimized weight from decomposition
+                    semantic_weight=semantic_weight  # Use optimized weight from decomposition
                 )
             else:
                 relevant_chunks = retrieve_relevant_chunks(
@@ -362,17 +384,20 @@ def process_file_wrapper(args):
                     chunks=chunks,
                     model=embedding_model,
                     top_k=RAG_TOP_K,
-                    reranker_model=reranker_model  # Use local reranker model
+                    reranker_model=reranker_model,  # Use local reranker model
+                    bm25_weight=bm25_weight,  # Use optimized weight from decomposition
+                    semantic_weight=semantic_weight  # Use optimized weight from decomposition
                 )
 
-            # Store sub-prompt data with its relevant chunks
+            # Store sub-prompt data with its relevant chunks and RAG params
             sub_prompts_with_contexts.append({
                 "title": sub_prompt_title,
                 "sub_prompt": sub_prompt,
-                "relevant_chunks": relevant_chunks
+                "relevant_chunks": relevant_chunks,
+                "rag_params": rag_params  # Store for potential retry use
             })
 
-            logger.info(f"Retrieved {len(relevant_chunks)} chunks for sub-prompt '{sub_prompt_title}' in {filename}")
+            logger.info(f"Retrieved {len(relevant_chunks)} chunks for sub-prompt '{sub_prompt_title}' in {filename} using optimized RAG weights")
 
         # Now analyze all sub-prompts in a single LLM call
         logger.info(f"Analyzing all {len(sub_prompts_with_contexts)} sub-prompts together for {filename} using unified context approach")

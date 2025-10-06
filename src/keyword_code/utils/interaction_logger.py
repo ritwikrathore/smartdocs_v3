@@ -82,6 +82,45 @@ def disable_interaction_logging() -> None:
     interaction_logger.info("Interaction logging disabled.")
 
 
+def log_rag_parameters(
+    sub_prompt_title: str,
+    sub_prompt: str,
+    bm25_weight: float,
+    semantic_weight: float,
+    reasoning: str,
+    source: str = "decomposition"
+) -> None:
+    """
+    Log RAG parameter selection for a sub-prompt.
+
+    Args:
+        sub_prompt_title: Title of the sub-prompt
+        sub_prompt: The actual sub-prompt text
+        bm25_weight: BM25 weight used
+        semantic_weight: Semantic weight used
+        reasoning: Reasoning for the weight selection
+        source: Source of the parameters (e.g., "decomposition", "retry_agent", "default")
+    """
+    if not INTERACTION_LOGGING_ENABLED:
+        return
+
+    try:
+        log_entry = {
+            "timestamp": datetime.now().isoformat(),
+            "type": "rag_parameters",
+            "source": source,
+            "sub_prompt_title": sub_prompt_title,
+            "sub_prompt": sub_prompt[:200] + "..." if len(sub_prompt) > 200 else sub_prompt,
+            "bm25_weight": bm25_weight,
+            "semantic_weight": semantic_weight,
+            "reasoning": reasoning
+        }
+
+        interaction_logger.info(f"RAG_PARAMETERS: {json.dumps(log_entry, indent=2)}")
+    except Exception as e:
+        interaction_logger.error(f"Error logging RAG parameters: {e}")
+
+
 def log_bm25_results(prompt: str, results: List[Tuple[int, float]], chunks: List[Dict[str, Any]]) -> None:
     """
     Log BM25 search results.

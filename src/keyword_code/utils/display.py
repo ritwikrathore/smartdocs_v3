@@ -816,7 +816,7 @@ def display_analysis_results(results: List[Dict[str, Any]]):
                             # Create a container for the section title with improved styling and RAG retry button
                             with st.container(border=False):
                                 # Create columns for title and RAG retry button
-                                title_col, rag_col = st.columns([4, 1])
+                                title_col, rag_col = st.columns([0.92, 0.08])
 
                                 with title_col:
                                     st.markdown(f"""
@@ -829,8 +829,10 @@ def display_analysis_results(results: List[Dict[str, Any]]):
                                     """, unsafe_allow_html=True)
 
                                 with rag_col:
+                                    st.markdown('<div style="margin-top: 16px;">', unsafe_allow_html=True)
                                     # Add RAG retry button in the header
                                     display_rag_retry_button_header(section_key, result, section_data)
+                                    st.markdown('</div>', unsafe_allow_html=True)
 
                             # Display RAG analysis and retry results if available (below the header)
                             # Retry results are integrated into the main view; no separate section
@@ -1666,7 +1668,7 @@ def display_rag_retry_button_header(section_key: str, result: Dict[str, Any], se
     # Instead, we'll create buttons directly without columns, stacked vertically
     # Analyze button removed per new agent/tool design
 
-    if st.button("🔄 Retry", key=f"retry_{retry_key}", help="Retry RAG retrieval with optimized parameters", use_container_width=True):
+    if st.button("↻", key=f"retry_{retry_key}", help="Retry Retrieval", use_container_width=True):
         # Store the retry request in session state
         if "rag_retry_requests" not in st.session_state:
             st.session_state.rag_retry_requests = {}

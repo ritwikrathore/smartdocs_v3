@@ -283,6 +283,7 @@ async def retrieve_relevant_chunks_async(
 
     try:
         # --- Run BM25 and Semantic Search in parallel ---
+        logger.info(f"RAG: Running hybrid search with weights - BM25: {bm25_weight:.2f}, Semantic: {semantic_weight:.2f}")
         logger.info("RAG: Running BM25 and semantic search in parallel...")
 
         # Define tasks to run in parallel
