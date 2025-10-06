@@ -14,10 +14,16 @@ import streamlit as st
 import pandas as pd
 import json
 import requests
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 from dotenv import load_dotenv
 from pathlib import Path
-from ..config import logger, USE_DATABRICKS_RERANKER, RERANKER_MAX_TOKENS
+from ..config import (
+    logger,
+    USE_DATABRICKS_RERANKER,
+    RERANKER_MAX_TOKENS,
+    RERANKER_API_TIMEOUT,
+    ENABLE_LLM_RERANKER_FALLBACK
+)
 from transformers import AutoTokenizer
 
 # Databricks endpoint URL
@@ -211,12 +217,13 @@ class DatabricksRerankerModel:
                 'Content-Type': 'application/json'
             }
 
-            # Make the API call
+            # Make the API call with timeout
             logger.info(f"Calling Databricks reranker API with {len(sentence_pairs)} pairs")
             response = requests.post(
                 url=self.endpoint_url,
                 headers=headers,
-                data=data_json
+                data=data_json,
+                timeout=RERANKER_API_TIMEOUT
             )
 
             # Check for errors
@@ -264,15 +271,21 @@ class DatabricksRerankerModel:
                 logger.error(f"Unexpected response format. 'predictions' key not found. Keys: {list(result.keys())}")
                 return np.zeros(len(sentence_pairs))
 
+        except requests.exceptions.Timeout:
+            logger.error(f"Databricks reranker API timeout after {RERANKER_API_TIMEOUT} seconds")
+            return np.zeros(len(sentence_pairs))
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Databricks reranker API request error: {e}")
+            return np.zeros(len(sentence_pairs))
         except Exception as e:
             logger.error(f"Error in Databricks reranker prediction: {e}")
             return np.zeros(len(sentence_pairs))
 
 
 @st.cache_resource
-def load_databricks_reranker_model():
+def load_databricks_reranker_model() -> Optional[object]:
     """
-    Loads and caches the Databricks reranker model.
+    Loads and caches the Databricks reranker model with timeout and fallback support.
 
     The model has a maximum context window of 512 tokens, so inputs will be
     automatically truncated if they exceed this limit. The truncation is done
@@ -280,24 +293,36 @@ def load_databricks_reranker_model():
     count tokens and ensure the combined length of query and document doesn't
     exceed the model's maximum token length.
 
+    If the Databricks reranker API fails at startup (timeout, 403 error, etc.),
+    this function will automatically fall back to the LLM-based reranker.
+
     Returns:
-        DatabricksRerankerModel instance or None if initialization fails
+        DatabricksRerankerModel or LLMRerankerModel instance, or None if both fail
     """
     try:
         logger.info(f"Loading Databricks reranker model: {DATABRICKS_RERANKER_MODEL_NAME}")
         logger.info(f"Using max token length: {RERANKER_MAX_TOKENS}")
+        logger.info(f"API timeout set to: {RERANKER_API_TIMEOUT} seconds")
+
         model = DatabricksRerankerModel()  # Uses RERANKER_MAX_TOKENS from config
 
         # Test the model with a simple input to verify API connection
+        # This test will timeout after RERANKER_API_TIMEOUT seconds
         test_pairs = [["How many people live in Berlin?", "Berlin has a population of 3,520,031 registered inhabitants in an area of 891.82 square kilometers."]]
 
         try:
+            logger.info("Testing Databricks reranker API connection...")
             test_scores = model.predict(test_pairs)
 
             if isinstance(test_scores, np.ndarray) and test_scores.shape[0] > 0:
+                # Check if we got a zero score (which indicates an API error)
+                if test_scores[0] == 0.0:
+                    logger.warning("Databricks reranker returned zero score, likely due to API error")
+                    raise ValueError("Databricks reranker API returned error response")
+
                 # Check if the score is a reasonable value (should be between 0 and 1)
                 if 0 <= test_scores[0] <= 1:
-                    logger.info(f"Databricks reranker model loaded successfully with score: {test_scores[0]:.4f}")
+                    logger.info(f"✓ Databricks reranker model loaded successfully with score: {test_scores[0]:.4f}")
                     return model
                 else:
                     logger.warning(f"Databricks reranker returned an unusual score: {test_scores[0]}")
@@ -305,10 +330,41 @@ def load_databricks_reranker_model():
                     return model
             else:
                 logger.error(f"Databricks reranker model test failed: Invalid score format: {type(test_scores)}")
-                return None
+                raise ValueError("Invalid score format from Databricks reranker")
+
+        except requests.exceptions.Timeout:
+            logger.error(f"✗ Databricks reranker API timeout after {RERANKER_API_TIMEOUT} seconds at startup")
+            raise
+        except requests.exceptions.RequestException as e:
+            logger.error(f"✗ Databricks reranker API request error at startup: {e}")
+            raise
         except Exception as e:
-            logger.error(f"Databricks reranker model test failed with error: {e}")
-            return None
+            logger.error(f"✗ Databricks reranker model test failed with error: {e}")
+            raise
+
     except Exception as e:
-        logger.error(f"Error loading Databricks reranker model: {e}")
-        return None
+        logger.error(f"Failed to load Databricks reranker model: {e}")
+
+        # Check if fallback is enabled
+        if not ENABLE_LLM_RERANKER_FALLBACK:
+            logger.warning("LLM-based fallback reranker is disabled in configuration")
+            logger.info("Set ENABLE_LLM_RERANKER_FALLBACK=True in config.py to enable fallback")
+            return None
+
+        logger.warning("Attempting to load LLM-based fallback reranker...")
+
+        # Try to load the LLM-based fallback reranker
+        try:
+            from .llm_reranker import load_llm_reranker_model
+            fallback_model = load_llm_reranker_model()
+
+            if fallback_model:
+                logger.info("✓ Successfully loaded LLM-based fallback reranker")
+                return fallback_model
+            else:
+                logger.error("✗ Failed to load LLM-based fallback reranker")
+                return None
+
+        except Exception as fallback_error:
+            logger.error(f"✗ Error loading LLM-based fallback reranker: {fallback_error}")
+            return None

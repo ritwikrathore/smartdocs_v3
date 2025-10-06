@@ -96,7 +96,8 @@ class PDFProcessor:
 
                     # Normalize block text: replace multiple spaces/newlines with a single space, then strip.
                     # This helps create a cleaner text string for spaCy and for char mapping.
-                    block_text_cleaned = re.sub(r'\\s+', ' ', block_text_original).strip()
+                    # Fixed: Use \s instead of \\s for proper regex matching
+                    block_text_cleaned = re.sub(r'\s+', ' ', block_text_original).strip()
 
                     if not block_text_cleaned:
                         continue
@@ -134,13 +135,35 @@ class PDFProcessor:
                     chunk_text = chunk["text"]
 
                     # Find the sentences that make up this chunk
+                    # Improved: Use more robust matching with normalized text comparison
                     chunk_sentences = []
+                    chunk_text_normalized = chunk_text.strip()
+
                     for i in range(0, len(page_sentences)):
-                        if chunk_text.startswith(page_sentences[i].text):
+                        # Try exact match first
+                        if chunk_text_normalized.startswith(page_sentences[i].text.strip()):
                             # Found the first sentence of the chunk
                             end_idx = min(i + SENTENCES_PER_CHUNK, len(page_sentences))
                             chunk_sentences = page_sentences[i:end_idx]
                             break
+
+                    # Fallback: If no match found, try fuzzy matching on first 50 chars
+                    if not chunk_sentences and page_sentences:
+                        from fuzzywuzzy import fuzz
+                        chunk_start = chunk_text_normalized[:50]
+                        best_match_idx = -1
+                        best_score = 0
+                        for i in range(0, len(page_sentences)):
+                            sent_start = page_sentences[i].text.strip()[:50]
+                            score = fuzz.ratio(chunk_start, sent_start)
+                            if score > best_score and score > 80:  # 80% similarity threshold
+                                best_score = score
+                                best_match_idx = i
+
+                        if best_match_idx >= 0:
+                            end_idx = min(best_match_idx + SENTENCES_PER_CHUNK, len(page_sentences))
+                            chunk_sentences = page_sentences[best_match_idx:end_idx]
+                            logger.debug(f"Used fuzzy matching (score: {best_score}) to find sentences for chunk {chunk.get('chunk_id', 'unknown')}")
 
                     # Determine bounding boxes for this sentence-based chunk
                     chunk_associated_bboxes: List[fitz.Rect] = []
@@ -161,15 +184,17 @@ class PDFProcessor:
                                 overlap_length = overlap_end - overlap_start
                                 block_length = block_map_end - block_map_start
 
-                                # Only include blocks with significant overlap (>10% of block length)
-                                if overlap_length > 0.1 * block_length:
+                                # Improved: Lower threshold from 10% to 5% to capture more relevant blocks
+                                # This helps with chunks that span multiple small blocks
+                                if overlap_length > 0.05 * block_length:
                                     overlapping_blocks.append((block_bbox, overlap_length))
 
-                        # Sort blocks by overlap length (descending) and take top 3 at most
-                        # This prevents extremely large fallback highlighting areas
+                        # Improved: Increase from top 3 to top 5 blocks to capture more complete text areas
+                        # This helps with multi-line chunks and complex layouts
                         if overlapping_blocks:
                             overlapping_blocks.sort(key=lambda x: x[1], reverse=True)
-                            for block_bbox, _ in overlapping_blocks[:3]:  # Limit to top 3 blocks
+                            max_blocks = min(5, len(overlapping_blocks))  # Take up to 5 blocks
+                            for block_bbox, _ in overlapping_blocks[:max_blocks]:
                                 chunk_associated_bboxes.append(block_bbox)
 
                         if not chunk_associated_bboxes and char_pos_to_bbox_map:
@@ -180,10 +205,15 @@ class PDFProcessor:
                             for block_map_start, block_map_end, block_bbox in char_pos_to_bbox_map:
                                 if block_map_start <= first_sent_start_char < block_map_end:
                                     chunk_associated_bboxes.append(block_bbox)
+                                    logger.debug(f"Used fallback bbox matching for chunk {chunk.get('chunk_id', 'unknown')}")
                                     break # Found one, that's enough for this fallback
 
                     # Add bounding boxes to the chunk
                     chunk["bboxes"] = chunk_associated_bboxes
+
+                    # Log warning if no bboxes found for this chunk
+                    if not chunk_associated_bboxes:
+                        logger.warning(f"No bounding boxes found for chunk {chunk.get('chunk_id', 'unknown')} on page {page_num}. Highlighting may fail for this chunk.")
 
                     # Add to our chunks list
                     self._chunks.append(chunk)

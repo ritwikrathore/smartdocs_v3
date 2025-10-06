@@ -63,6 +63,8 @@ USE_DATABRICKS_RERANKER = True  # Use Databricks for reranking
 # The Databricks reranker model has a maximum context window of 512 tokens
 # Inputs longer than this will be automatically truncated
 RERANKER_MAX_TOKENS = 512  # Maximum token length for the reranker model
+RERANKER_API_TIMEOUT = 60  # Timeout in seconds for reranker API calls at startup
+ENABLE_LLM_RERANKER_FALLBACK = True  # Enable automatic fallback to LLM-based reranker on API failure
 
 # --- LLM Configuration ---
 # Using Databricks LLM

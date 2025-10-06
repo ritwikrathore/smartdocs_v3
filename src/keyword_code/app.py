@@ -95,7 +95,12 @@ except Exception as e:
 
 # Load the embedding model using the cached function
 embedding_model = load_embedding_model()
+
 # Load the reranker model (shared)
+# Note: This will attempt to load the Databricks reranker API first (with 60s timeout).
+# If the API is unavailable (403 error, timeout, etc.), it will automatically fall back
+# to an LLM-based reranker that provides the same functionality.
+# See docs/RERANKER_FALLBACK.md for details.
 reranker_model = load_reranker_model()
 
 # Check for incompatible embeddings in session state after model loading
@@ -481,33 +486,10 @@ def process_file_wrapper(args):
         aggregated_ai_analysis_json_str = json.dumps(aggregated_analysis, indent=2)
         logger.info(f"Aggregated analysis results for {filename}")
 
-        # --- Step 4.5: Extract Facts using Pydantic-AI Fact Extraction ---
+        # --- Step 4.5: Fact Extraction ---
+        # Note: Fact extraction is now only performed on-demand when the user clicks "Generate Facts"
+        # This improves performance by not running extraction during the main query processing
         extracted_facts = None
-        try:
-            from .services.fact_extraction_service import FactExtractionService
-
-            logger.info(f"Starting fact extraction for {filename}")
-            fact_service = FactExtractionService()
-
-            # Convert sub-prompt results to the format expected by fact extractor
-            analyses_for_extraction = []
-            for result in all_sub_prompt_results:
-                try:
-                    sub_analysis = json.loads(result["analysis_json"])
-                    analyses_for_extraction.append(sub_analysis)
-                except Exception as e:
-                    logger.warning(f"Could not parse analysis for fact extraction: {e}")
-                    continue
-
-            if analyses_for_extraction:
-                extracted_facts = fact_service.extract_facts_from_multiple_analyses(analyses_for_extraction)
-                logger.info(f"Successfully extracted facts from {len(extracted_facts)} analyses")
-            else:
-                logger.warning("No valid analyses found for fact extraction")
-
-        except Exception as fact_err:
-            logger.error(f"Error during fact extraction for {filename}: {fact_err}", exc_info=True)
-            extracted_facts = None
 
         # --- Step 5: Verification & Annotation (on aggregated results) ---
         # If we have a status_container from the main thread, update it

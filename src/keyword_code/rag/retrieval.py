@@ -221,18 +221,17 @@ async def rerank_results(
         reranked_pairs = list(zip(combined_indices, rerank_scores))
         reranked_pairs.sort(key=lambda x: x[1], reverse=True)
 
-        # Format results
+        # Format results - IMPORTANT: Preserve ALL chunk data including bboxes for highlighting
         results = []
         for i in range(min(top_k, len(reranked_pairs))):
             chunk_index, score = reranked_pairs[i]
             chunk = chunks[chunk_index]
-            results.append({
-                "text": chunk.get("text", ""),
-                "page_num": chunk.get("page_num", -1),
-                "score": float(score),
-                "chunk_id": chunk.get("chunk_id", f"unknown_{chunk_index}"),
-                "retrieval_method": "hybrid"
-            })
+            # Create a copy of the original chunk to preserve all fields (especially bboxes)
+            result_chunk = chunk.copy()
+            # Update with reranking score and method
+            result_chunk["score"] = float(score)
+            result_chunk["retrieval_method"] = "hybrid"
+            results.append(result_chunk)
 
         # Log reranker results
         log_reranker_results(prompt, results)
@@ -347,6 +346,7 @@ async def retrieve_relevant_chunks_async(
             logger.warning("RAG: Reranker not available, using combined scores without reranking.")
 
             # Format results without reranking, using normalized scores
+            # IMPORTANT: Preserve ALL chunk data including bboxes for highlighting
             results = []
             for chunk_index in combined_indices[:final_top_k]:
                 chunk = chunks[chunk_index]
@@ -363,13 +363,12 @@ async def retrieve_relevant_chunks_async(
                 else:
                     score = semantic_score * semantic_weight
 
-                results.append({
-                    "text": chunk.get("text", ""),
-                    "page_num": chunk.get("page_num", -1),
-                    "score": score,
-                    "chunk_id": chunk.get("chunk_id", f"unknown_{chunk_index}"),
-                    "retrieval_method": "hybrid_no_rerank"
-                })
+                # Create a copy of the original chunk to preserve all fields (especially bboxes)
+                result_chunk = chunk.copy()
+                # Update with computed score and method
+                result_chunk["score"] = score
+                result_chunk["retrieval_method"] = "hybrid_no_rerank"
+                results.append(result_chunk)
 
             # Sort results by score
             results.sort(key=lambda x: x["score"], reverse=True)

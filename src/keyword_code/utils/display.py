@@ -26,6 +26,8 @@ from ..utils.async_utils import run_async
 from ..ai.analyzer import DocumentAnalyzer # Import DocumentAnalyzer
 from ..ai.chat import generate_chat_response
 
+from ..processors.pdf_processor import PDFProcessor
+
 # Load the embedding model using the cached function
 embedding_model = load_embedding_model()
 reranker_model = load_reranker_model()
@@ -70,6 +72,113 @@ def find_annotated_pdf_for_filename(filename: str) -> Optional[bytes]:
                 return None
     logger.warning(f"Could not find annotated PDF data for {filename} in session state analysis_results.")
     return None
+
+def regenerate_annotated_pdfs_from_chat_chunks(relevant_chunks: List[Dict[str, Any]]):
+    """Regenerate annotated PDFs based on chat/follow-up RAG chunks so highlights stay current.
+
+    For each filename present in relevant_chunks, this finds the original PDF bytes
+    and chunk metadata (including bboxes) from session_state.preprocessed_data,
+    builds a minimal phrase_locations structure using the union bbox of each retrieved
+    chunk, and regenerates the annotated PDF via PDFProcessor.add_annotations.
+    """
+    try:
+        if not relevant_chunks:
+            return
+
+        # Group retrieved chunks by filename
+        chunks_by_file: Dict[str, List[Dict[str, Any]]] = {}
+        for rc in relevant_chunks:
+            fname = rc.get("filename")
+            if not fname:
+                continue
+            chunks_by_file.setdefault(fname, []).append(rc)
+
+        pre = st.session_state.get("preprocessed_data", {}) or {}
+
+        for filename, file_chunks in chunks_by_file.items():
+            pre_doc = pre.get(filename, {}) or {}
+            orig_bytes = pre_doc.get("original_bytes")
+            if not orig_bytes:
+                logger.warning(f"Original PDF bytes not found for {filename}; skipping re-annotation.")
+                continue
+
+            # Map chunk_id -> chunk metadata to access page_num and bboxes
+            meta_chunks: List[Dict[str, Any]] = pre_doc.get("chunks", []) or []
+            by_id: Dict[Any, Dict[str, Any]] = {c.get("chunk_id"): c for c in meta_chunks if isinstance(c, dict)}
+
+            # Build locations from the union of bboxes per relevant chunk
+            locations: List[Dict[str, Any]] = []
+            for rc in file_chunks:
+                cid = rc.get("chunk_id")
+                cmeta = by_id.get(cid)
+                if not cmeta:
+                    # Fallback attempt: match by text if chunk_id missing
+                    ctext = rc.get("text")
+                    if ctext:
+                        cmeta = next((m for m in meta_chunks if m.get("text") == ctext), None)
+                if not cmeta:
+                    continue
+
+                try:
+                    rect = fitz.Rect()
+                    for bbox in (cmeta.get("bboxes") or []):
+                        try:
+                            if isinstance(bbox, fitz.Rect):
+                                rect.include_rect(bbox)
+                            elif isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+                                rect.include_rect(fitz.Rect(bbox))
+                        except Exception:
+                            continue
+                    if rect.is_empty:
+                        # If no bbox, skip this chunk (nothing to highlight)
+                        continue
+
+                    page_num = cmeta.get("page_num", rc.get("page_num"))
+                    locations.append({
+                        "page_num": page_num,
+                        "rect": [rect.x0, rect.y0, rect.x1, rect.y1],
+                        "chunk_id": cid,
+                        "match_score": rc.get("score"),
+                        "method": "chat_rag",
+                        "phrase_text": (rc.get("text") or "RAG Chunk")[:120],
+                    })
+                except Exception as loc_err:
+                    logger.warning(f"Skipping location build for {filename} chunk {cid}: {loc_err}")
+
+            if not locations:
+                logger.info(f"No highlightable locations for {filename} from chat RAG; keeping existing annotations.")
+                continue
+
+            phrase_locations = {"[Chat RAG]": locations}
+            try:
+                processor = PDFProcessor(orig_bytes)
+                annotated_bytes = processor.add_annotations(phrase_locations)
+            except Exception as ann_err:
+                logger.error(f"Annotation regeneration failed for {filename}: {ann_err}")
+                continue
+
+            # Persist back into analysis_results for this filename
+            updated_b64 = base64.b64encode(annotated_bytes).decode("utf-8")
+            found = False
+            for res in st.session_state.get("analysis_results", []):
+                if isinstance(res, dict) and res.get("filename") == filename:
+                    res["annotated_pdf"] = updated_b64
+                    found = True
+                    break
+            if not found:
+                # If result entry doesn't exist, append a minimal one
+                st.session_state.setdefault("analysis_results", []).append({
+                    "filename": filename,
+                    "annotated_pdf": updated_b64,
+                })
+
+            # If currently viewing this PDF, update the live viewer bytes
+            if st.session_state.get("current_pdf_name") == filename and st.session_state.get("show_pdf"):
+                st.session_state.pdf_bytes = annotated_bytes
+
+            logger.info(f"Regenerated annotated PDF for {filename} based on chat RAG results ({len(locations)} highlights).")
+    except Exception as e:
+        logger.error(f"Error during chat-based PDF re-annotation: {e}")
 
 def process_chat_response_for_numbered_citations(raw_response_text: str) -> Tuple[str, List[Dict[str, Any]]]:
     """
@@ -740,7 +849,7 @@ def display_analysis_results(results: List[Dict[str, Any]]):
         st.markdown('<hr style="margin: 12px 0; border: 0; border-top: 1px solid #e0e0e0;">', unsafe_allow_html=True)
 
         # Create a scrollable container for the analysis
-        with st.container(height=1220, border=True):
+        with st.container(height=1300, border=True):
             # Process results to extract only those with real analysis
             results_with_real_analysis = []
             for result in results:
@@ -900,7 +1009,13 @@ def display_analysis_results(results: List[Dict[str, Any]]):
                                             current_score_info = f"{float(score_val):.1f}" if score_val is not None else "N/A"
                                         except Exception:
                                             current_score_info = str(score_val) if score_val is not None else "N/A"
-                                        current_page_num_info = f"Page {page}"
+                                        # Convert from 0-based to 1-based page numbering for display
+                                        if isinstance(page, int):
+                                            current_page_num_info = f"Page {page + 1}"
+                                            logger.debug(f"RAG Citation {citation_counter}: chunk page_num={page} (0-based), displaying as {page + 1} (1-based)")
+                                        else:
+                                            current_page_num_info = f"Page {page}" if page != 'Unknown' else "Page Unknown"
+                                            logger.debug(f"RAG Citation {citation_counter}: page={page} (non-integer)")
 
                                         # Always mark optimized citations as verified (they come from RAG)
                                         badge_html = '<span style="display: inline-block; background-color: #d1fecf; color: #11631a; padding: 1px 6px; border-radius: 0.25rem; font-size: 0.8em; margin-left: 5px; border: 1px solid #a1e0a3; font-weight: 600;">✔ Verified</span>'
@@ -922,9 +1037,11 @@ def display_analysis_results(results: List[Dict[str, Any]]):
                                             filename_for_go = filename
                                             pdf_bytes_for_view = find_annotated_pdf_for_filename(filename_for_go)
                                             if pdf_bytes_for_view and isinstance(page, int):
+                                                # Convert from 0-based to 1-based page numbering
+                                                page_1_based = page + 1
                                                 button_key = f"goto_{i}_{section_key}_{citation_counter}_{j}"
-                                                if st.button("Go", key=button_key, type="secondary", help=f"Go to Page {page} in {filename_for_go}", use_container_width=True):
-                                                    update_pdf_view(pdf_bytes=pdf_bytes_for_view, page_num=page, filename=filename_for_go)
+                                                if st.button("Go", key=button_key, type="secondary", help=f"Go to Page {page_1_based} in {filename_for_go}", use_container_width=True):
+                                                    update_pdf_view(pdf_bytes=pdf_bytes_for_view, page_num=page_1_based, filename=filename_for_go)
                                                     st.session_state.scroll_to_pdf_viewer = True
                                                     st.rerun()
                                             else:
@@ -960,40 +1077,58 @@ def display_analysis_results(results: List[Dict[str, Any]]):
                                             current_page_num_info = "Page unknown"
                                             current_score_info = "N/A"
 
-                                            if isinstance(phrase_location_data, list) and phrase_location_data:
-                                                first_loc = phrase_location_data[0]
-                                                if isinstance(first_loc, dict):
-                                                    page_num_val = first_loc.get("page_num")
-                                                    if isinstance(page_num_val, int):
-                                                        current_page_num_info = f"Page {page_num_val + 1}"
-                                                    else:
-                                                        current_page_num_info = f"Page {page_num_val}" if page_num_val is not None else "Page unknown"
-
-                                                    score_val = first_loc.get("match_score", score)
-                                                    if score_val:
-                                                        try: current_score_info = f"{float(score_val):.1f}"
-                                                        except: current_score_info = str(score_val)
-                                                    else:
-                                                        if score:
-                                                            try: current_score_info = f"{float(score):.1f}"
-                                                            except: current_score_info = str(score)
-                                                best_location_dict = first_loc
+                                            # Choose the best location instead of taking the first one
+                                            best_location_dict = {}
+                                            candidate_locs = []
+                                            if isinstance(phrase_location_data, list):
+                                                candidate_locs = [loc for loc in phrase_location_data if isinstance(loc, dict)]
                                             elif isinstance(phrase_location_data, dict):
-                                                page_num_val = phrase_location_data.get("page_num")
+                                                # Some pipelines might store a single dict or include a 'best_match'
+                                                if 'best_match' in phrase_location_data and isinstance(phrase_location_data['best_match'], dict):
+                                                    candidate_locs = [phrase_location_data['best_match']]
+                                                else:
+                                                    candidate_locs = [phrase_location_data]
+
+                                            if candidate_locs:
+                                                # Prefer exact > fuzzy > individual fallback > fallback; then by highest score
+                                                method_priority = {
+                                                    'exact': 3,
+                                                    'fuzzy': 2,
+                                                    'fuzzy_chunk_fallback_individual': 1,
+                                                    'fuzzy_chunk_fallback': 0
+                                                }
+                                                def loc_key(loc):
+                                                    method = loc.get('method', '')
+                                                    score_val = loc.get('match_score', 0) or 0
+                                                    try:
+                                                        score_val = float(score_val)
+                                                    except Exception:
+                                                        score_val = 0.0
+                                                    return (method_priority.get(method, -1), score_val)
+
+                                                best_location_dict = max(candidate_locs, key=loc_key)
+                                                page_num_val = best_location_dict.get("page_num")
                                                 if isinstance(page_num_val, int):
                                                     current_page_num_info = f"Page {page_num_val + 1}"
                                                 else:
                                                     current_page_num_info = f"Page {page_num_val}" if page_num_val is not None else "Page unknown"
 
-                                                score_val = phrase_location_data.get("match_score", score)
+                                                score_val = best_location_dict.get("match_score", score)
                                                 if score_val:
-                                                    try: current_score_info = f"{float(score_val):.1f}"
-                                                    except: current_score_info = str(score_val)
+                                                    try:
+                                                        current_score_info = f"{float(score_val):.1f}"
+                                                    except Exception:
+                                                        current_score_info = str(score_val)
                                                 else:
                                                     if score:
-                                                        try: current_score_info = f"{float(score):.1f}"
-                                                        except: current_score_info = str(score)
-                                                best_location_dict = phrase_location_data.get("best_match", phrase_location_data)
+                                                        try:
+                                                            current_score_info = f"{float(score):.1f}"
+                                                        except Exception:
+                                                            current_score_info = str(score)
+
+                                                logger.debug(f"Selected best location out of {len(candidate_locs)} candidates for phrase '{phrase[:50]}...': page={page_num_val}")
+                                            else:
+                                                logger.debug(f"No candidate locations available for phrase '{phrase[:50]}...' to determine page")
 
                                             if is_verified:
                                                 badge_html = '<span style="display: inline-block; background-color: #d1fecf; color: #11631a; padding: 1px 6px; border-radius: 0.25rem; font-size: 0.8em; margin-left: 5px; border: 1px solid #a1e0a3; font-weight: 600;">✔ Verified</span>'
@@ -1117,6 +1252,12 @@ def display_analysis_results(results: List[Dict[str, Any]]):
                         # Process response for citations
                         processed_text, citation_details = process_chat_response_for_numbered_citations(raw_response)
 
+                        # Refresh PDF highlighting to reflect the new RAG chunks
+                        try:
+                            regenerate_annotated_pdfs_from_chat_chunks(relevant_chunks)
+                        except Exception as _e:
+                            logger.warning(f"Could not refresh PDF highlights for follow-up: {_e}")
+
                         # Store the Q&A pair
                         qa_pair = {
                             "question": followup_question,
@@ -1199,6 +1340,13 @@ def display_analysis_results(results: List[Dict[str, Any]]):
                                 )
                                 logger.info("Chat response generated.")
                                 processed_chat_text, chat_citation_details = process_chat_response_for_numbered_citations(raw_ai_response_content)
+
+                                # Refresh PDF highlighting to reflect the new RAG chunks
+                                try:
+                                    regenerate_annotated_pdfs_from_chat_chunks(relevant_chunks)
+                                except Exception as _e:
+                                    logger.warning(f"Could not refresh PDF highlights for chat: {_e}")
+
                         except Exception as chat_err:
                             logger.error(f"Error during chat processing: {chat_err}", exc_info=True)
                             processed_chat_text = f"Sorry, an error occurred while processing your request: {str(chat_err)}"
@@ -1364,9 +1512,9 @@ def display_analysis_results(results: List[Dict[str, Any]]):
 
             # Fact Extraction (beta) Expander
             with st.expander("🧪 Fact Extraction (beta)", expanded=False):
-                st.caption("Uses custom LLM-based extraction with Pydantic-AI to intelligently identify fact types and extract structured information from analysis text.")
+                st.caption("Uses custom LLM-based extraction to intelligently identify fact types and extract structured information from analysis text.")
 
-                if st.button("🧠 Generate Facts", key="compute_fact_definitions_beta"):
+                if st.button("Generate Facts", key="compute_fact_definitions_beta"):
                     with st.spinner("Extracting facts using LLM-based analysis..."):
                         try:
                             from src.keyword_code.services.fact_extraction_service import FactExtractionService
@@ -1377,10 +1525,6 @@ def display_analysis_results(results: List[Dict[str, Any]]):
                             # Show progress and debug info
                             st.info(f"Processing {len(results_with_real_analysis)} document(s)...")
 
-                            # Debug: Check API key
-                            import os
-                            has_api_key = bool(os.environ.get('DATABRICKS_API_KEY'))
-                            st.info(f"DATABRICKS_API_KEY present: {has_api_key}")
 
                             # Debug: Show what sections we're processing
                             total_sections = 0
@@ -1399,15 +1543,14 @@ def display_analysis_results(results: List[Dict[str, Any]]):
                                 df_two.to_excel(buf, index=False, engine="openpyxl")
                                 buf.seek(0)
                                 st.session_state["facts_defs_excel"] = buf.getvalue()
-                                st.session_state["facts_defs_json"] = json.dumps([
-                                    {"Fact": r.get("Fact",""), "Definition": r.get("Definition","")}
-                                    for r in rows
-                                ], ensure_ascii=False, indent=2).encode("utf-8")
                                 st.success(f"✅ Extracted {len(rows)} facts using intelligent LLM-based analysis.")
 
                                 # Show a preview
                                 st.subheader("Preview (first 10 facts)")
-                                preview_df = pd.DataFrame(rows[:10])
+                                preview_df = pd.DataFrame([
+                                    {"Fact": r.get("Fact", ""), "Definition": r.get("Definition", "")}
+                                    for r in rows[:10]
+                                ])
                                 st.dataframe(preview_df, use_container_width=True)
 
                             else:
@@ -1428,13 +1571,6 @@ def display_analysis_results(results: List[Dict[str, Any]]):
                         file_name=f"fact_definitions_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         key="download_fact_defs_excel"
-                    )
-                    st.download_button(
-                        label="📥 Export Fact Definitions (JSON)",
-                        data=st.session_state.get("facts_defs_json"),
-                        file_name=f"fact_definitions_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-                        mime="application/json",
-                        key="download_fact_defs_json"
                     )
 
             # Report Issue Expander
@@ -1723,7 +1859,13 @@ def display_rag_results_section(section_key: str):
             if new_results:
                 for i, chunk in enumerate(new_results[:3]):  # Show top 3 results
                     st.markdown(f"**Result {i+1}** (Score: {chunk.get('score', 0):.3f})")
-                    st.markdown(f"*Page {chunk.get('page_num', 'Unknown')}*")
+                    # Convert from 0-based to 1-based page numbering for display
+                    page_num = chunk.get('page_num', 'Unknown')
+                    if isinstance(page_num, int):
+                        page_display = page_num + 1
+                    else:
+                        page_display = page_num
+                    st.markdown(f"*Page {page_display}*")
                     st.markdown(chunk.get('text', '')[:200] + '...')
                     st.markdown("---")
             else:
