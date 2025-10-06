@@ -1,0 +1,17 @@
+numpy==2.2.5
+openai==1.78.1
+pandas==2.2.3
+pdfplumber==0.11.6
+psutil==7.0.0
+python-dotenv==1.1.0
+python_docx==1.1.2
+pymupdf==1.26.1
+rank_bm25==0.2.2
+requests==2.31.0
+setuptools==78.1.0
+spacy==3.8.5
+streamlit==1.44.0
+streamlit_pills==0.3.0
+thefuzz==0.22.1
+openpyxl==3.1.5
+transformers==4.50.3
