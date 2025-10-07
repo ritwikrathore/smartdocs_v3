@@ -200,24 +200,3 @@ These systems ensure that the application:
 2. Manages its memory footprint efficiently
 3. Doesn't interfere with the host application's resources
 4. Can run for extended periods without degradation
-
-### Chunking Test Framework (Not part of PROD)
-
-The `chunking_test` directory contains a framework for testing different document chunking strategies specifically designed for legal documents. This is particularly useful for improving retrieval of short, important phrases like definitions.
-
-Features:
-- Tests 6 different chunking strategies (fixed-size, sentence-based, recursive, semantic, hybrid, rolling window)
-- Evaluates how well each strategy preserves important legal definitions
-- Includes a hybrid approach that applies different chunking rules to different document sections
-
-To use:
-1. Place your legal document in `chunking_test/test_file/` or run streamlit app
-2. Run `cd chunking_test && python chunking_test.py`
-3. Check results in the `chunking_test/results/` directory
-
-The hybrid chunking approach is particularly effective for legal documents as it uses:
-- Single-sentence chunks for definition sections
-- 2-3 sentence chunks for articles and operational text
-- Larger chunks for narrative or background sections
-
-See `chunking_test/README.md` for more details.

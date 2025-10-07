@@ -15,3 +15,4 @@ streamlit_pills==0.3.0
 thefuzz==0.22.1
 openpyxl==3.1.5
 transformers==4.50.3
+pydantic-ai==1.0.6

@@ -307,32 +307,9 @@ def process_rag_requests(results: list[dict[str, any]]) -> tuple[list[dict[str, 
                             except Exception as ver_err:
                                 logger.error(f"Verification error for retried section {section_key}: {ver_err}")
 
-                            # Fact extraction from the retried analysis text
+                            # Fact extraction is now only performed on-demand when user clicks "Generate Facts"
+                            # This improves performance by not running extraction during RAG retry
                             extracted_facts = None
-                            try:
-                                if ai_section and ai_section.get("Analysis"):
-                                    fact_service = FactExtractionService()
-                                    extraction_result = fact_service.extract_facts(
-                                        query=derived_sub_prompt,
-                                        analysis_text=ai_section["Analysis"],
-                                        context=f"Section: {section_key} in {filename}"
-                                    )
-                                    # Convert to old format for compatibility
-                                    extracted_facts = {
-                                        "sub_prompt": derived_sub_prompt,
-                                        "original_analysis": ai_section["Analysis"],
-                                        "extracted_facts": [
-                                            {
-                                                "category": fact.fact_type.value,
-                                                "text": fact.fact_name,
-                                                "attributes": {"fact": fact.fact_name, "definition": fact.fact_value, **fact.metadata}
-                                            }
-                                            for fact in extraction_result.extracted_facts
-                                        ],
-                                        "extraction_metadata": extraction_result.extraction_metadata
-                                    }
-                            except Exception as fe_err:
-                                logger.error(f"Fact extraction error for retried section {section_key}: {fe_err}")
 
                             # Save augmented results under rag_retry_results for UI rendering
                             st.session_state.rag_retry_results[section_key].update({

@@ -1090,9 +1090,13 @@ def display_analysis_results(results: List[Dict[str, Any]]):
                                                     candidate_locs = [phrase_location_data]
 
                                             if candidate_locs:
-                                                # Prefer exact > fuzzy > individual fallback > fallback; then by highest score
+                                                # Prefer exact > cross-page/special > fuzzy > individual fallback > fallback; then by highest score
                                                 method_priority = {
-                                                    'exact': 3,
+                                                    'exact': 5,
+                                                    'exact_cleaned_search': 5,
+                                                    'special_case_quotes_handling': 3,
+                                                    'cross_page_fuzzy_match_part1': 2,
+                                                    'cross_page_fuzzy_match_part2': 2,
                                                     'fuzzy': 2,
                                                     'fuzzy_chunk_fallback_individual': 1,
                                                     'fuzzy_chunk_fallback': 0
@@ -1126,6 +1130,22 @@ def display_analysis_results(results: List[Dict[str, Any]]):
                                                         except Exception:
                                                             current_score_info = str(score)
 
+                                                # Log all candidates to help diagnose selection issues
+                                                try:
+                                                    cand_summaries = []
+                                                    for loc in candidate_locs:
+                                                        p = loc.get('page_num')
+                                                        p_disp = (p + 1) if isinstance(p, int) else p
+                                                        m = loc.get('method', '')
+                                                        s = loc.get('match_score', 0)
+                                                        try:
+                                                            s = float(s) if s is not None else 0.0
+                                                        except Exception:
+                                                            s = 0.0
+                                                        cand_summaries.append(f"p={p_disp}, m={m}, s={s:.2f}")
+                                                    logger.debug(f"Candidates for phrase '{phrase[:50]}...': [" + "; ".join(cand_summaries) + "]")
+                                                except Exception as _e:
+                                                    logger.debug("Error building candidate summaries for logging")
                                                 logger.debug(f"Selected best location out of {len(candidate_locs)} candidates for phrase '{phrase[:50]}...': page={page_num_val}")
                                             else:
                                                 logger.debug(f"No candidate locations available for phrase '{phrase[:50]}...' to determine page")
@@ -1899,12 +1919,46 @@ def display_rag_results_section(section_key: str):
                         v = ver_results.get(phrase, False)
                         is_verified = v.get("verified", False) if isinstance(v, dict) else bool(v)
                         icon = "✅" if is_verified else "⚠️"
-                        # page info from first location if present
+                        # Choose best location instead of first
                         pinfo = ""
                         locs = phrase_locs.get(phrase, [])
-                        if isinstance(locs, list) and locs:
-                            loc0 = locs[0] if isinstance(locs[0], dict) else {}
-                            page_val = loc0.get("page_num")
+                        candidate_locs = [loc for loc in locs if isinstance(loc, dict)] if isinstance(locs, list) else []
+                        if candidate_locs:
+                            method_priority = {
+                                'exact': 5,
+                                'exact_cleaned_search': 5,
+                                'special_case_quotes_handling': 3,
+                                'cross_page_fuzzy_match_part1': 2,
+                                'cross_page_fuzzy_match_part2': 2,
+                                'fuzzy': 2,
+                                'fuzzy_chunk_fallback_individual': 1,
+                                'fuzzy_chunk_fallback': 0
+                            }
+                            def loc_key(loc):
+                                method = loc.get('method', '')
+                                score_val = loc.get('match_score', 0) or 0
+                                try:
+                                    score_val = float(score_val)
+                                except Exception:
+                                    score_val = 0.0
+                                return (method_priority.get(method, -1), score_val)
+                            best_loc = max(candidate_locs, key=loc_key)
+                            page_val = best_loc.get("page_num")
+                            try:
+                                # Log all candidates for diagnostics
+                                cand_summaries = []
+                                for loc in candidate_locs:
+                                    p = loc.get('page_num')
+                                    p_disp = (p + 1) if isinstance(p, int) else p
+                                    m = loc.get('method', '')
+                                    s = loc.get('match_score', 0)
+                                    try: s = float(s) if s is not None else 0.0
+                                    except: s = 0.0
+                                    cand_summaries.append(f"p={p_disp}, m={m}, s={s:.2f}")
+                                logger.debug(f"[Retry] Candidates for phrase '{phrase[:50]}...': [" + "; ".join(cand_summaries) + "]")
+                                logger.debug(f"[Retry] Selected best location page={page_val}")
+                            except Exception:
+                                pass
                             if isinstance(page_val, int):
                                 pinfo = f" (Page {page_val + 1})"
                             elif page_val is not None:
