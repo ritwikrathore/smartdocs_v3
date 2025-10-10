@@ -641,7 +641,7 @@ else:
 5. What are the interest payment dates?
 6. What are the interest terms, variable or fixed rate? Is it Term SOFR, NON-USD Index, or NCCR for different loans?
 7. Interest shall accrue from day to day on what basis?
-8. What are the partial prepayment terms - allocation of principal amounts outstanding.
+8. What are the partial prepayment terms / prepayment premium and allocation of principal amounts outstanding.
 9. What are the repayment terms and schedule?
 10. What are all the fees the borrower shall pay and the amounts?
 11. what is the commitment fee on undisbursed amount of the loan?
