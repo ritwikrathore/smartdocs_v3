@@ -296,3 +296,49 @@ def display_welcome_features(check_img=None):
             </div>
         </div>
         """, unsafe_allow_html=True)
+
+
+
+def display_review_features(check_img=None):
+    """Display welcome features section (Review mode) with check icons"""
+    try:
+        # If check_img is not provided, load the same icon used for Ask features
+        if check_img is None:
+            try:
+                from pathlib import Path
+                from ..utils.helpers import get_base64_encoded_image
+                check_path = Path(__file__).parent.parent / "assets" / "correct.png"
+                check_base64 = get_base64_encoded_image(str(check_path))
+                if check_base64:
+                    check_img = f'<img src="data:image/png;base64,{check_base64}" class="check-icon" alt="\u2713">'
+                else:
+                    check_img = "✅"
+            except Exception:
+                check_img = "✅"
+
+        st.markdown(f"""
+        <div class="features-container">
+            <div class="features-row">
+                <div class="feature-text">{check_img} Validate numbers, currencies, and dates with automated checks and suggested fixes.</div>
+                <div class="feature-text">{check_img} Apply the same validation rules across multiple documents simultaneously.</div>
+            </div>
+            <div class="features-row">
+                <div class="feature-text">{check_img} Review findings with page references and highlights directly in annotated PDFs.</div>
+                <div class="feature-text">{check_img} Export validation reports and annotated PDFs/Excel for audit and sharing.</div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+    except Exception as e:
+        logging.error(f"Failed to display review features: {e}")
+        st.markdown("""
+        <div class="features-container">
+            <div class="features-row">
+                <div class="feature-text">✅ Validate numbers, currencies, and dates with automated checks and suggested fixes.</div>
+                <div class="feature-text">✅ Apply the same validation rules across multiple documents simultaneously.</div>
+            </div>
+            <div class="features-row">
+                <div class="feature-text">✅ Review findings with page references and highlights directly in annotated PDFs.</div>
+                <div class="feature-text">✅ Export validation reports and annotated PDFs/Excel for audit and sharing.</div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)

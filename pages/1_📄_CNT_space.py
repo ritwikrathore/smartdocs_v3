@@ -27,11 +27,288 @@ from src.keyword_code.app import preprocess_file, process_file_wrapper
 from src.keyword_code.utils.display import display_analysis_results, display_pdf_viewer, update_pdf_view
 from src.keyword_code.utils.async_utils import run_async
 from src.keyword_code.utils.helpers import get_base64_encoded_image
-from src.keyword_code.utils.ui_helpers import apply_ui_styling, render_branding, initialize_session_state, display_welcome_features
+from src.keyword_code.utils.ui_helpers import apply_ui_styling, render_branding, initialize_session_state, display_welcome_features, display_review_features
+from src.keyword_code.config import PROCESS_CYAN, DARK_BLUE, SAVED_PROMPTS
 
 # Apply styling immediately to ensure it's loaded before any content is displayed
 apply_ui_styling()
 render_branding()
+
+# --- Mode Switch and SmartReview integration helpers ---
+# Store and render Ask/Review mode toggle at the very top of the page
+if "smartdocs_mode" not in st.session_state:
+    st.session_state.smartdocs_mode = "Ask"  # default
+
+# Place the mode selector in the center column so it appears centered on the page
+_left_col, _center_col, _right_col = st.columns([1, 0.5, 1])
+with _center_col:
+    # Inject tight CSS to make the radio look like pill buttons and use project theme blues
+    st.markdown(f"""
+    <style>
+        /* Center the radiogroup and allow wrapping on small widths */
+        div[role="radiogroup"] {{
+            display: flex;
+            justify-content: center;
+            gap: 10px;
+            flex-wrap: wrap;
+            align-items: center;
+        }}
+        /* Hide the native radio circle */
+        div[role="radiogroup"] label > div:first-child {{
+            display: none !important;
+        }}
+        /* Base pill styling */
+        div[role="radiogroup"] label > div {{
+            background: transparent;
+            color: inherit;
+            border-radius: 999px;
+            padding: 6px 14px;
+            border: 1px solid rgba(0,0,0,0.08);
+            transition: all .12s ease-in-out;
+            cursor: pointer;
+            font-weight: 600;
+        }}
+        /* Selected state uses the project's primary blue */
+        div[role="radiogroup"] input[type="radio"]:checked + div {{
+            background: {PROCESS_CYAN};
+            color: #ffffff;
+            border-color: {PROCESS_CYAN};
+            box-shadow: 0 2px 6px rgba(0,0,0,0.08);
+        }}
+        /* Keyboard focus state */
+        div[role="radiogroup"] input[type="radio"]:focus + div {{
+            outline: 2px solid {DARK_BLUE};
+            outline-offset: 2px;
+        }}
+    </style>
+    """, unsafe_allow_html=True)
+
+    new_mode = st.radio("", ["Ask", "Review"], index=(0 if st.session_state.smartdocs_mode == "Ask" else 1), horizontal=True, key="mode_switch_main")
+if new_mode != st.session_state.smartdocs_mode:
+    st.session_state.smartdocs_mode = new_mode
+    st.rerun()
+
+# Import SmartReview primitives lazily to avoid circular imports at module import time
+from SmartReview import (
+    ProposedValidation,
+    Rule as SRRule,
+    ValidationTemplate,
+    DocumentChunk,
+    propose_validation_from_rule,
+    execute_validation_template,
+)
+
+# Helper: build SmartReview DocumentChunk list from preprocessed_data entry
+def _build_document_chunks(pre_doc):
+    chunks = pre_doc.get("chunks", []) or []
+    doc_chunks = []
+    for c in chunks:
+        text = c.get("text", "")
+        if not text or not isinstance(text, str):
+            continue
+        # Convert to 1-based page index for SmartReview display-only purposes
+        page_1_based = (c.get("page_num", 0) or 0) + 1
+        doc_chunks.append(DocumentChunk(content=text, page_num=page_1_based))
+    return doc_chunks
+
+# Helper: try to extract a concise phrase from a validation finding to verify/highlight in PDF
+import re as _re
+
+def _extract_phrase(finding: str, context: str) -> str:
+    if not isinstance(finding, str):
+        finding = str(finding)
+    # Prefer quoted text inside the finding, e.g., Violation: "..."
+    m = _re.search(r'"([^"]{8,200})"', finding)
+    if m:
+        return m.group(1).strip()
+    m = _re.search(r"'([^']{8,200})'", finding)
+    if m:
+        return m.group(1).strip()
+    # Fallback: use context snippet without ellipses
+    if isinstance(context, str) and context.strip():
+        cleaned = context.replace("...", " ").strip()
+        return cleaned[:200]
+    # Last resort: truncate finding itself
+    return finding[:200]
+
+# Background runner: build template from rules and execute, then verify and annotate using SmartDocs PDF pipeline
+import base64 as _b64
+import json as _json
+from src.keyword_code.processors.pdf_processor import PDFProcessor as _PDFProcessor
+
+def run_auto_review_update():
+    try:
+        if st.session_state.smartdocs_mode != "Review":
+            return
+        rules_text = (st.session_state.get("user_prompt", "") or "").strip()
+        if not rules_text:
+            return
+        pre = st.session_state.get("preprocessed_data", {}) or {}
+        if not pre:
+            return
+        # Debounce: only re-run if rules changed
+        last_rules = st.session_state.get("_last_review_rules_text")
+        if last_rules == rules_text and st.session_state.get("analysis_results"):
+            return
+        st.session_state._last_review_rules_text = rules_text
+
+        rule_lines = [ln.strip(" •-\t") for ln in rules_text.splitlines() if ln.strip()]
+        if not rule_lines:
+            return
+
+        aggregated_results = []
+        for filename, pre_doc in pre.items():
+            # Build document chunks for AI proposal context
+            doc_chunks = _build_document_chunks(pre_doc)
+            # Build rules via AI proposals
+            rules_final = []
+            for rl in rule_lines:
+                try:
+                    pv = run_async(propose_validation_from_rule(rl, "", doc_chunks))
+                    if pv:
+                        rules_final.append(SRRule(description=rl, validation_type=pv.validation_type, validator=pv.validator))
+                except Exception:
+                    # Skip rule on failure; continue others
+                    pass
+            if not rules_final:
+                continue
+            template = ValidationTemplate(name=f"Auto Review - {filename}", rules=rules_final)
+            # Execute validation
+            try:
+                validation_results = run_async(execute_validation_template(template, doc_chunks)) or []
+            except Exception:
+                validation_results = []
+
+            # Build phrases for verification/highlighting
+            phrases = []
+            for vr in validation_results:
+                try:
+                    phrase = _extract_phrase(getattr(vr, "finding", ""), getattr(vr, "context", ""))
+                    if phrase and phrase not in phrases:
+                        phrases.append(phrase)
+                except Exception:
+                    continue
+
+            # Build structured analysis by sub-prompt (one section per rule), to match Ask mode UI
+            # Group validation results by their originating rule description
+            grouped_by_rule = {}
+            for vr in validation_results:
+                try:
+                    key = getattr(vr, "rule_description", "Rule") or "Rule"
+                except Exception:
+                    key = "Rule"
+                grouped_by_rule.setdefault(key, []).append(vr)
+
+            # Create analysis sections mirroring Ask mode's `section_{i}_{slug}` keys
+            analysis_sections = {}
+            sub_prompt_results = []
+
+            # AI-rewritten titles and subprompts via decomposition (like Ask mode)
+            ai_titles = {}
+            ai_subprompts = {}
+            try:
+                from src.keyword_code.ai.analyzer import DocumentAnalyzer as _Analyzer
+                from src.keyword_code.ai.decomposition import decompose_prompt as _decompose
+                _anlz = _Analyzer()
+                for _rd in grouped_by_rule.keys():
+                    try:
+                        _decomp = run_async(_decompose(_anlz, str(_rd)))
+                        if isinstance(_decomp, list) and _decomp:
+                            _t = _decomp[0].get("title") or str(_rd)
+                            _sp = _decomp[0].get("sub_prompt") or str(_rd)
+                        else:
+                            _t, _sp = str(_rd), str(_rd)
+                    except Exception:
+                        _t, _sp = str(_rd), str(_rd)
+                    ai_titles[_rd] = _t
+                    ai_subprompts[_rd] = _sp
+            except Exception:
+                # If decomposition fails, fall back to rule descriptions
+                pass
+
+            for idx, (rule_desc, group_items) in enumerate(grouped_by_rule.items(), start=1):
+                # Use AI-rewritten title when available
+                ai_title = ai_titles.get(rule_desc, str(rule_desc))
+                # Derive a slug from the AI title for the section key
+                slug = _re.sub(r"[^a-z0-9]+", "_", str(ai_title).lower()).strip("_") or f"rule_{idx}"
+
+                # Build supporting phrases per rule from findings/contexts
+                group_phrases = []
+                for vr in group_items:
+                    try:
+                        phrase = _extract_phrase(getattr(vr, "finding", ""), getattr(vr, "context", ""))
+                        if phrase and phrase not in group_phrases:
+                            group_phrases.append(phrase)
+                    except Exception:
+                        continue
+
+                # Human-readable analysis text per rule
+                findings_count = len(group_items)
+                analysis_text = (
+                    f"Validation for '{ai_title}' found {findings_count} potential issue(s)."
+                    if findings_count > 0 else f"No issues found for '{ai_title}'."
+                )
+
+                section_key = f"section_{idx}_{slug}"
+                analysis_sections[section_key] = {
+                    "Analysis": analysis_text,
+                    "Supporting_Phrases": group_phrases or ["No relevant phrase found."],
+                    "Context": f"From sub-prompt: {ai_subprompts.get(rule_desc, str(rule_desc))}",
+                }
+                # Provide sub-prompt metadata for downstream features (e.g., retry)
+                sub_prompt_results.append({
+                    "title": str(ai_title),
+                    "sub_prompt": str(ai_subprompts.get(rule_desc, str(rule_desc))),
+                })
+
+            # If, for any reason, no results were produced, still create a placeholder section
+            if not analysis_sections:
+                analysis_sections = {
+                    "section_1_validation_review": {
+                        "Analysis": f"Auto review found {len(validation_results)} potential issue(s) across {len(rule_lines)} rule(s).",
+                        "Supporting_Phrases": phrases or ["No relevant phrase found."],
+                        "Context": "Auto Review",
+                    }
+                }
+
+            aggregated = {
+                "title": f"Validation of {filename}",
+                "analysis_sections": analysis_sections,
+            }
+            aggregated_str = _json.dumps(aggregated, indent=2)
+
+            # Verify and annotate using existing SmartDocs PDF pipeline
+            orig_bytes = pre_doc.get("original_bytes")
+            if not orig_bytes:
+                continue
+            processor = _PDFProcessor(orig_bytes)
+            try:
+                verification_results, phrase_locations = processor.verify_and_locate_phrases(aggregated_str)
+            except Exception:
+                verification_results, phrase_locations = {}, {}
+            try:
+                annotated_pdf_bytes = processor.add_annotations(phrase_locations)
+                annotated_pdf_b64 = _b64.b64encode(annotated_pdf_bytes).decode("utf-8")
+            except Exception:
+                annotated_pdf_b64 = _b64.b64encode(orig_bytes).decode("utf-8")
+
+            aggregated_results.append({
+                "filename": filename,
+                "annotated_pdf": annotated_pdf_b64,
+                "verification_results": verification_results,
+                "phrase_locations": phrase_locations,
+                "ai_analysis": aggregated_str,
+                "validation_results": [vr.model_dump() if hasattr(vr, "model_dump") else getattr(vr, "__dict__", vr) for vr in validation_results],
+                "sub_prompt_results": sub_prompt_results,
+            })
+
+        if aggregated_results:
+            st.session_state.analysis_results = aggregated_results
+            st.session_state.results_just_generated = True
+    except Exception as _e:
+        # Non-fatal; keep UI responsive
+        import logging as _lg
+        _lg.getLogger(__name__).error(f"Auto review update failed: {_e}", exc_info=True)
 
 # --- Configuration ---
 # Setup logging (consider moving to a central config if used elsewhere)
@@ -624,51 +901,48 @@ else:
             # Rerun to reflect preprocessing status and potentially hide welcome message
             st.rerun()
 
-    # Welcome Features Section - use imported function
+    # Welcome Features Section - Ask vs Review
     if not st.session_state.get("preprocessed_data") and not st.session_state.get("file_selection_changed_by_user"):
         with preprocessing_or_features_container.container():
-            display_welcome_features()
+            if st.session_state.smartdocs_mode == "Review":
+                display_review_features()
+            else:
+                display_welcome_features()
 
     # Analysis Inputs - Only show if files are uploaded and preprocessed
     if st.session_state.get("preprocessed_data"):
-        with st.container(border=False): # Changed border to False
-            # --- Prompt Suggestions ---
-            prompt_suggestions = [
-                {"label": "Loans Analysis", "prompt": """1. What is the currency of the loan?
-2. What is the loan amount for different tranches and loan types such as 'A Loan', 'B1 Loan', 'C Loan'??
-3. What is the spread rate or margin rate for different loans?
-4. What are the business day definitions?
-5. What are the interest payment dates?
-6. What are the interest terms, variable or fixed rate? Is it Term SOFR, NON-USD Index, or NCCR for different loans?
-7. Interest shall accrue from day to day on what basis?
-8. What are the partial prepayment terms / prepayment premium and allocation of principal amounts outstanding.
-9. What are the repayment terms and schedule?
-10. What are all the fees the borrower shall pay and the amounts?
-11. what is the commitment fee on undisbursed amount of the loan?
-12. What are the terms for default interest?
-13. What is the maturity date?
-14. When does the availability period end?"""},
-                {"label": "Equity Analysis", "prompt": """1. What is the name of the issuing company?
-2. Who are the investors involved in this transaction?
-3. What is the investment commitment amount that IFC (International Finance Corporation) has agreed to in this transaction?
-4. What type of equity shares is IFC committing to in this agreement?
-5. How many shares or units is IFC subscribing to?
-6. What is the price per share or unit for IFC\'s subscription?
-7. What is the signing date of the agreement?
-8. Are there any fees or expenses associated with the agreement that affect IFC?
-9. What type of expense is it, such as equalization fee, mobilization, advisory, admin fee, etc.?
-10. What fees or expenses are explicitly paid to or paid by IFC in this transaction?
-11. Does IFC have any special rights or preferences, such as voting rights, dividends, or liquidation preferences, in this agreement?
-12. Are there any specific conditions or contingencies related to IFC\'s participation in the transaction?"""},
-            ]
+        with st.container(border=False):  # Changed border to False
+            # --- Saved Prompts (from configuration, per mode) ---
+            mode_key = "Ask" if st.session_state.smartdocs_mode == "Ask" else "Review"
+            configured = SAVED_PROMPTS.get(mode_key, {})
+            # Flatten categories to a single list of suggestions
+            prompt_suggestions = []
+            for _cat_name, _items in configured.items():
+                for _it in _items:
+                    entry = {
+                        "label": _it.get("label", "Unnamed"),
+                        "prompt": _it.get("prompt", ""),
+                        "explanation": _it.get("explanation"),
+                        "category": _cat_name,
+                    }
+                    prompt_suggestions.append(entry)
+
+            # In Review mode, only show the single merged checklist prompt to avoid confusion
+            if mode_key == "Review":
+                prompt_suggestions = [
+                    s for s in prompt_suggestions
+                    if s.get("label") == "Comprehensive Financial Statement Validation"
+                ]
+
             suggestion_labels = [s["label"] for s in prompt_suggestions]
             suggestion_prompts = [s["prompt"] for s in prompt_suggestions]
+            explanations_map = {s["label"]: (s.get("explanation"), s.get("category")) for s in prompt_suggestions}
 
             selected_pill = stp.pills(
                 "Saved Prompts:",
                 suggestion_labels,
                 clearable=True,
-                index=None, # No default selection
+                index=None,  # No default selection
                 label_visibility="visible"
             )
 
@@ -676,17 +950,21 @@ else:
                 try:
                     idx = suggestion_labels.index(selected_pill)
                     st.session_state["user_prompt"] = suggestion_prompts[idx]
-                    # No st.rerun() needed if text_area value is correctly bound to session_state
+                    exp_cat = explanations_map.get(selected_pill)
+                    if exp_cat and exp_cat[0]:
+                        st.caption(f"{exp_cat[1]} • {exp_cat[0]}")
                 except ValueError:
                     logger.warning(f"Selected pill '{selected_pill}' not found in suggestion labels.")
 
+            label = "Analysis Prompt" if st.session_state.smartdocs_mode == "Ask" else "Validation Rules"
             st.session_state.user_prompt = st.text_area(
-                "Analysis Prompt",
-                placeholder="Enter your analysis instructions, or select a suggestion above and edit if needed.",
+                label,
+                placeholder="Ask: enter your analysis instructions. Review: type validation checks (one per line); they run automatically.",
                 height=150,
                 key="prompt_input_main",
                 value=st.session_state.get("user_prompt", ""),
             )
+
 
         # Process Button
         # Disable if model not loaded, no files uploaded, no prompt, or if files haven't finished preprocessing
@@ -705,7 +983,7 @@ else:
             current_user_prompt = st.session_state.get("user_prompt", "")
 
             if not files_to_process_objs: st.warning("Please upload one or more documents.")
-            elif not current_user_prompt.strip(): st.error("Please enter an Analysis Prompt.")
+            elif not current_user_prompt.strip(): st.error(f"Please enter {'Validation Rules' if st.session_state.smartdocs_mode == 'Review' else 'an Analysis Prompt'}.")
             elif not all_preprocessed: st.error("Please wait for file preprocessing to complete.")
             else:
                 # --- Processing Logic ---
@@ -717,6 +995,12 @@ else:
                 total_files = len(files_to_process_objs)
                 overall_start_time = datetime.now()
                 # Use a dictionary for results placeholder for easier mapping back
+                # If in Review mode, run the SmartReview pipeline now and then rerun to display results all at once
+                if st.session_state.smartdocs_mode == "Review":
+                    with st.spinner("Running review...", show_time=True):
+                        run_auto_review_update()
+                    st.rerun()
+
                 results_placeholder = {} # Use filename as key
                 file_map = {f.name: f for f in files_to_process_objs} # Map name to object
 

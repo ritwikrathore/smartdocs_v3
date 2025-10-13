@@ -44,7 +44,7 @@ import streamlit_pills as stp # For clickable prompt suggestions
 # Import from our modules
 from .config import (
     logger, MAX_WORKERS, ENABLE_PARALLEL, RAG_TOP_K, RERANKER_MODEL_PATH,
-    USE_DATABRICKS_RERANKER, ENABLE_INTERACTION_LOGGING
+    USE_DATABRICKS_RERANKER, ENABLE_INTERACTION_LOGGING, SAVED_PROMPTS
 )
 from .utils.helpers import get_base64_encoded_image, normalize_text, remove_markdown_formatting
 from .utils.async_utils import run_async
@@ -798,13 +798,12 @@ def display_page():
 
         # Analysis Inputs - Only show if preprocessed data exists
         if st.session_state.get("preprocessed_data"):
-            # --- Prompt Suggestions ---
-            equity_analysis_prompt = """1. What is the name of the issuing company?\n2. Who are the investors involved in this transaction?\n3. What is the investment commitment amount that IFC (International Finance Corporation) has agreed to in this transaction?\n4. What type of equity shares is IFC committing to in this agreement?\n5. How many shares or units is IFC subscribing to?\n6. What is the price per share or unit for IFC's subscription?\n7. What is the signing date of the agreement?\n8. Are there any fees or expenses associated with the agreement that affect IFC?\n9. What type of expense is it, such as equalization fee, mobilization, advisory, admin fee, etc.?\n10. What fees or expenses are explicitly paid to or paid by IFC in this transaction?\n11. Does IFC have any special rights or preferences, such as voting rights, dividends, or liquidation preferences, in this agreement?\n12. Are there any specific conditions or contingencies related to IFC's participation in the transaction?"""
-            loans_analysis_prompt = """1. What is the loan currency What is the loan amount?\n2. What is the spread or margin rate?\n3. What are the business day definitions?\n4. What are the interest payment dates?\n5. What are the interest terms, variable or fixed rate? Is it Term SOFR, NON-USD Index, or NCCR?\n6. Interest shall accrue from day to day on what basis?\n7. What are the partial prepayment terms - allocation of principal amounts outstanding.\n8. What are the repayment terms and schedule?\n9. What are all the fees the borrower shall pay and the amounts?\n10. What is the commitment fee rate?\n11. What are the terms for default interest?\n12. What is the maturity date?\n13. When does the availability period end?"""
-            prompt_suggestions = [
-                {"label": "Equity Analysis", "prompt": equity_analysis_prompt},
-                {"label": "Loans Analysis", "prompt": loans_analysis_prompt},
-            ]
+            # --- Prompt Suggestions (Ask mode from configuration) ---
+            ask_config = SAVED_PROMPTS.get("Ask", {})
+            prompt_suggestions = []
+            for _cat, _items in ask_config.items():
+                for _it in _items:
+                    prompt_suggestions.append({"label": _it.get("label", "Unnamed"), "prompt": _it.get("prompt", "")})
             suggestion_labels = [s["label"] for s in prompt_suggestions]
             suggestion_prompts = [s["prompt"] for s in prompt_suggestions]
             # Show pills for suggestions
