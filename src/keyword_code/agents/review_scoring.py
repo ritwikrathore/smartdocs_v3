@@ -12,7 +12,6 @@ def pre_score(findings: List[ToolFinding]) -> List[ToolFinding]:
         "regex": 0.8,      # precise patterns score higher by default
         "semantic": 0.6,   # LLM judgments get moderated until corroborated
         "calc": 0.7,
-        "rag": 0.5,
     }
     for f in findings:
         if f.score_raw is None:

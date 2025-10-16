@@ -267,19 +267,37 @@ def process_file_wrapper(args):
     """
     Wrapper for processing a single file: decompose prompt, run RAG & analysis per sub-prompt, aggregate results.
     Now uses precomputed embeddings when available.
+
+    Supports two modes:
+    - 'ask': Full RAG workflow with decomposition, retrieval, and analysis
+    - 'review': Validation-only workflow (no decomposition, no RAG)
     """
     # Monitor memory usage before processing
     memory_before = get_memory_usage()
     logger.debug(f"Memory before processing: {format_bytes(memory_before['used'])} used, {memory_before['percent']}% of total")
 
-    (
-        uploaded_file_data,
-        filename,
-        user_prompt,
-        use_advanced_extraction, # Keep if PDFProcessor uses it
-        # --- NEW: Pass preprocessed data if available ---
-        preprocessed_data_for_file
-    ) = args
+    # Unpack args - now includes mode parameter
+    if len(args) == 6:
+        (
+            uploaded_file_data,
+            filename,
+            user_prompt,
+            use_advanced_extraction,
+            preprocessed_data_for_file,
+            mode  # 'ask' or 'review'
+        ) = args
+    else:
+        # Backward compatibility: default to 'ask' mode if not specified
+        (
+            uploaded_file_data,
+            filename,
+            user_prompt,
+            use_advanced_extraction,
+            preprocessed_data_for_file
+        ) = args
+        mode = 'ask'
+
+    logger.info(f"Processing {filename} in '{mode}' mode")
 
     if embedding_model is None:
         logger.error(f"Skipping processing for {filename}: Embedding model not loaded.")
@@ -330,7 +348,27 @@ def process_file_wrapper(args):
             else:
                 raise ValueError(f"Unsupported file type: {file_extension}")
 
-        # --- Step 2: Decompose the prompt into sub-prompts ---
+        # --- CONDITIONAL EXECUTION BASED ON MODE ---
+        # Review mode: Skip decomposition and RAG, return minimal result
+        # Ask mode: Full RAG workflow with decomposition, retrieval, and analysis
+
+        if mode == 'review':
+            logger.info(f"Review mode: Skipping decomposition and RAG for {filename}")
+            # Review mode validation is handled separately by run_auto_review_update()
+            # This function should not be called for review mode in normal flow
+            # Return a minimal result indicating review mode processing
+            return {
+                "filename": filename,
+                "mode": "review",
+                "message": "Review mode: Validation handled separately",
+                "annotated_pdf": None,
+                "verification_results": {},
+                "phrase_locations": {},
+                "ai_analysis": json.dumps({"message": "Review mode: Validation handled separately"})
+            }
+
+        # --- ASK MODE: Step 2 - Decompose the prompt into sub-prompts ---
+        logger.info(f"Ask mode: Starting decomposition and RAG workflow for {filename}")
         analyzer = DocumentAnalyzer()
         sub_prompts = run_async(decompose_prompt(analyzer, user_prompt))
         logger.info(f"Decomposed prompt into {len(sub_prompts)} sub-prompts for {filename}")

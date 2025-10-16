@@ -86,7 +86,7 @@ SAVED_PROMPTS = {
             {
                 "label": "Loans Analysis",
                 "prompt": (
-                    """1. What is the currency of the loan?\n"
+                    "1. What is the currency of the loan?\n"
                     "2. What is the loan amount for different tranches and loan types such as 'A Loan', 'B1 Loan', 'C Loan'??\n"
                     "3. What is the spread rate or margin rate for different loans?\n"
                     "4. What are the business day definitions?\n"
@@ -99,13 +99,13 @@ SAVED_PROMPTS = {
                     "11. what is the commitment fee on undisbursed amount of the loan?\n"
                     "12. What are the terms for default interest?\n"
                     "13. What is the maturity date?\n"
-                    "14. When does the availability period end?"""
+                    "14. When does the availability period end?"
                 ),
             },
             {
                 "label": "Equity Analysis",
                 "prompt": (
-                    """1. What is the name of the issuing company?\n"
+                    "1. What is the name of the issuing company?\n"
                     "2. Who are the investors involved in this transaction?\n"
                     "3. What is the investment commitment amount that IFC (International Finance Corporation) has agreed to in this transaction?\n"
                     "4. What type of equity shares is IFC committing to in this agreement?\n"
@@ -116,7 +116,18 @@ SAVED_PROMPTS = {
                     "9. What type of expense is it, such as equalization fee, mobilization, advisory, admin fee, etc.?\n"
                     "10. What fees or expenses are explicitly paid to or paid by IFC in this transaction?\n"
                     "11. Does IFC have any special rights or preferences, such as voting rights, dividends, or liquidation preferences, in this agreement?\n"
-                    "12. Are there any specific conditions or contingencies related to IFC's participation in the transaction?"""
+                    "12. Are there any specific conditions or contingencies related to IFC's participation in the transaction?"
+                ),
+            },
+            {
+                "label": "Guarentee Analysis",
+                "prompt": (
+                    "Check if clauses relating to the following keywords are present in the agreement:\n"
+                    "1. Default\n"
+                    "2. Restructuring\n"
+                    "3. Distressed sale\n"
+                    "4. Bankruptcy\n"
+                    "5. Rating downgrade"
                 ),
             },
         ]

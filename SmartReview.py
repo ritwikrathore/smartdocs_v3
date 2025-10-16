@@ -114,18 +114,70 @@ def get_llm_client():
     """
     try:
         logger.info("Initializing Databricks LLM client")
+
+        # Primary: environment variable
         databricks_token = os.environ.get("DATABRICKS_API_KEY")
+
+        # Fallback: Streamlit secrets (useful during local dev / deployed Streamlit)
+        try:
+            if (not databricks_token) and hasattr(st, "secrets") and "DATABRICKS_API_KEY" in st.secrets:
+                databricks_token = st.secrets["DATABRICKS_API_KEY"]
+                logger.info("Loaded DATABRICKS_API_KEY from Streamlit secrets")
+        except Exception:
+            # Safe to ignore access to secrets failing
+            pass
+
         if not databricks_token:
-            st.error("Databricks API token not found. Please add DATABRICKS_API_KEY to your environment.")
+            st.error("Databricks API token not found. Please add DATABRICKS_API_KEY to your environment or Streamlit secrets.")
             st.stop()
-        # Use the OpenAI-compatible client but point base_url to Databricks serving endpoints
-        client = openai.OpenAI(api_key=databricks_token, base_url=DATABRICKS_BASE_URL)
-        # store model mapping on client for convenience
-        client._default_model = DATABRICKS_LLM_MODEL
-        logger.info("Databricks OpenAI-compatible client initialized")
-        return client
+
+        # Clean token (strip whitespace and any surrounding quotes)
+        if isinstance(databricks_token, str):
+            clean_token = databricks_token.strip().strip('"').strip("'")
+        else:
+            clean_token = str(databricks_token)
+
+        # Expose Databricks creds to the process so other modules (evaluator) can use them
+        try:
+            os.environ["DATABRICKS_API_KEY"] = clean_token
+            os.environ["DATABRICKS_BASE_URL"] = DATABRICKS_BASE_URL
+            os.environ["DATABRICKS_LLM_MODEL"] = DATABRICKS_LLM_MODEL
+        except Exception:
+            pass
+
+        # Try to construct the OpenAI-compatible client. Some versions of the OpenAI
+        # library may ignore the api_key parameter and require the OPENAI_API_KEY env var,
+        # so we attempt both approaches for compatibility.
+        try:
+            client = openai.OpenAI(api_key=clean_token, base_url=DATABRICKS_BASE_URL)
+            client._default_model = DATABRICKS_LLM_MODEL
+            logger.info("Databricks OpenAI-compatible client initialized via direct api_key")
+            return client
+        except Exception as first_err:
+            logger.warning("Direct OpenAI(...) init failed, will attempt env-var fallback: %s", first_err)
+
+            # Set OPENAI_API_KEY env var as a fallback and try again
+            try:
+                os.environ["OPENAI_API_KEY"] = clean_token
+                # Also try to set module-level attribute if present
+                try:
+                    setattr(openai, "api_key", clean_token)
+                except Exception:
+                    pass
+
+                client = openai.OpenAI(base_url=DATABRICKS_BASE_URL)
+                client._default_model = DATABRICKS_LLM_MODEL
+                logger.info("Databricks OpenAI-compatible client initialized via OPENAI_API_KEY env var")
+                return client
+            except Exception as second_err:
+                # Both approaches failed; raise a helpful error
+                logger.exception("Failed to initialize Databricks LLM client after both direct and env-var attempts: %s; %s", first_err, second_err)
+                st.error(
+                    "Failed to initialize Databricks LLM client. Ensure DATABRICKS_API_KEY is a valid token and matches your installed OpenAI client expectations."
+                )
+                st.stop()
     except Exception as e:
-        logger.exception("Failed to initialize Databricks LLM client: %s", e)
+        logger.exception("Failed to initialize Databricks LLM client (unexpected): %s", e)
         st.error(f"Failed to initialize Databricks LLM client: {e}")
         st.stop()
 
@@ -193,9 +245,20 @@ def _parse_model_json(text: str) -> dict:
                 except json.JSONDecodeError:
                     pass
 
-    # If no fenced JSON parsed, try to find the first JSON object or array anywhere in the text.
-    # This uses a regex to locate balanced-looking {...} or [...] snippets (best-effort).
-    # Note: regex cannot fully validate nested JSON but works for most model outputs.
+    # Try to locate the first '{' and the last '}' and parse that slice.
+    # This is more reliable than regex for complex nested JSON with escaped characters.
+    start = stripped.find('{')
+    end = stripped.rfind('}')
+    if start != -1 and end != -1 and end > start:
+        candidate = stripped[start:end+1]
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError as e:
+            logger.debug(f"JSON decode error on candidate (first {{ to last }}): {e}")
+            pass
+
+    # If that fails, try to find the first JSON object or array using regex (less reliable for complex JSON).
+    # Note: regex cannot fully validate nested JSON but works for simple model outputs.
     obj_pattern = re.compile(r"(\{(?:[^{}]|\{[^}]*\})*\})", re.DOTALL)
     arr_pattern = re.compile(r"(\[(?:[^\[\]]|\[[^\]]*\])*\])", re.DOTALL)
 
@@ -207,16 +270,6 @@ def _parse_model_json(text: str) -> dict:
             except json.JSONDecodeError:
                 # try next match
                 continue
-
-    # As a last resort, try to locate the first '{' and the last '}' and parse that slice.
-    start = stripped.find('{')
-    end = stripped.rfind('}')
-    if start != -1 and end != -1 and end > start:
-        candidate = stripped[start:end+1]
-        try:
-            return json.loads(candidate)
-        except json.JSONDecodeError:
-            pass
 
     # If all attempts fail, raise with a helpful message including a short snippet
     # of the model output to aid debugging.
@@ -248,7 +301,9 @@ class ValidationResult(BaseModel):
     """Represents a single issue found during validation."""
     page_num: int
     rule_description: str
+    violation_type: Optional[str] = None
     finding: str
+    analysis: Optional[str] = None
     context: str # A snippet of text around the finding for context
 
 class DocumentChunk(BaseModel):
@@ -258,6 +313,50 @@ class DocumentChunk(BaseModel):
 
 
 # --- Core Logic Functions ---
+@log_sync
+def decompose_rule_smartreview(rule_text: str) -> List[Rule]:
+    """Decompose a plain-text rule into SmartReview validation tasks.
+    - No RAG/retrieval. Single-step analysis to choose regex vs semantic.
+    - Integrates validation type determination into decomposition.
+    - Returns a list of Rule objects suitable for the SmartReview pipeline.
+    """
+    text = (rule_text or "").strip().lower()
+    tasks: List[Rule] = []
+
+    # Heuristics: precise formats → semantic with guardrails; qualitative/intent/tone → semantic
+    # NOTE: We no longer hardcode regex patterns. Instead, use propose_validation_from_rule()
+    # which has an AI agent that can generate optimal regex patterns with proper lookahead/lookbehind.
+    format_keywords = [
+        "yyyy", "mm", "dd", "date", "currency", "usd", "$", "eur", "€",
+        "email", "e-mail", "phone", "ssn", "id", "identifier", "format",
+        "digits", "characters", "alphanumeric", "exactly", "pattern",
+    ]
+    if any(k in text for k in format_keywords):
+        # Default to semantic when we cannot synthesize a robust regex deterministically here.
+        # The user can refine this into a regex later in the UI if desired.
+        semantic_prompt = (
+            f"You must check the text for violations of this rule:\n\"{rule_text}\"\n"
+            "- Quote the exact offending text if any.\n"
+            "- Provide a concise reason for the violation.\n"
+            "- Do NOT flag compliant cases; only clear violations.\n"
+            "- Be strict about numeric/word boundaries; avoid partial matches.\n"
+            "- If the rule requires decimal precision, do NOT flag numbers that already include a decimal fraction (e.g., '67.3 billion', '1.0 billion').\n"
+        )
+        tasks.append(Rule(description=rule_text, validation_type='semantic', validator=semantic_prompt))
+        return tasks
+
+    # Default: semantic validation
+    default_prompt = (
+        f"You must check the text for violations of this rule:\n\"{rule_text}\"\n"
+        "- Quote the exact offending text if any.\n"
+        "- Provide a concise reason for the violation.\n"
+        "- Do NOT flag compliant cases.\n"
+        "- Be strict about boundaries; avoid partial/embedded matches.\n"
+        "- If the rule mentions 'billion' and decimal precision, do NOT flag values with a decimal part (e.g., '67.3 billion', '1.0 billion').\n"
+    )
+    tasks.append(Rule(description=rule_text, validation_type='semantic', validator=default_prompt))
+    return tasks
+
 
 @log_sync
 def extract_text_from_pdf(uploaded_file_bytes: bytes) -> List[DocumentChunk]:
@@ -279,11 +378,11 @@ def extract_text_from_pdf(uploaded_file_bytes: bytes) -> List[DocumentChunk]:
 @log_async
 async def propose_validation_from_rule(rule_text: str, example_text: str, doc_chunks: List[DocumentChunk]) -> Optional[ProposedValidation]:
     """AI agent to interpret a user's rule and propose a validation method."""
-    
+
     # Combine document chunks for context, but limit the size to avoid excessive token usage
     full_text_context = "\n".join([chunk.content for chunk in doc_chunks])
     # Truncate context to a reasonable length for the API call
-    max_context_length = 12000 
+    max_context_length = 12000
     if len(full_text_context) > max_context_length:
         full_text_context = full_text_context[:max_context_length] + "\n... [document truncated for brevity]"
 
@@ -298,6 +397,29 @@ async def propose_validation_from_rule(rule_text: str, example_text: str, doc_ch
        - If 'semantic': produce a clear, concise evaluation prompt for another AI to check violations.
     4) Find an example from the provided document text that your validator would identify.
     5) Explain the approach in one or two sentences.
+
+    CRITICAL REGEX GUIDELINES:
+    When creating regex patterns, be aware of word boundaries and decimal numbers:
+
+    - PROBLEM: Word boundary \\b treats '.' as a boundary, so "67.3 billion" is seen as two tokens: "67" and "3"
+      If you write \\b\\d+\\s+billion\\b, it will match BOTH "67 billion" AND "3 billion" (from "67.3 billion")
+
+    - SOLUTION: Use negative lookbehind and lookahead to prevent matching decimal parts:
+      * (?<!\\.) - No decimal point immediately before the number
+      * (?<!\\d\\.) - No digit-dot pattern before (prevents matching "3" in "67.3")
+      * (?!\\.\\d+) - No decimal point after the number
+
+    - EXAMPLE: To match integers like "67 billion" but NOT decimals like "67.3 billion":
+      Pattern: (?<!\\.)(?<!\\d\\.)\\b(?:\\d{1,3}(?:,\\d{3})*|\\d+)(?!\\.\\d+)\\s+billion\\b
+
+      This pattern:
+      ✓ Matches: "67 billion", "1,234 billion", "5 billion"
+      ✗ Does NOT match: "67.3 billion", "1.0 billion", "5.5 billion"
+
+    - GENERAL RULE: When matching numbers that should NOT include decimals:
+      1. Add (?<!\\.) and (?<!\\d\\.) before your number pattern
+      2. Add (?!\\.\\d+) after your number pattern
+      3. This prevents matching decimal parts as separate integers
 
     STRICT OUTPUT REQUIREMENTS:
     - Output MUST be a single JSON object with EXACTLY these keys:
@@ -440,15 +562,38 @@ async def refine_validation_from_chat(chat_history: List[dict], original_proposa
     The user was not satisfied with your previous proposal and will provide feedback.
     Your task is to generate a *new* `ProposedValidation` JSON object that incorporates the user's feedback.
     Carefully read the chat history to understand what the user wants to change. Then, generate a completely new proposal that addresses their concerns.
+
+    CRITICAL REGEX GUIDELINES:
+    When creating regex patterns, be aware of word boundaries and decimal numbers:
+
+    - PROBLEM: Word boundary \\b treats '.' as a boundary, so "67.3 billion" is seen as two tokens: "67" and "3"
+      If you write \\b\\d+\\s+billion\\b, it will match BOTH "67 billion" AND "3 billion" (from "67.3 billion")
+
+    - SOLUTION: Use negative lookbehind and lookahead to prevent matching decimal parts:
+      * (?<!\\.) - No decimal point immediately before the number
+      * (?<!\\d\\.) - No digit-dot pattern before (prevents matching "3" in "67.3")
+      * (?!\\.\\d+) - No decimal point after the number
+
+    - EXAMPLE: To match integers like "67 billion" but NOT decimals like "67.3 billion":
+      Pattern: (?<!\\.)(?<!\\d\\.)\\b(?:\\d{1,3}(?:,\\d{3})*|\\d+)(?!\\.\\d+)\\s+billion\\b
+
+      This pattern:
+      ✓ Matches: "67 billion", "1,234 billion", "5 billion"
+      ✗ Does NOT match: "67.3 billion", "1.0 billion", "5.5 billion"
+
+    - GENERAL RULE: When matching numbers that should NOT include decimals:
+      1. Add (?<!\\.) and (?<!\\d\\.) before your number pattern
+      2. Add (?!\\.\\d+) after your number pattern
+      3. This prevents matching decimal parts as separate integers
     """
-    
+
     chat_transcript = "\n".join([f"{msg['role']}: {msg['content']}" for msg in chat_history])
 
     user_prompt = f"""
     --- DOCUMENT TEXT ---
     {full_text_context}
     --- END DOCUMENT TEXT ---
-    
+
     This was my original proposal that the user wants to refine:
     --- ORIGINAL PROPOSAL ---
     {original_proposal.model_dump_json(indent=2)}
@@ -461,7 +606,7 @@ async def refine_validation_from_chat(chat_history: List[dict], original_proposa
 
     Based on the user's feedback in the chat, please generate a new and improved validation proposal in the required JSON format.
     """
-    
+
     logger.info("Refining validation from chat. chat_length=%d original_type=%s", len(chat_history), original_proposal.validation_type if original_proposal else None)
     try:
         logger.debug("Calling LLM at %s model=%s", DATABRICKS_BASE_URL, getattr(client, "_default_model", "databricks-llama-4-maverick"))
@@ -557,7 +702,9 @@ async def execute_validation_template(template: ValidationTemplate, doc_chunks: 
                 ValidationResult(
                     page_num=r.page_num,
                     rule_description=r.rule_description,
+                    violation_type=r.violation_type,
                     finding=r.finding,
+                    analysis=r.analysis,
                     context=r.context,
                 )
             )
@@ -591,7 +738,9 @@ async def run_rule_on_chunk(rule: Rule, chunk: DocumentChunk) -> List[Validation
                 results.append(ValidationResult(
                     page_num=chunk.page_num,
                     rule_description=rule.description,
+                    violation_type='regex',
                     finding=f"Found violation: '{match.group(0)}'",
+                    analysis=f"Regex matched the pattern for this rule, indicating non-compliance: {rule.description}",
                     context=context_snippet
                 ))
         except re.error as e:
@@ -604,12 +753,13 @@ async def run_rule_on_chunk(rule: Rule, chunk: DocumentChunk) -> List[Validation
         Your task is to check if the text violates the rule.
         - If you find a violation, respond with "Violation: [Explain the violation and quote the specific text]".
         - If there are no violations, respond *only* with the text "No violation found.".
+        - Do NOT flag numeric expressions that already satisfy the rule; for example, if decimal precision like "1.0 billion" is required, values like "67.3 billion" are compliant and must not be flagged; only integer forms like "67 billion" should be flagged.
         Do not be conversational. Provide only the violation report or "No violation found.".
         """
         prompt = f"""
         --- RULE ---
         {rule.validator}
-        
+
         --- TEXT TO VALIDATE ---
         {chunk.content}
         """
@@ -630,7 +780,9 @@ async def run_rule_on_chunk(rule: Rule, chunk: DocumentChunk) -> List[Validation
                 results.append(ValidationResult(
                     page_num=chunk.page_num,
                     rule_description=rule.description,
+                    violation_type='semantic',
                     finding=message_content,
+                    analysis=f"Semantic evaluation reason: {message_content}",
                     context=f"Semantic check on page {chunk.page_num}."
                 ))
         except Exception as e:
@@ -684,7 +836,7 @@ def render_validation_view():
                 if doc_chunks:
                     results = asyncio.run(execute_validation_template(template, doc_chunks))
                     st.session_state.validation_results = results
-                    st.success(f"Validation complete — {len(results)} potential issues found.")
+                    st.success("Validation complete.")
                 else:
                     st.error("Could not extract text from the PDF.")
 
@@ -697,7 +849,10 @@ def render_validation_view():
             st.success("No issues were found for the selected template.")
         else:
             for result in st.session_state.validation_results:
-                with st.expander(f"Page {result.page_num} — {result.rule_description}", expanded=False):
+                header = f"[{(result.violation_type or 'violation').upper()}] Page {result.page_num} — {result.rule_description}"
+                with st.expander(header, expanded=False):
+                    if getattr(result, 'analysis', None):
+                        st.markdown(result.analysis)
                     st.error(result.finding)
                     st.caption("Context")
                     st.markdown(f"> {result.context.replace('...', ' ... ')}")

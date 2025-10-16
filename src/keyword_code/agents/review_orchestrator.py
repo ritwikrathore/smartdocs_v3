@@ -12,11 +12,9 @@ from . import review_tools as tools
 async def _run_for_rule_chunk(rule, chunk) -> List[ToolFinding]:
     """Run independent tools in parallel; sequence only when necessary."""
     tasks = []
-    # Regex is fast and independent
-    tasks.append(asyncio.create_task(tools.run_regex(rule, chunk)))
-    # Semantic check does not depend on regex; can run in parallel
-    if getattr(rule, "validation_type", None) in ("semantic", None) or True:
-        tasks.append(asyncio.create_task(tools.run_semantic(rule, chunk)))
+    # Run regex only for regex rules
+    if getattr(rule, "validation_type", None) == "regex":
+        tasks.append(asyncio.create_task(tools.run_regex(rule, chunk)))
     results: List[List[ToolFinding]] = await asyncio.gather(*tasks)
     return [f for sub in results for f in sub]
 
@@ -32,6 +30,10 @@ async def orchestrate_review(template, doc_chunks) -> List[RankedFinding]:
     for rule in template.rules:
         for chunk in doc_chunks:
             per_tasks.append(asyncio.create_task(_run_for_rule_chunk(rule, chunk)))
+
+        # Per-rule semantic batch pass (single call per rule)
+        if getattr(rule, "validation_type", None) == "semantic":
+            per_tasks.append(asyncio.create_task(tools.run_semantic_batch(rule, doc_chunks)))
 
     findings_nested: List[List[ToolFinding]] = await asyncio.gather(*per_tasks)
     findings: List[ToolFinding] = [f for sub in findings_nested for f in sub]

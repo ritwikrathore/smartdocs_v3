@@ -203,62 +203,40 @@ def run_auto_review_update():
             analysis_sections = {}
             sub_prompt_results = []
 
-            # AI-rewritten titles and subprompts via decomposition (like Ask mode)
-            ai_titles = {}
-            ai_subprompts = {}
-            try:
-                from src.keyword_code.ai.analyzer import DocumentAnalyzer as _Analyzer
-                from src.keyword_code.ai.decomposition import decompose_prompt as _decompose
-                _anlz = _Analyzer()
-                for _rd in grouped_by_rule.keys():
-                    try:
-                        _decomp = run_async(_decompose(_anlz, str(_rd)))
-                        if isinstance(_decomp, list) and _decomp:
-                            _t = _decomp[0].get("title") or str(_rd)
-                            _sp = _decomp[0].get("sub_prompt") or str(_rd)
-                        else:
-                            _t, _sp = str(_rd), str(_rd)
-                    except Exception:
-                        _t, _sp = str(_rd), str(_rd)
-                    ai_titles[_rd] = _t
-                    ai_subprompts[_rd] = _sp
-            except Exception:
-                # If decomposition fails, fall back to rule descriptions
-                pass
-
+            # Use rule descriptions directly as titles (no RAG decomposition needed in Review mode)
+            # This avoids unnecessary LLM calls and keeps Review mode fast and focused on validation
             for idx, (rule_desc, group_items) in enumerate(grouped_by_rule.items(), start=1):
-                # Use AI-rewritten title when available
-                ai_title = ai_titles.get(rule_desc, str(rule_desc))
-                # Derive a slug from the AI title for the section key
-                slug = _re.sub(r"[^a-z0-9]+", "_", str(ai_title).lower()).strip("_") or f"rule_{idx}"
+                # Use rule description directly as title
+                display_title = str(rule_desc)
+                # Derive a slug from the rule description for the section key base
+                slug_base = _re.sub(r"[^a-z0-9]+", "_", display_title.lower()).strip("_") or f"rule_{idx}"
 
-                # Build supporting phrases per rule from findings/contexts
-                group_phrases = []
-                for vr in group_items:
+                # Create one analysis section per violation (finding)
+                for gidx, vr in enumerate(group_items, start=1):
                     try:
                         phrase = _extract_phrase(getattr(vr, "finding", ""), getattr(vr, "context", ""))
-                        if phrase and phrase not in group_phrases:
-                            group_phrases.append(phrase)
                     except Exception:
-                        continue
+                        phrase = None
 
-                # Human-readable analysis text per rule
-                findings_count = len(group_items)
-                analysis_text = (
-                    f"Validation for '{ai_title}' found {findings_count} potential issue(s)."
-                    if findings_count > 0 else f"No issues found for '{ai_title}'."
-                )
+                    vtype = (getattr(vr, "violation_type", None) or "violation").upper()
+                    page = getattr(vr, "page_num", "N/A")
+                    analysis_text = (
+                        getattr(vr, "analysis", None)
+                        or f"[{vtype}] {getattr(vr, 'finding', '')}"
+                    )
+                    context_text = f"[{vtype}] Page {page} — From rule: {rule_desc}"
 
-                section_key = f"section_{idx}_{slug}"
-                analysis_sections[section_key] = {
-                    "Analysis": analysis_text,
-                    "Supporting_Phrases": group_phrases or ["No relevant phrase found."],
-                    "Context": f"From sub-prompt: {ai_subprompts.get(rule_desc, str(rule_desc))}",
-                }
+                    section_key = f"section_{idx}_{slug_base}_p{page}_{gidx}"
+                    analysis_sections[section_key] = {
+                        "Analysis": analysis_text,
+                        "Supporting_Phrases": ([phrase] if phrase else ["No relevant phrase found."]),
+                        "Context": context_text,
+                    }
+
                 # Provide sub-prompt metadata for downstream features (e.g., retry)
                 sub_prompt_results.append({
-                    "title": str(ai_title),
-                    "sub_prompt": str(ai_subprompts.get(rule_desc, str(rule_desc))),
+                    "title": display_title,
+                    "sub_prompt": rule_desc,
                 })
 
             # If, for any reason, no results were produced, still create a placeholder section
@@ -1006,6 +984,10 @@ else:
 
                 process_args_list = []
                 files_read_ok = True
+                # Determine mode for process_file_wrapper: 'ask' or 'review'
+                current_mode = st.session_state.smartdocs_mode.lower()  # 'ask' or 'review'
+                logger.info(f"Preparing to process {len(files_to_process_objs)} files in '{current_mode}' mode")
+
                 for uploaded_file in files_to_process_objs:
                     try:
                         # Ensure pointer is at start before reading
@@ -1018,8 +1000,9 @@ else:
                              logger.error(f"Missing preprocessed data for {filename} during process button click.")
                              raise ValueError(f"Preprocessing data missing for {filename}.")
 
+                        # Add mode parameter to process_args
                         process_args_list.append(
-                            (file_data, filename, current_user_prompt, False, preprocessed_file_data)
+                            (file_data, filename, current_user_prompt, False, preprocessed_file_data, current_mode)
                         )
                         results_placeholder[filename] = None # Initialize placeholder
                     except Exception as read_err:
