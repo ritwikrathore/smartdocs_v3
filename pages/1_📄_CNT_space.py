@@ -24,7 +24,7 @@ st.set_page_config(
 # Import necessary components directly from the modules
 from src.keyword_code.models.embedding import load_embedding_model
 from src.keyword_code.app import preprocess_file, process_file_wrapper
-from src.keyword_code.utils.display import display_analysis_results, display_pdf_viewer, update_pdf_view
+from src.keyword_code.display_utils import display_analysis_results, display_pdf_viewer, update_pdf_view
 from src.keyword_code.utils.async_utils import run_async
 from src.keyword_code.utils.helpers import get_base64_encoded_image
 from src.keyword_code.utils.ui_helpers import apply_ui_styling, render_branding, initialize_session_state, display_welcome_features, display_review_features
@@ -88,8 +88,8 @@ if new_mode != st.session_state.smartdocs_mode:
     st.session_state.smartdocs_mode = new_mode
     st.rerun()
 
-# Import SmartReview primitives lazily to avoid circular imports at module import time
-from SmartReview import (
+# Import SmartReview primitives from the centralized module
+from src.keyword_code.smartreview import (
     ProposedValidation,
     Rule as SRRule,
     ValidationTemplate,
@@ -175,8 +175,15 @@ def run_auto_review_update():
             template = ValidationTemplate(name=f"Auto Review - {filename}", rules=rules_final)
             # Execute validation
             try:
+                import logging as _lg
+                _logger = _lg.getLogger(__name__)
+                _logger.info(f"Starting validation for {filename} with {len(rules_final)} rules...")
                 validation_results = run_async(execute_validation_template(template, doc_chunks)) or []
-            except Exception:
+                _logger.info(f"Validation completed for {filename}. Found {len(validation_results)} results.")
+            except Exception as e:
+                import logging as _lg
+                _logger = _lg.getLogger(__name__)
+                _logger.error(f"Validation failed for {filename}: {e}", exc_info=True)
                 validation_results = []
 
             # Build phrases for verification/highlighting
@@ -281,8 +288,15 @@ def run_auto_review_update():
             })
 
         if aggregated_results:
+            import logging as _lg
+            _logger = _lg.getLogger(__name__)
+            _logger.info(f"Storing {len(aggregated_results)} aggregated results in session state.")
+            for idx, res in enumerate(aggregated_results):
+                vr_count = len(res.get("validation_results", []))
+                _logger.info(f"  Result {idx+1}: {res.get('filename', 'unknown')} - {vr_count} validation results")
             st.session_state.analysis_results = aggregated_results
             st.session_state.results_just_generated = True
+            _logger.info("Results stored successfully. UI will update on next rerun.")
     except Exception as _e:
         # Non-fatal; keep UI responsive
         import logging as _lg

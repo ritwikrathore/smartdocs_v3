@@ -93,7 +93,7 @@ SAVED_PROMPTS = {
                     "5. What are the interest payment dates?\n"
                     "6. What are the interest terms, variable or fixed rate? Is it Term SOFR, NON-USD Index, or NCCR for different loans?\n"
                     "7. Interest shall accrue from day to day on what basis?\n"
-                    "8. What are the partial prepayment terms / prepayment premium and allocation of principal amounts outstanding.\n"
+                    "8. What are the terms for partial prepayment / prepayment premium and allocation of principal amounts outstanding.\n"
                     "9. What are the repayment terms and schedule?\n"
                     "10. What are all the fees the borrower shall pay and the amounts?\n"
                     "11. what is the commitment fee on undisbursed amount of the loan?\n"
@@ -121,6 +121,7 @@ SAVED_PROMPTS = {
             },
             {
                 "label": "Guarentee Analysis",
+                "explanation": "CNTPI Guarentee Agreement Analysis",
                 "prompt": (
                     "Check if clauses relating to the following keywords are present in the agreement:\n"
                     "1. Default\n"
@@ -135,60 +136,10 @@ SAVED_PROMPTS = {
     "Review": {
         "Financial Statement Review": [
             {
-                "label": "Numeric Precision Validation",
-                "explanation": "All billion-scale values must include decimal precision to avoid ambiguity.",
-                "prompt": "Verify that all billion values are expressed with decimal precision (e.g., '1.0 billion' not '1 billion')",
-            },
-            {
-                "label": "Currency Formatting Validation",
-                "explanation": "All currency names should use Sentence case (first letter capitalized, rest lowercase).",
-                "prompt": "Check that all currency references use proper Sentence case (e.g., 'Indian rupee' not 'Indian Rupee' or 'indian rupee')",
-            },
-            {
-                "label": "Language Intent and Spelling Validation",
-                "explanation": "Detect commonly confused words that change meaning due to spelling errors.",
-                "prompt": "Identify potential word confusion errors such as 'decease' vs 'decrease', 'principal' vs 'principle', 'affect' vs 'effect'",
-            },
-            {
-                "label": "Percentage Rate Formatting",
-                "explanation": "Interest rates and percentages should include a percent symbol and at least one decimal place for precision.",
-                "prompt": "Confirm that percentage rates include a '%' symbol and at least one decimal place (e.g., '5.5%' not '5%')",
-            },
-            {
-                "label": "Thousands Separator for Large Numbers",
-                "explanation": "Numbers greater than or equal to 1,000 should include thousands separators for readability.",
-                "prompt": "Flag numbers >= 1,000 that lack thousands separators (e.g., '10000' should be '10,000')",
-            },
-            {
-                "label": "ISO Currency Codes Formatting",
-                "explanation": "When currency codes are used, require uppercase three-letter ISO codes without punctuation.",
-                "prompt": "Ensure ISO currency codes are uppercase three-letter codes when used as codes (e.g., 'USD 1,000,000' not 'Usd 1,000,000' or '$US 1,000,000')",
-            },
-            {
-                "label": "Date Format Consistency",
-                "explanation": "Dates should follow one consistent format across the document.",
-                "prompt": "Ensure all dates follow the 'Month DD, YYYY' format (e.g., 'June 30, 2024' not '30/06/2024')",
-            },
-            {
-                "label": "Calculation Verification (Totals)",
-                "explanation": "Totals should equal the sum of their components, allowing a small rounding tolerance.",
-                "prompt": "Verify that 'Total Liabilities' equals 'Current Liabilities' + 'Non-current Liabilities' within a rounding tolerance of 1 unit",
-            },
-            {
-                "label": "Units Consistency (Thousands/Millions)",
-                "explanation": "Amounts within a section should use a consistent presentation unit (e.g., thousands or millions) and the unit must be stated.",
-                "prompt": "Check that amounts are consistently reported in the stated presentation unit (e.g., 'US$ in millions'); flag mixed units or missing unit declarations",
-            },
-            {
-                "label": "Negative Numbers Formatting",
-                "explanation": "Negative amounts should be displayed in parentheses rather than using a leading minus sign.",
-                "prompt": "Ensure negative amounts are displayed in parentheses (e.g., '(1,234)' not '-1,234')",
-            },
-            {
                 "label": "Comprehensive Financial Statement Validation",
                 "explanation": "Comprehensive checklist covering numeric formatting, currency conventions, terminology accuracy, calculation verification, and consistency checks.",
                 "prompt": """1) Verify that all billion values are expressed with decimal precision (e.g., '1.0 billion' not '1 billion')
-2) Check that all currency references use proper Sentence case (e.g., 'Indian rupee' not 'Indian Rupee' or 'indian rupee')
+2) Check that all currency references use proper case sensitivity where only the first letter is capitalized (e.g., 'Indian rupee' not 'Indian Rupee' or 'indian rupee')
 3) Identify potential word confusion errors such as 'decease' vs 'decrease', 'principal' vs 'principle', 'affect' vs 'effect'
 4) Confirm that percentage rates include a '%' symbol and at least one decimal place (e.g., '5.5%' not '5%')
 5) Flag numbers >= 1,000 that lack thousands separators (e.g., '10000' should be '10,000')
@@ -197,9 +148,7 @@ SAVED_PROMPTS = {
 8) Verify that 'Total Liabilities' equals 'Current Liabilities' + 'Non-current Liabilities' within a rounding tolerance of 1 unit
 9) Check that amounts are consistently reported in the stated presentation unit (e.g., 'US$ in millions'); flag mixed units or missing unit declarations
 10) Ensure negative amounts are displayed in parentheses (e.g., '(1,234)' not '-1,234')""",
-
             },
-
         ]
     },
 }

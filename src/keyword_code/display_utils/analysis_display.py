@@ -1,0 +1,804 @@
+"""
+Analysis results display functions.
+"""
+
+import streamlit as st
+import base64
+import json
+import re
+import pandas as pd
+import fitz
+from io import BytesIO
+from datetime import datetime
+from typing import Dict, List, Any
+from ..config import logger, RAG_TOP_K
+from ..models.embedding import load_embedding_model, load_reranker_model
+from ..rag.retrieval import retrieve_relevant_chunks_for_chat
+from ..utils.async_utils import run_async
+from ..ai.analyzer import DocumentAnalyzer
+from ..ai.chat import generate_chat_response
+from .pdf_utils import update_pdf_view, regenerate_annotated_pdfs_from_chat_chunks
+from .citation_utils import (
+    process_chat_response_for_numbered_citations,
+    display_followup_citations_like_main_analysis,
+    display_chat_message_with_citations
+)
+from .export_utils import export_to_word
+
+# Load the embedding model using the cached function
+embedding_model = load_embedding_model()
+reranker_model = load_reranker_model()
+
+
+def display_analysis_results(results: List[Dict[str, Any]]):
+    """
+    Displays the analysis results in a structured format with a two-column layout.
+    Left column shows AI analysis, right column shows tools including PDF viewer, chat, and export options.
+
+    Args:
+        results: A list of result dictionaries, each containing analysis data for a file
+    """
+    # Initialize followup_qa if it doesn't exist
+    if "followup_qa" not in st.session_state:
+        st.session_state.followup_qa = []
+
+    if not results:
+        st.warning("No analysis results to display.")
+        return
+
+    # Define CSS styles based on app.py.bak
+    st.markdown("""
+    <style>
+    .header-title {
+        font-weight: 700;
+        font-size: 1.5rem;
+        color: #333; /* From app.py.bak's .header-title */
+        margin: 0;
+        padding: 0;
+    }
+    .sleek-container {
+        background-color: #f5f5f5;
+        border-radius: 8px;
+        padding: 8px 16px;
+        margin: 0 0 16px 0;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        border: 1px solid #e0e0e0;
+    }
+    .file-name {
+        font-weight: 600;
+        color: #424242; /* From app.py.bak's .file-name */
+        font-size: 1rem;
+        display: flex;
+        align-items: center;
+        margin: 0;
+        padding: 0;
+    }
+    .file-icon {
+        color: #1976d2; /* From app.py.bak's .file-icon */
+        margin-right: 8px;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    # Create a two-column layout for the analysis results
+    analysis_col, tools_col = st.columns([2.5, 1.5], gap="small")
+
+    # Add an anchor for auto-scrolling
+    st.markdown('<div id="results-anchor"></div>', unsafe_allow_html=True)
+
+    # Left Column: AI Analysis Display
+    with analysis_col:
+        # Header style from app.py.bak
+        st.markdown('<div class="header-title">AI Analysis Results</div>', unsafe_allow_html=True)
+        st.markdown('<hr style="margin: 12px 0; border: 0; border-top: 1px solid #e0e0e0;">', unsafe_allow_html=True)
+
+        # Create a scrollable container for the analysis
+        with st.container(height=1300, border=True):
+            # Process results to extract only those with real analysis
+            results_with_real_analysis = []
+            for result in results:
+                try:
+                    filename = result.get("filename", "Unknown File")
+                    ai_analysis_str = result.get("ai_analysis", "{}")
+
+                    try:
+                        ai_analysis = json.loads(ai_analysis_str)
+                        # Only include results with actual analysis sections
+                        if ai_analysis.get("analysis_sections", {}):
+                            results_with_real_analysis.append((result, ai_analysis))
+                    except json.JSONDecodeError:
+                        logger.error(f"Failed to parse analysis JSON for {filename}")
+                        continue
+                except Exception as e:
+                    logger.error(f"Error processing result for {result.get('filename', 'unknown')}: {e}")
+
+            # If we have results with analysis, create tabs for each document
+            if results_with_real_analysis:
+                tab_titles = [res[0].get("filename", f"Result {i+1}") for i, res in enumerate(results_with_real_analysis)]
+                tabs = st.tabs(tab_titles)
+
+                for i, (result, ai_analysis) in enumerate(results_with_real_analysis):
+                    with tabs[i]:
+                        filename = result.get("filename", "Unknown File")
+                        annotated_pdf_b64 = result.get("annotated_pdf")
+
+                        # File info and download button row (app.py.bak style)
+                        file_col1, file_col2 = st.columns([0.8, 0.2])
+                        with file_col1:
+                            st.markdown(f"""
+                            <div class="sleek-container">
+                                <div class="file-name">
+                                    <span class="file-icon">📄</span> {filename}
+                                </div>
+                            </div>
+                            """, unsafe_allow_html=True)
+
+                        with file_col2:
+                            if annotated_pdf_b64:
+                                annotated_pdf_bytes = base64.b64decode(annotated_pdf_b64)
+                                # Simpler label from app.py.bak
+                                download_label = "💾 PDF"
+                                st.download_button(
+                                    label=download_label,
+                                    data=annotated_pdf_bytes,
+                                    file_name=f"{filename.replace('.pdf', '').replace('.docx', '')}_annotated.pdf",
+                                    mime="application/pdf",
+                                    key=f"download_pdf_{i}_{filename}",  # Ensure unique key
+                                    use_container_width=True,  # Consistent with app.py.bak button style
+                                    help=f"Download annotated PDF for {filename}"  # Added help text
+                                )
+                            else:
+                                st.caption("No PDF")
+
+                        # Display analysis sections
+                        analysis_sections = ai_analysis.get("analysis_sections", {})
+                        citation_counter = 0  # For numbering citations within a tab
+
+                        for section_key, section_data in analysis_sections.items():
+                            # Extract the actual title from the section key (removing "section_n_" prefix)
+                            # Example: "section_1_investment_amount" -> "investment amount"
+                            section_title = section_key
+                            # Check if it follows the pattern section_N_title
+                            if re.match(r'^section_\d+_', section_key):
+                                # Extract just the title part after section_N_
+                                section_title = re.sub(r'^section_\d+_', '', section_key)
+
+                            # Format section name for display
+                            display_section_name = section_title.replace("_", " ").title()
+
+                            # Create a container for the section title with improved styling and RAG retry button
+                            with st.container(border=False):
+                                # Create columns for title and RAG retry button
+                                title_col, rag_col = st.columns([0.92, 0.08])
+
+                                with title_col:
+                                    st.markdown(f"""
+                                        <div style='background-color: #f5f5f5; padding: 0px 16px; border-radius: 8px;
+                                                margin: 16px 0 8px 0; border-left: 4px solid #1976d2;'>
+                                            <h4 style='color: #333; font-size: 1.2rem; margin: 0; font-weight: 600;'>
+                                                {display_section_name}
+                                            </h4>
+                                        </div>
+                                    """, unsafe_allow_html=True)
+
+                                with rag_col:
+                                    st.markdown('<div style="margin-top: 16px;">', unsafe_allow_html=True)
+                                    # Add RAG retry button in the header
+                                    display_rag_retry_button_header(section_key, result, section_data)
+                                    st.markdown('</div>', unsafe_allow_html=True)
+
+                            # Display RAG analysis and retry results if available (below the header)
+                            # Retry results are integrated into the main view; no separate section
+
+                            # Section content in a bordered container
+                            with st.container(border=True):
+                                analysis_content = section_data.get("Analysis")
+                                context_content = section_data.get("Context")
+
+                                if analysis_content:
+                                    analysis_html_parts = [
+                                        f"<div style='background-color: #f8f9fa; padding: .5rem; border-radius: 0.5rem; margin-bottom: 1rem;'>",
+                                        f"<h4 style='color: #1e88e5; font-size: 1.1rem;'>Analysis</h4>",
+                                        f"<div style='color: #424242; line-height: 1.6;'>{analysis_content}"
+                                    ]
+                                    if context_content:
+                                        analysis_html_parts.extend([
+                                            f"<div style='margin-top: 0.8rem; border-top: 1px solid #e0e0e0; padding-top: 0.8rem;'>",
+                                            f"<span style='color: #1b5e20; font-size: 0.9rem; line-height: 1.4;'>{context_content}</span>",
+                                            f"</div>"
+                                        ])
+                                    analysis_html_parts.extend(["</div></div>"])
+                                    st.markdown("".join(analysis_html_parts), unsafe_allow_html=True)
+                                elif context_content:  # Display context even if analysis is missing
+                                    st.markdown(f"""
+                                        <div style='background-color: #f8f9fa; padding: .5rem; border-radius: 0.5rem; margin-bottom: 1rem;'>
+                                            <h4 style='color: #1e88e5; font-size: 1.1rem;'>Context</h4>
+                                            <div style='color: #424242; line-height: 1.6;'>
+                                                <span style='color: #1b5e20; font-size: 0.9rem; line-height: 1.4;'>{context_content}</span>
+                                            </div>
+                                        </div>
+                                    """, unsafe_allow_html=True)
+
+                            # Supporting Citations in an expander
+                            supporting_phrases = section_data.get("Supporting_Phrases", [])
+                            verification_results = result.get("verification_results", {})
+                            phrase_locations = result.get("phrase_locations", {})
+
+                            any_needs_review = False
+                            if supporting_phrases and supporting_phrases != ["No relevant phrase found."]:
+                                for phrase in supporting_phrases:
+                                    phrase_verification = verification_results.get(phrase, {})
+                                    if isinstance(phrase_verification, dict):
+                                        is_verified = phrase_verification.get("verified", False)
+                                    elif isinstance(phrase_verification, bool):
+                                        is_verified = phrase_verification
+                                    else:
+                                        is_verified = bool(phrase_verification)  # Fallback
+                                    if not is_verified:
+                                        any_needs_review = True
+                                        break
+
+                            # Determine expansion behavior based on mode
+                            # Review mode: always expanded
+                            # Ask mode: only expanded when status is "needs review"
+                            current_mode = st.session_state.get("smartdocs_mode", "Ask")
+                            should_expand = (current_mode == "Review") or any_needs_review
+
+                            with st.expander("Supporting Citations", expanded=should_expand):
+                                # If optimized RAG results exist for this section, use them to REPLACE the citations display
+                                # Disabled displaying optimized RAG results separately; use verified citations from analysis
+                                new_results = []
+
+                                if new_results:
+                                    # This section handles optimized RAG results (currently disabled)
+                                    pass
+                                else:
+                                    # Fallback to original citations if no optimized results
+                                    if not supporting_phrases or supporting_phrases == ["No relevant phrase found."]:
+                                        st.info("No supporting citations were identified for this section.")
+                                    else:
+                                        has_citations_to_show = False
+                                        for phrase_idx, phrase in enumerate(supporting_phrases):
+                                            if not isinstance(phrase, str) or phrase == "No relevant phrase found.":
+                                                continue
+                                            has_citations_to_show = True
+                                            citation_counter += 1  # Increment citation counter
+
+                                            phrase_verification = verification_results.get(phrase, {})
+                                            phrase_location_data = phrase_locations.get(phrase, {})
+
+                                            is_verified = False
+                                            score = 0
+                                            best_location_dict = {}
+
+                                            if isinstance(phrase_verification, bool):
+                                                is_verified = phrase_verification
+                                            elif isinstance(phrase_verification, dict):
+                                                is_verified = phrase_verification.get("verified", False)
+                                                score = phrase_verification.get("score", 0)
+                                            else:
+                                                try:
+                                                    is_verified = bool(phrase_verification)
+                                                except:
+                                                    is_verified = False
+
+                                            current_page_num_info = "Page unknown"
+                                            current_score_info = "N/A"
+
+                                            # Choose the best location instead of taking the first one
+                                            best_location_dict = {}
+                                            candidate_locs = []
+                                            if isinstance(phrase_location_data, list):
+                                                candidate_locs = [loc for loc in phrase_location_data if isinstance(loc, dict)]
+                                            elif isinstance(phrase_location_data, dict):
+                                                # Some pipelines might store a single dict or include a 'best_match'
+                                                if 'best_match' in phrase_location_data and isinstance(phrase_location_data['best_match'], dict):
+                                                    candidate_locs = [phrase_location_data['best_match']]
+                                                else:
+                                                    candidate_locs = [phrase_location_data]
+
+                                            if candidate_locs:
+                                                # Prefer exact > cross-page/special > fuzzy > individual fallback > fallback; then by highest score
+                                                method_priority = {
+                                                    'exact': 5,
+                                                    'exact_cleaned_search': 5,
+                                                    'special_case_quotes_handling': 3,
+                                                    'cross_page_fuzzy_match_part1': 2,
+                                                    'cross_page_fuzzy_match_part2': 2,
+                                                    'fuzzy': 2,
+                                                    'fuzzy_chunk_fallback_individual': 1,
+                                                    'fuzzy_chunk_fallback': 0
+                                                }
+
+                                                def loc_key(loc):
+                                                    method = loc.get('method', '')
+                                                    score_val = loc.get('match_score', 0) or 0
+                                                    try:
+                                                        score_val = float(score_val)
+                                                    except Exception:
+                                                        score_val = 0.0
+                                                    return (method_priority.get(method, -1), score_val)
+
+                                                best_location_dict = max(candidate_locs, key=loc_key)
+                                                page_num_val = best_location_dict.get("page_num")
+                                                if isinstance(page_num_val, int):
+                                                    current_page_num_info = f"Page {page_num_val + 1}"
+                                                else:
+                                                    current_page_num_info = f"Page {page_num_val}" if page_num_val is not None else "Page unknown"
+
+                                                score_val = best_location_dict.get("match_score", score)
+                                                if score_val:
+                                                    try:
+                                                        current_score_info = f"{float(score_val):.1f}"
+                                                    except Exception:
+                                                        current_score_info = str(score_val)
+                                                else:
+                                                    if score:
+                                                        try:
+                                                            current_score_info = f"{float(score):.1f}"
+                                                        except Exception:
+                                                            current_score_info = str(score)
+
+                                                # Log all candidates to help diagnose selection issues
+                                                try:
+                                                    cand_summaries = []
+                                                    for loc in candidate_locs:
+                                                        p = loc.get('page_num')
+                                                        p_disp = (p + 1) if isinstance(p, int) else p
+                                                        m = loc.get('method', '')
+                                                        s = loc.get('match_score', 0)
+                                                        try:
+                                                            s = float(s) if s is not None else 0.0
+                                                        except Exception:
+                                                            s = 0.0
+                                                        cand_summaries.append(f"p={p_disp}, m={m}, s={s:.2f}")
+                                                    logger.debug(f"Candidates for phrase '{phrase[:50]}...': [" + "; ".join(cand_summaries) + "]")
+                                                except Exception as _e:
+                                                    logger.debug("Error building candidate summaries for logging")
+                                                logger.debug(f"Selected best location out of {len(candidate_locs)} candidates for phrase '{phrase[:50]}...': page={page_num_val}")
+                                            else:
+                                                logger.debug(f"No candidate locations available for phrase '{phrase[:50]}...' to determine page")
+
+                                            if is_verified:
+                                                badge_html = '<span style="display: inline-block; background-color: #d1fecf; color: #11631a; padding: 1px 6px; border-radius: 0.25rem; font-size: 0.8em; margin-left: 5px; border: 1px solid #a1e0a3; font-weight: 600;">✔ Verified</span>'
+                                            else:
+                                                badge_html = '<span style="display: inline-block; background-color: #ffeacc; color: #a05e03; padding: 1px 6px; border-radius: 0.25rem; font-size: 0.8em; margin-left: 5px; border: 1px solid #f8c78d; font-weight: 600;">⚠️ Needs Review</span>'
+
+                                            cite_col, btn_col = st.columns([0.90, 0.10], gap="small")
+                                            with cite_col:
+                                                st.markdown(f"""
+                                                <div style="border: 1px solid #e0e0e0; border-radius: 5px; padding: 8px 12px; margin-top: 5px; margin-bottom: 8px; background-color: #f9f9f9;">
+                                                    <div style="margin-bottom: 5px; display: flex; justify-content: space-between; align-items: center;">
+                                                        <span style="font-weight: bold;">Citation {citation_counter} {badge_html}</span>
+                                                        <span style="font-size: 0.8em; color: #555;">{current_page_num_info} | Score: {current_score_info}</span>
+                                                    </div>
+                                                    <div style="color: #333; line-height: 1.4; font-size: 0.95em;"><i>"{phrase}"</i></div>
+                                                </div>
+                                                """, unsafe_allow_html=True)
+
+                                            with btn_col:
+                                                st.markdown('<div style="margin-top: 20px;"></div>', unsafe_allow_html=True)
+                                                if is_verified and best_location_dict and isinstance(best_location_dict, dict) and "page_num" in best_location_dict and annotated_pdf_b64:
+                                                    try:
+                                                        page_num_to_go = best_location_dict["page_num"]
+                                                        page_num_1_indexed = page_num_to_go + 1 if isinstance(page_num_to_go, int) else int(page_num_to_go) + 1
+                                                        button_key = f"goto_{i}_{section_key}_{citation_counter}_{phrase_idx}"
+                                                        if st.button("Go", key=button_key, type="secondary", help=f"Go to Page {page_num_1_indexed} in {filename}", use_container_width=True):
+                                                            pdf_bytes_for_view = base64.b64decode(annotated_pdf_b64)
+                                                            update_pdf_view(pdf_bytes=pdf_bytes_for_view, page_num=page_num_1_indexed, filename=filename)
+                                                            st.session_state.scroll_to_pdf_viewer = True
+                                                            st.rerun()
+                                                    except Exception as e_go:
+                                                        logger.error(f"Error setting up 'Go' button for citation: {e_go}")
+                                                elif is_verified:
+                                                    st.caption("Loc N/A")
+
+                                        if not has_citations_to_show:
+                                            st.caption("No supporting citations provided or found for this section.")
+
+                            # Facts display removed per request (use Export Results > Export Facts)
+            else:  # No results_with_real_analysis
+                st.info("Processing complete, but no analysis sections were generated or found.")
+
+            # Add Follow-up Question Interface at the bottom of the analysis results
+            st.markdown('<hr style="margin: 20px 0; border: 0; border-top: 2px solid #e0e0e0;">', unsafe_allow_html=True)
+            st.markdown('<div class="header-title" style="font-size: 1.3rem;">Follow-up Questions [Beta]</div>', unsafe_allow_html=True)
+            st.markdown('<hr style="margin: 12px 0; border: 0; border-top: 1px solid #e0e0e0;">', unsafe_allow_html=True)
+
+            # Display existing follow-up Q&A if any
+            if st.session_state.get("followup_qa"):
+                for i, qa_pair in enumerate(st.session_state.get("followup_qa", [])):
+                    # Question
+                    st.markdown(f"""
+                    <div style='background-color: #e3f2fd; padding: 12px; border-radius: 8px; margin: 8px 0; border-left: 4px solid #1976d2;'>
+                        <strong>Q{i+1}:</strong> {qa_pair['question']}
+                    </div>
+                    """, unsafe_allow_html=True)
+
+                    # Answer with citations
+                    with st.container(border=True):
+                        processed_text = qa_pair.get("processed_text", qa_pair.get("answer", ""))
+                        citation_details = qa_pair.get("citation_details", [])
+
+                        # Display the answer text
+                        st.markdown(f"""
+                        <div style='background-color: #f8f9fa; padding: 12px; border-radius: 8px; margin-bottom: 8px;'>
+                            <div style='color: #424242; line-height: 1.6;'>{processed_text}</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                        # Display citations if any
+                        if citation_details:
+                            with st.expander("Supporting Citations", expanded=False):
+                                # Use processed_text which contains the citation numbers [1], [2], etc.
+                                processed_answer_text = qa_pair.get("processed_text", qa_pair.get("answer", ""))
+                                display_followup_citations_like_main_analysis(citation_details, i, processed_answer_text)
+
+            # Follow-up question input
+            followup_question = st.text_input(
+                "Ask a follow-up question about the analysis:",
+                placeholder="e.g., Can you provide more details about the investment timeline?",
+                key="followup_question_input"
+            )
+
+            col1, _ = st.columns([1, 4])
+            with col1:
+                ask_followup = st.button(
+                    "Ask Follow-up Question",
+                    key="ask_followup_button",
+                    type="primary",
+                    disabled=not followup_question.strip(),
+                    use_container_width=True
+                )
+
+            # Process follow-up question
+            if ask_followup and followup_question.strip():
+                with st.spinner("Processing your follow-up question..."):
+                    try:
+                        logger.info(f"Processing follow-up question: {followup_question[:50]}...")
+
+                        # Use the same RAG pipeline as chat with same retrieval depth as main analysis
+                        relevant_chunks = retrieve_relevant_chunks_for_chat(
+                            prompt=followup_question,
+                            top_k_per_doc=RAG_TOP_K,
+                            embedding_model=embedding_model,
+                            reranker_model=reranker_model,
+                            preprocessed_data=st.session_state.get("preprocessed_data", {})
+                        )
+
+                        # Generate response using the same analyzer
+                        analyzer = DocumentAnalyzer()
+                        raw_response = run_async(
+                            generate_chat_response(
+                                analyzer,
+                                followup_question,
+                                relevant_chunks
+                            )
+                        )
+
+                        # Process response for citations
+                        processed_text, citation_details = process_chat_response_for_numbered_citations(raw_response)
+
+                        # Refresh PDF highlighting to reflect the new RAG chunks
+                        try:
+                            regenerate_annotated_pdfs_from_chat_chunks(relevant_chunks)
+                        except Exception as _e:
+                            logger.warning(f"Could not refresh PDF highlights for follow-up: {_e}")
+
+                        # Store the Q&A pair
+                        qa_pair = {
+                            "question": followup_question,
+                            "answer": raw_response,
+                            "processed_text": processed_text,
+                            "citation_details": citation_details,
+                            "timestamp": datetime.now().isoformat()
+                        }
+
+                        # Ensure followup_qa exists before appending
+                        if "followup_qa" not in st.session_state:
+                            st.session_state.followup_qa = []
+                        st.session_state.followup_qa.append(qa_pair)
+                        logger.info("Follow-up question processed successfully")
+
+                        # Clear the input and rerun to show the new Q&A
+                        st.rerun()
+
+                    except Exception as e:
+                        logger.error(f"Error processing follow-up question: {e}", exc_info=True)
+                        st.error(f"Sorry, an error occurred while processing your follow-up question: {str(e)}")
+
+            if not st.session_state.get("followup_qa") and not followup_question.strip():
+                st.info("💡 Ask follow-up questions to get more specific insights about your documents. The AI will use the same document context to provide detailed answers.")
+
+    # Right Column: Tools & PDF Viewer
+    from .tools_column import display_tools_column
+    display_tools_column(results_with_real_analysis, tools_col)
+
+
+def display_rag_retry_button_header(section_key: str, result: Dict[str, Any], section_data: Dict[str, Any]):
+    """
+    Display RAG retry button in the section header.
+
+    Args:
+        section_key: The section identifier
+        result: Result dictionary containing analysis data
+        section_data: The specific section data
+    """
+    # Create a unique key for this section's retry button
+    retry_key = f"retry_rag_{section_key}_{result.get('filename', 'unknown')}"
+
+    # Since this function is called within a column context, we cannot create nested columns
+    # Instead, we'll create buttons directly without columns, stacked vertically
+    # Analyze button removed per new agent/tool design
+
+    if st.button("↻", key=f"retry_{retry_key}", help="Retry Retrieval", use_container_width=True):
+        # Store the retry request in session state
+        if "rag_retry_requests" not in st.session_state:
+            st.session_state.rag_retry_requests = {}
+
+        st.session_state.rag_retry_requests[section_key] = {
+            "status": "requested",
+            "section_data": section_data,
+            "result": result
+        }
+        st.rerun()
+
+
+def display_rag_results_section(section_key: str):
+    """
+    Display RAG analysis and retry results for a section.
+
+    Args:
+        section_key: The section identifier
+    """
+    # Display analysis results if available
+    if hasattr(st.session_state, 'rag_analysis_results') and section_key in st.session_state.rag_analysis_results:
+        analysis = st.session_state.rag_analysis_results[section_key]
+
+        with st.expander("📊 RAG Analysis Results", expanded=False):
+            col1, col2 = st.columns(2)
+
+            with col1:
+                st.metric("Query Type", analysis.get("query_type", "Unknown"))
+                st.metric("Quality Score", f"{analysis.get('current_quality_score', 0):.2f}")
+
+            with col2:
+                st.metric("Recommended BM25 Weight", f"{analysis.get('recommended_bm25_weight', 0.5):.2f}")
+                st.metric("Recommended Semantic Weight", f"{analysis.get('recommended_semantic_weight', 0.5):.2f}")
+
+            if analysis.get("issues_identified"):
+                st.markdown("**Issues Identified:**")
+                for issue in analysis["issues_identified"]:
+                    st.markdown(f"• {issue}")
+
+            if analysis.get("reasoning"):
+                st.markdown("**Reasoning:**")
+                st.markdown(analysis["reasoning"])
+
+    # Display retry results if available
+    if hasattr(st.session_state, 'rag_retry_results') and section_key in st.session_state.rag_retry_results:
+        retry_data = st.session_state.rag_retry_results[section_key]
+
+        with st.expander("🔄 RAG Retry Results", expanded=False):
+            st.markdown("**New Retrieval Results:**")
+
+            new_results = retry_data.get("new_results", [])
+            if new_results:
+                for i, chunk in enumerate(new_results[:3]):  # Show top 3 results
+                    st.markdown(f"**Result {i+1}** (Score: {chunk.get('score', 0):.3f})")
+                    # Convert from 0-based to 1-based page numbering for display
+                    page_num = chunk.get('page_num', 'Unknown')
+                    if isinstance(page_num, int):
+                        page_display = page_num + 1
+                    else:
+                        page_display = page_num
+                    st.markdown(f"*Page {page_display}*")
+                    st.markdown(chunk.get('text', '')[:200] + '...')
+                    st.markdown("---")
+            else:
+                st.info("No new results retrieved")
+
+            # Show comparison with original results
+            original_results = retry_data.get("original_results", [])
+            original_count = len(original_results) if isinstance(original_results, list) else 0
+            new_count = len(new_results)
+            st.metric("Results Comparison", f"{new_count} new vs {original_count} original")
+
+        # If we produced a new AI analysis for this retry, show it with validation and facts
+        ai_section = retry_data.get("ai_section")
+        if ai_section:
+            with st.expander("🧠 AI Response (Retry) + Validation", expanded=True):
+                # Analysis text
+                analysis_text = ai_section.get("Analysis", "")
+                if analysis_text:
+                    st.markdown("**Analysis (Retry):**")
+                    st.markdown(analysis_text)
+                else:
+                    st.info("No analysis text available from retry.")
+
+                # Verified supporting citations
+                supporting = ai_section.get("Supporting_Phrases", []) or []
+                ver_results = retry_data.get("verification_results", {}) or {}
+                phrase_locs = retry_data.get("phrase_locations", {}) or {}
+                if supporting and supporting != ["No relevant phrase found."]:
+                    st.markdown("**Verified Supporting Citations:**")
+                    for idx, phrase in enumerate(supporting, start=1):
+                        v = ver_results.get(phrase, False)
+                        is_verified = v.get("verified", False) if isinstance(v, dict) else bool(v)
+                        icon = "✅" if is_verified else "⚠️"
+                        # Choose best location instead of first
+                        pinfo = ""
+                        locs = phrase_locs.get(phrase, [])
+                        candidate_locs = [loc for loc in locs if isinstance(loc, dict)] if isinstance(locs, list) else []
+                        if candidate_locs:
+                            method_priority = {
+                                'exact': 5,
+                                'exact_cleaned_search': 5,
+                                'special_case_quotes_handling': 3,
+                                'cross_page_fuzzy_match_part1': 2,
+                                'cross_page_fuzzy_match_part2': 2,
+                                'fuzzy': 2,
+                                'fuzzy_chunk_fallback_individual': 1,
+                                'fuzzy_chunk_fallback': 0
+                            }
+
+                            def loc_key(loc):
+                                method = loc.get('method', '')
+                                score_val = loc.get('match_score', 0) or 0
+                                try:
+                                    score_val = float(score_val)
+                                except Exception:
+                                    score_val = 0.0
+                                return (method_priority.get(method, -1), score_val)
+
+                            best_loc = max(candidate_locs, key=loc_key)
+                            page_val = best_loc.get("page_num")
+                            try:
+                                # Log all candidates for diagnostics
+                                cand_summaries = []
+                                for loc in candidate_locs:
+                                    p = loc.get('page_num')
+                                    p_disp = (p + 1) if isinstance(p, int) else p
+                                    m = loc.get('method', '')
+                                    s = loc.get('match_score', 0)
+                                    try:
+                                        s = float(s) if s is not None else 0.0
+                                    except:
+                                        s = 0.0
+                                    cand_summaries.append(f"p={p_disp}, m={m}, s={s:.2f}")
+                                logger.debug(f"[Retry] Candidates for phrase '{phrase[:50]}...': [" + "; ".join(cand_summaries) + "]")
+                                logger.debug(f"[Retry] Selected best location page={page_val}")
+                            except Exception:
+                                pass
+                            if isinstance(page_val, int):
+                                pinfo = f" (Page {page_val + 1})"
+                            elif page_val is not None:
+                                pinfo = f" (Page {page_val})"
+                        st.markdown(f"{icon} [{idx}] {phrase}{pinfo}")
+                else:
+                    st.info("No supporting phrases identified by the retry analysis.")
+
+                # Facts display removed per request (use Export Results > Export Facts)
+
+
+def display_section_facts_expander(section_key: str, section_data: Dict[str, Any], result: Dict[str, Any], citation_counter: int = 0):
+    """
+    Display extracted facts in an expander for a specific section.
+
+    Args:
+        section_key: The section identifier
+        section_data: The specific section data containing Analysis text
+        result: Result dictionary containing filename and other metadata
+        citation_counter: Current citation counter for consistent numbering
+    """
+
+    # Check if we have facts for this specific section
+    section_facts_key = f"section_facts_{section_key}_{result.get('filename', 'unknown')}"
+
+    # Check if facts extraction is in progress or completed for this section
+    if hasattr(st.session_state, 'section_facts') and section_facts_key in st.session_state.section_facts:
+        facts_data = st.session_state.section_facts[section_facts_key]
+
+        if facts_data.get("status") == "completed" and facts_data.get("facts"):
+            facts = facts_data["facts"]
+
+            st.markdown("--- ")
+            st.markdown("##### 📊 Extracted Facts")
+            # Group facts by category
+            facts_by_category = {}
+            for fact in facts:
+                category = fact.get("category", "General")
+                if category not in facts_by_category:
+                    facts_by_category[category] = []
+                facts_by_category[category].append(fact)
+
+            # Display each category
+            for category, category_facts in facts_by_category.items():
+                if len(facts_by_category) > 1:
+                    st.markdown(f"**{category.replace('_', ' ').title()}:**")
+
+                for fact in category_facts:
+                    fact_text = fact.get("text", "")
+                    attributes = fact.get("attributes", {})
+
+                    # Compact, badge-like fact display
+                    fact_html = f'<div style="margin: 4px 0; font-size: 0.92em; color: #333;">'
+                    fact_html += f'<span style="display:inline-block; padding:2px 8px; border-radius:999px; background:#eef5ff; color:#1e88e5; border:1px solid #cfe3ff; font-weight:600; margin-right:8px;">{category.replace("_", " ").title()}</span>'
+                    fact_html += f'{fact_text}'
+
+                    if attributes:
+                        fact_html += '<span style="margin-left:8px; color:#666;">'
+                        for key, value in list(attributes.items())[:3]:
+                            fact_html += f'<span style="display:inline-block; padding:1px 6px; border-radius:999px; background:#f5f5f5; border:1px solid #e0e0e0; margin-right:6px; font-size:0.85em;">{key.replace("_", " ").title()}: {value}</span>'
+                        fact_html += '</span>'
+
+                    fact_html += '</div>'
+                    st.markdown(fact_html, unsafe_allow_html=True)
+
+            # Show extraction metadata
+            metadata = facts_data.get("metadata", {})
+            if metadata:
+                st.caption(f"Extracted {len(facts)} facts using {metadata.get('model_used', 'Unknown model')}")
+
+        elif facts_data.get("status") == "processing":
+            st.markdown("--- ")
+            st.markdown("##### 📊 Extracted Facts")
+            st.info("🔄 Extracting facts from analysis...")
+
+        elif facts_data.get("status") == "error":
+            st.markdown("--- ")
+            st.markdown("##### 📊 Extracted Facts")
+            error_msg = facts_data.get("error", "Unknown error")
+            st.error(f"❌ Error extracting facts from analysis: {error_msg}")
+
+            # Add retry button
+            if st.button(f"🔄 Retry Fact Extraction", key=f"retry_facts_{section_facts_key}"):
+                # Reset the request status to trigger retry
+                if "section_facts_requests" in st.session_state:
+                    st.session_state.section_facts_requests[section_facts_key] = {
+                        "status": "requested",
+                        "section_key": section_key,
+                        "analysis_text": section_data.get("Analysis", ""),
+                        "section_data": section_data,
+                        "result": result
+                    }
+                st.session_state.section_facts[section_facts_key] = {"status": "processing"}
+                st.rerun()
+
+    else:
+        # Always show the facts section, even if no facts are available yet
+        st.markdown("--- ")
+        st.markdown("##### 📊 Extracted Facts")
+
+        # Trigger fact extraction for this section if not already done
+        if section_data.get("Analysis"):
+            # Perform extraction synchronously to avoid per-section reruns
+            from src.keyword_code.services.fact_extraction_service import FactExtractionService
+            try:
+                fact_service = FactExtractionService()
+                extracted_facts = fact_service.extract_facts_from_text(
+                    text=section_data.get("Analysis", ""),
+                    context=f"Legal/Financial Analysis - Section: {section_key}",
+                    section_name=section_key,
+                    filename=result.get("filename", "Unknown")
+                )
+                if "section_facts" not in st.session_state:
+                    st.session_state.section_facts = {}
+                st.session_state.section_facts[section_facts_key] = {
+                    "status": "completed",
+                    "facts": extracted_facts.get("extracted_facts", []),
+                    "metadata": {
+                        "model_used": "Pydantic-AI Fact Extraction",
+                        "total_extractions": len(extracted_facts.get("extracted_facts", [])),
+                        "section_key": section_key
+                    }
+                }
+            except Exception as _fe_err:
+                logger.error(f"Synchronous fact extraction error for section {section_key}: {_fe_err}")
+                st.session_state.section_facts[section_facts_key] = {"status": "error", "error": str(_fe_err)}
+            st.caption("Facts extracted using LLM-based analysis.")
+        else:
+            st.info("No analysis text available for fact extraction.")
+

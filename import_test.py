@@ -1,11 +1,16 @@
 import sys
-sys.path.append(r'c:\Users\rrathore1\Projects\keyword_code_v3')
 import importlib
 import traceback
+from pathlib import Path
+
+# Add project root to path
+project_root = Path(__file__).parent
+sys.path.insert(0, str(project_root))
 
 importlib.invalidate_caches()
 try:
-    import SmartReview as SR
+    # Import SmartReview from src/smartreview directory
+    import src.smartreview.smartreview as SR
     print('Imported SmartReview OK')
 except Exception:
     traceback.print_exc()

@@ -52,7 +52,7 @@ from .utils.ui_helpers import (
     apply_ui_styling, render_branding, initialize_session_state,
     display_welcome_features, clear_session_for_new_query, clear_incompatible_embeddings
 )
-from .utils.display import display_analysis_results, display_pdf_viewer, update_pdf_view
+from .display_utils import display_analysis_results, display_pdf_viewer, update_pdf_view
 from .utils.file_manager import (
     create_temp_file, create_temp_dir, remove_temp_file, remove_temp_dir,
     cleanup_session_files, cleanup_all_temp_files, create_session_temp_file,

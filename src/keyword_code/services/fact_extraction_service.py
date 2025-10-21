@@ -15,6 +15,9 @@ from ..agents.fact_extraction_agent import (
     FactExtractionResult,
     ExtractedFact
 )
+import re
+from io import BytesIO
+import pandas as pd
 
 
 class FactExtractionService:
@@ -388,4 +391,90 @@ class FactExtractionService:
 
         logger.info(f"Completed fact extraction for {len(results)} analyses")
         return results
+
+
+def sanitize_sheet_name(name: str, existing: Optional[set] = None) -> str:
+    """
+    Sanitize a string to be a valid Excel sheet name.
+
+    - Replaces invalid characters with underscores: \\ / * ? : [ ]
+    - Trims to Excel's 31 character limit
+    - Handles duplicates by appending " (n)" while keeping within the 31-char limit
+
+    Args:
+        name: Original sheet name (usually the document/filename)
+        existing: Optional set of already used sheet names to avoid collisions
+
+    Returns:
+        A sanitized, unique sheet name safe for Excel
+    """
+    if existing is None:
+        existing = set()
+
+    # Replace forbidden characters
+    cleaned = re.sub(r"[\\\\\/*\?:\[\]]", "_", str(name or ""))
+    cleaned = cleaned.strip()
+
+    if not cleaned:
+        cleaned = "Sheet"
+
+    max_len = 31
+    # Base name to use for truncation; leave room for duplicate suffixes
+    base = cleaned[:max_len]
+    sheet = base
+    counter = 1
+    while sheet in existing:
+        suffix = f" ({counter})"
+        allowed = max_len - len(suffix)
+        sheet = base[:allowed].rstrip()
+        sheet = f"{sheet}{suffix}"
+        counter += 1
+
+    # Final safety truncate
+    return sheet[:max_len]
+
+
+def export_fact_definitions_to_excel_bytes(rows: List[Dict[str, Any]]) -> bytes:
+    """
+    Create a multi-sheet Excel file (bytes) from fact-definition rows.
+
+    Each distinct 'Filename' becomes its own sheet. Sheets contain only two columns:
+    'Fact' and 'Definition', preserving the current export format.
+
+    Args:
+        rows: List of dicts with keys: Filename, Section, Fact, Definition
+
+    Returns:
+        Excel file as bytes
+    """
+    # Group rows by filename
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for r in rows:
+        filename = (r.get("Filename") or "Unknown").strip()
+        if not filename:
+            filename = "Unknown"
+        grouped.setdefault(filename, []).append(r)
+
+    buffer = BytesIO()
+    used_sheet_names = set()
+
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        for filename, group_rows in grouped.items():
+            sheet_name = sanitize_sheet_name(filename, used_sheet_names)
+            used_sheet_names.add(sheet_name)
+
+            # Build DataFrame with only the two required columns
+            df = pd.DataFrame([
+                {"Fact": gr.get("Fact", ""), "Definition": gr.get("Definition", "")} for gr in group_rows
+            ])
+
+            # Ensure columns are present even if empty
+            if df.empty:
+                df = pd.DataFrame(columns=["Fact", "Definition"])
+
+            # Write to its own sheet
+            df.to_excel(writer, sheet_name=sheet_name, index=False)
+
+    buffer.seek(0)
+    return buffer.getvalue()
 

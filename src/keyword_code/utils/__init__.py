@@ -3,7 +3,7 @@
 from .helpers import get_base64_encoded_image, normalize_text, remove_markdown_formatting
 from .async_utils import run_async
 from .ui_helpers import apply_ui_styling, render_branding, initialize_session_state, display_welcome_features, clear_session_for_new_query
-from .display import display_analysis_results, display_pdf_viewer, update_pdf_view
+from ..display_utils import display_analysis_results, display_pdf_viewer, update_pdf_view
 from .file_manager import (
     create_temp_file, create_temp_dir,
     remove_temp_file, remove_temp_dir,

@@ -85,7 +85,7 @@ class DocumentAnalyzer:
                         "Exact quote 1 from the document text...",
                         "Exact quote 2, potentially longer...",
                     ],
-                    "Context": "Optional context about this section (e.g., source sub-prompt)",
+                    "Context": "Optional context about this section (e.g., source sections)",
                 },
                 # Add more sections as identified by the AI FOR THIS SUB-PROMPT
             },
@@ -128,8 +128,9 @@ class DocumentAnalyzer:
                     formatted_context = "No relevant text found for this sub-prompt."
                 else:
                     # Format relevant chunks for this sub-prompt
+                    # Note: We provide page numbers but not chunk IDs to encourage natural section references
                     formatted_context = "\n\n---\n\n".join([
-                        f"Chunk ID: {chunk.get('chunk_id', 'unknown')}, Page: {chunk.get('page_num', -1) + 1}, Score: {chunk.get('score', 0):.3f}\n"
+                        f"Page: {chunk.get('page_num', -1) + 1}\n"
                         f"TEXT: {chunk.get('text', '')}"
                         for chunk in relevant_chunks
                     ])
@@ -151,7 +152,7 @@ class DocumentAnalyzer:
 4. **Exact Supporting Quotes:** For each sub-prompt, include direct, verbatim quotes from its context that support your analysis.
 5. **No Cross-Referencing:** Do not use context from one sub-prompt to answer another sub-prompt, even if they seem related.
 6. **No Information Found:** If the context for a sub-prompt does not contain information to answer it, clearly state this in the analysis.
-7. **Do not mention chunk ids in your analysis text:** Do not include references to chunk id in your analysis text.
+7. **Natural Section References:** When referring to where information is found in the document, use natural language references to document sections (e.g., "Section 9 of the Loan Agreement", "Definitions Section", "Article 5", "Schedule A") based on the content of the text excerpts. Do NOT mention chunk IDs or technical identifiers. You may reference page numbers when helpful.
 
 ### JSON Output Schema:
 ```json
@@ -166,7 +167,7 @@ class DocumentAnalyzer:
         "Exact quote 1 from the document text for the first sub-prompt...",
         "Exact quote 2, potentially longer..."
       ],
-      "analysis_context": "Optional context about the analysis (e.g., document section names)"
+      "analysis_context": "Natural language description of where the information was found (e.g., 'Section 9 of the Loan Agreement', 'Definitions Section', 'Article 5 - Payment Terms')"
     },
     {
       "sub_prompt_index": 2,
@@ -177,7 +178,7 @@ class DocumentAnalyzer:
         "Exact quote 1 from the document text for the second sub-prompt...",
         "Exact quote 2, potentially longer..."
       ],
-      "analysis_context": "Optional context about the analysis (e.g., document section names)"
+      "analysis_context": "Natural language description of where the information was found (e.g., 'Section 9 of the Loan Agreement', 'Definitions Section', 'Article 5 - Payment Terms')"
     }
     // Additional analyses for each sub-prompt...
   ]

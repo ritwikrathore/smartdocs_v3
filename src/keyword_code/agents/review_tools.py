@@ -7,7 +7,7 @@ from typing import List, Dict
 
 # We deliberately import SmartReview lazily to reuse its LLM helper without
 # creating a hard module-level circular import with orchestrator wiring.
-import SmartReview as SR  # type: ignore
+import src.keyword_code.smartreview.smartreview as SR  # type: ignore
 
 from .review_types import ToolFinding
 
@@ -60,10 +60,11 @@ async def run_semantic(rule, chunk) -> List[ToolFinding]:
     system_prompt = (
         "You are an AI document validation assistant. You will be given a chunk of text and a rule.\n"
         "Your task is to check if the text violates the rule.\n"
-        "- If you find a violation, respond with \"Violation: [Explain the violation and quote the specific text]\".\n"
+        "- If you find a violation, respond with ONLY the exact string of text from the document that violates the rule. "
+        "Do NOT include explanations, commentary, or corrections. Extract and return ONLY the verbatim erroneous text.\n"
         "- If there are no violations, respond only with \"No violation found.\".\n"
         "- Do NOT flag numeric expressions that already satisfy the rule; for example, if decimal precision like \"1.0 billion\" is required, values like \"67.3 billion\" are compliant and must not be flagged; only integer forms like \"67 billion\" should be flagged.\n"
-        "Do not be conversational. Provide only the violation report or \"No violation found.\"."
+        "Do not be conversational. Provide only the exact erroneous text or \"No violation found.\"."
     )
     prompt = f"""
         --- RULE ---
@@ -78,7 +79,7 @@ async def run_semantic(rule, chunk) -> List[ToolFinding]:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt},
             ],
-            model=getattr(SR.client, "_default_model", "databricks-llama-4-maverick"),
+            model=getattr(SR, "DATABRICKS_LLM_MODEL", "databricks-llama-4-maverick"),
             temperature=0.1,
         )
         message_content = response.choices[0].message.content
@@ -93,8 +94,15 @@ async def run_semantic(rule, chunk) -> List[ToolFinding]:
                     details={"context": f"Semantic check on page {chunk.page_num}."},
                 )
             ]
-    except Exception:
-        pass
+    except Exception as e:
+        # Log the error but don't fail the entire validation
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.error(
+            f"Semantic validation failed for rule '{getattr(rule, 'description', 'unknown')}' "
+            f"on page {getattr(chunk, 'page_num', '?')}: {e}",
+            exc_info=True
+        )
     return []
 
 
@@ -104,6 +112,10 @@ async def run_semantic_batch(rule, doc_chunks: List) -> List[ToolFinding]:
     - For each batch, asks the LLM to return ONLY a JSON array of {page_num, finding}.
     - Aggregates into ToolFinding objects with kind="semantic".
     """
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.info(f"Starting batch semantic validation for rule: '{getattr(rule, 'description', 'unknown')[:80]}...' across {len(doc_chunks)} chunks")
+
     TARGET_TOKENS = 30000  # fixed; simple starting point as requested
     OVERLAP_TOKENS = 300  # fixed overlap between batches (words)
 
@@ -148,7 +160,13 @@ async def run_semantic_batch(rule, doc_chunks: List) -> List[ToolFinding]:
         "Identify ALL violations of the rule anywhere in the provided pages.\n"
         "Return ONLY a JSON array. Each item must be an object with exactly these keys: \n"
         "- page_num (integer)\n- finding (string).\n"
-        "Include a short explanation and the quoted offending text in 'finding'. No prose outside JSON.\n"
+        "CRITICAL: The 'finding' field MUST contain ONLY the exact string of text from the document that violates the rule. "
+        "Do NOT include explanations, commentary, or corrections in the 'finding' field. "
+        "Extract and return ONLY the verbatim erroneous text as it appears in the document.\n"
+        "Example: If the text says 'primarily representing reversals of unrealized losses upon sales that have deceased', "
+        "the finding should be ONLY: 'primarily representing reversals of unrealized losses upon sales that have deceased'\n"
+        "Do NOT return: 'The sentence is \"...\" The correct word is \"decreased\"...'\n"
+        "No prose outside JSON.\n"
         "Do NOT flag numeric expressions that already satisfy the rule; for example, if decimal precision like \"1.0 billion\" is required, values like \"67.3 billion\" are compliant and must not be flagged; only integer forms like \"67 billion\" should be flagged."
     )
 
@@ -183,7 +201,7 @@ async def run_semantic_batch(rule, doc_chunks: List) -> List[ToolFinding]:
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
-                model=getattr(SR.client, "_default_model", "databricks-llama-4-maverick"),
+                model=getattr(SR, "DATABRICKS_LLM_MODEL", "databricks-llama-4-maverick"),
                 temperature=0.1,
             )
             raw = resp.choices[0].message.content
@@ -194,7 +212,18 @@ async def run_semantic_batch(rule, doc_chunks: List) -> List[ToolFinding]:
             else:
                 items = parsed
             if not isinstance(items, list):
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.warning(
+                    f"Batch semantic validation for rule '{getattr(rule, 'description', 'unknown')}' "
+                    f"returned non-list response: {type(items).__name__}. Skipping batch."
+                )
                 continue
+
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.info(f"Batch semantic validation found {len(items)} items for rule '{getattr(rule, 'description', 'unknown')[:80]}...'")
+
             for it in items:
                 try:
                     page_num = int(it.get("page_num"))
@@ -211,11 +240,26 @@ async def run_semantic_batch(rule, doc_chunks: List) -> List[ToolFinding]:
                             details={"context": "Batch semantic check across pages"},
                         )
                     )
-                except Exception:
+                except Exception as e:
+                    import logging
+                    logger = logging.getLogger(__name__)
+                    logger.warning(
+                        f"Failed to parse finding item in batch semantic validation: {e}. "
+                        f"Item: {it if 'it' in locals() else 'N/A'}"
+                    )
                     continue
-        except Exception:
-            # Skip batch on any LLM error; continue with others
+        except Exception as e:
+            # Log the error and skip this batch, but continue with others
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.error(
+                f"Batch semantic validation failed for rule '{getattr(rule, 'description', 'unknown')}': {e}",
+                exc_info=True
+            )
             continue
 
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.info(f"Batch semantic validation completed for rule '{getattr(rule, 'description', 'unknown')[:80]}...'. Total findings: {len(findings)}")
     return findings
 

@@ -1,51 +1,39 @@
-import os
-import streamlit as st
-import fitz  # PyMuPDF
-import openai
+"""
+SmartReview - AI-powered document validation tool.
+
+This module provides functionality for creating validation templates and running
+document compliance checks using regex and semantic validation.
+"""
+
 import re
 import json
 import asyncio
+import fitz  # PyMuPDF
+import streamlit as st
 from pydantic import BaseModel, Field
 from typing import List, Literal, Optional
-import logging
-import functools
-import time
+
+# Import from centralized modules
+from src.keyword_code.config import logger
+from src.keyword_code.ai.databricks_llm import (
+    get_databricks_llm,
+    DATABRICKS_BASE_URL,
+    DATABRICKS_LLM_MODEL
+)
+from src.keyword_code.utils.ui_helpers import (
+    apply_ui_styling,
+    render_branding
+)
+
+# Initialize Databricks LLM client
+databricks_llm = get_databricks_llm()
+if not databricks_llm:
+    st.error("Failed to initialize Databricks LLM client. Please check your configuration.")
+    st.stop()
 
 
-# --- Small UI helpers ---
-def apply_ui_styling():
-    """Inject lightweight CSS to give the app a cleaner, branded look."""
-    css = """
-    <style>
-    /* Header/banner */
-    .header-banner { background: linear-gradient(90deg,#f7fbff,#eef6ff); padding:10px 12px; border-radius:8px; margin-bottom:8px; }
-    .brand-small { font-weight:700; color:#0b56d6; font-size:1.05rem; }
-    /* Card-like containers */
-    .stContainer { padding: 6px; }
-    .card { border: 1px solid #e6ebf2; padding: 10px; border-radius: 8px; background: #ffffff; }
-    </style>
-    """
-    st.markdown(css, unsafe_allow_html=True)
 
-
-def render_branding():
-    """Render compact branding in the sidebar"""
-    with st.sidebar:
-        st.markdown("<div class='header-banner'><span class='brand-small'>SmartReview</span></div>", unsafe_allow_html=True)
-        st.markdown("Powered by CNT")
-        st.markdown("---")
-
-# --- Logging setup and helpers ---
-LOGGER_NAME = "app.py"
-logger = logging.getLogger(LOGGER_NAME)
-if not logger.handlers:
-    # Configure basic logging to the terminal
-    handler = logging.StreamHandler()
-    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s - %(message)s")
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
-    logger.setLevel(logging.DEBUG)
-
+# --- Helper Functions ---
 
 def _safe_str(obj, max_len=500):
     """Return a safe, truncated string representation for logging."""
@@ -58,149 +46,25 @@ def _safe_str(obj, max_len=500):
     return s
 
 
-def log_sync(func):
-    """Decorator for logging entry/exit/exceptions for sync functions."""
-    @functools.wraps(func)
-    def wrapper(*args, **kwargs):
-        logger.debug("ENTER %s - args=%s kwargs=%s", func.__name__, _safe_str(args), _safe_str(kwargs))
-        start = time.time()
-        try:
-            result = func(*args, **kwargs)
-            duration = time.time() - start
-            logger.debug("EXIT %s - duration=%.3fs result=%s", func.__name__, duration, _safe_str(result))
-            return result
-        except Exception as e:
-            duration = time.time() - start
-            logger.exception("EXCEPTION in %s after %.3fs: %s", func.__name__, duration, e)
-            raise
-    return wrapper
-
-
-def log_async(func):
-    """Decorator for logging entry/exit/exceptions for async functions."""
-    @functools.wraps(func)
-    async def wrapper(*args, **kwargs):
-        logger.debug("ENTER async %s - args=%s kwargs=%s", func.__name__, _safe_str(args), _safe_str(kwargs))
-        start = time.time()
-        try:
-            result = await func(*args, **kwargs)
-            duration = time.time() - start
-            logger.debug("EXIT async %s - duration=%.3fs result=%s", func.__name__, duration, _safe_str(result))
-            return result
-        except Exception as e:
-            duration = time.time() - start
-            logger.exception("EXCEPTION in async %s after %.3fs: %s", func.__name__, duration, e)
-            raise
-    return wrapper
-
-
-# --- LLM Client Initialization (OpenAI or Databricks) ---
-# By default we use OpenAI. To enable Databricks LLM, set the following in your config or environment:
-# - USE_DATABRICKS_LLM = True (in your config module or environment)
-# - DATABRICKS_API_KEY env var must contain a valid Databricks token
-# - DATABRICKS_BASE_URL can be overridden via env var if needed
-
-# Default Databricks config (can be overridden by env)
-DATABRICKS_BASE_URL = os.environ.get("DATABRICKS_BASE_URL", "https://adb-3858882779799477.17.azuredatabricks.net/serving-endpoints")
-DATABRICKS_LLM_MODEL = os.environ.get("DATABRICKS_LLM_MODEL", "databricks-llama-4-maverick")
-
-
-@st.cache_resource
-def get_llm_client():
-    """
-    Initialize an OpenAI-compatible client configured to talk to Databricks Serving Endpoints.
-
-    This application uses Databricks as the single, default LLM provider.
-    """
-    try:
-        logger.info("Initializing Databricks LLM client")
-
-        # Primary: environment variable
-        databricks_token = os.environ.get("DATABRICKS_API_KEY")
-
-        # Fallback: Streamlit secrets (useful during local dev / deployed Streamlit)
-        try:
-            if (not databricks_token) and hasattr(st, "secrets") and "DATABRICKS_API_KEY" in st.secrets:
-                databricks_token = st.secrets["DATABRICKS_API_KEY"]
-                logger.info("Loaded DATABRICKS_API_KEY from Streamlit secrets")
-        except Exception:
-            # Safe to ignore access to secrets failing
-            pass
-
-        if not databricks_token:
-            st.error("Databricks API token not found. Please add DATABRICKS_API_KEY to your environment or Streamlit secrets.")
-            st.stop()
-
-        # Clean token (strip whitespace and any surrounding quotes)
-        if isinstance(databricks_token, str):
-            clean_token = databricks_token.strip().strip('"').strip("'")
-        else:
-            clean_token = str(databricks_token)
-
-        # Expose Databricks creds to the process so other modules (evaluator) can use them
-        try:
-            os.environ["DATABRICKS_API_KEY"] = clean_token
-            os.environ["DATABRICKS_BASE_URL"] = DATABRICKS_BASE_URL
-            os.environ["DATABRICKS_LLM_MODEL"] = DATABRICKS_LLM_MODEL
-        except Exception:
-            pass
-
-        # Try to construct the OpenAI-compatible client. Some versions of the OpenAI
-        # library may ignore the api_key parameter and require the OPENAI_API_KEY env var,
-        # so we attempt both approaches for compatibility.
-        try:
-            client = openai.OpenAI(api_key=clean_token, base_url=DATABRICKS_BASE_URL)
-            client._default_model = DATABRICKS_LLM_MODEL
-            logger.info("Databricks OpenAI-compatible client initialized via direct api_key")
-            return client
-        except Exception as first_err:
-            logger.warning("Direct OpenAI(...) init failed, will attempt env-var fallback: %s", first_err)
-
-            # Set OPENAI_API_KEY env var as a fallback and try again
-            try:
-                os.environ["OPENAI_API_KEY"] = clean_token
-                # Also try to set module-level attribute if present
-                try:
-                    setattr(openai, "api_key", clean_token)
-                except Exception:
-                    pass
-
-                client = openai.OpenAI(base_url=DATABRICKS_BASE_URL)
-                client._default_model = DATABRICKS_LLM_MODEL
-                logger.info("Databricks OpenAI-compatible client initialized via OPENAI_API_KEY env var")
-                return client
-            except Exception as second_err:
-                # Both approaches failed; raise a helpful error
-                logger.exception("Failed to initialize Databricks LLM client after both direct and env-var attempts: %s; %s", first_err, second_err)
-                st.error(
-                    "Failed to initialize Databricks LLM client. Ensure DATABRICKS_API_KEY is a valid token and matches your installed OpenAI client expectations."
-                )
-                st.stop()
-    except Exception as e:
-        logger.exception("Failed to initialize Databricks LLM client (unexpected): %s", e)
-        st.error(f"Failed to initialize Databricks LLM client: {e}")
-        st.stop()
-
-
-# Create the Databricks-only client
-client = get_llm_client()
-
-
 async def _chat_completion_async(messages, model: Optional[str] = None, temperature: Optional[float] = None):
-    """Run the (synchronous) client.chat.completions.create in a thread executor so it can be awaited.
-
-    This makes the Databricks OpenAI-compatible client usable from async code.
     """
-    model = model or getattr(client, "_default_model", DATABRICKS_LLM_MODEL)
+    Async wrapper for Databricks LLM completion.
+    Uses the centralized DatabricksLLMClient.
+    """
+    if not databricks_llm:
+        raise RuntimeError("Databricks LLM client not initialized")
 
-    def _sync_call():
-        kwargs = {"model": model, "messages": messages}
-        if temperature is not None:
-            kwargs["temperature"] = temperature
-        return client.chat.completions.create(**kwargs)
+    # Use the async method from DatabricksLLMClient
+    response_text = await databricks_llm.get_completion_async(messages, max_tokens=8192)
 
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, _sync_call)
+    # Wrap in a response-like object for compatibility
+    class MockResponse:
+        def __init__(self, content):
+            self.choices = [type('obj', (object,), {
+                'message': type('obj', (object,), {'content': content})()
+            })()]
+
+    return MockResponse(response_text)
 
 
 def _parse_model_json(text: str) -> dict:
@@ -313,7 +177,7 @@ class DocumentChunk(BaseModel):
 
 
 # --- Core Logic Functions ---
-@log_sync
+
 def decompose_rule_smartreview(rule_text: str) -> List[Rule]:
     """Decompose a plain-text rule into SmartReview validation tasks.
     - No RAG/retrieval. Single-step analysis to choose regex vs semantic.
@@ -358,7 +222,7 @@ def decompose_rule_smartreview(rule_text: str) -> List[Rule]:
     return tasks
 
 
-@log_sync
+
 def extract_text_from_pdf(uploaded_file_bytes: bytes) -> List[DocumentChunk]:
     """Extracts text from each page of an uploaded PDF file."""
     logger.info("Starting PDF text extraction. bytes=%s", _safe_str(len(uploaded_file_bytes) if uploaded_file_bytes is not None else None))
@@ -375,7 +239,7 @@ def extract_text_from_pdf(uploaded_file_bytes: bytes) -> List[DocumentChunk]:
         st.error(f"Error processing PDF file: {e}")
     return chunks
 
-@log_async
+
 async def propose_validation_from_rule(rule_text: str, example_text: str, doc_chunks: List[DocumentChunk]) -> Optional[ProposedValidation]:
     """AI agent to interpret a user's rule and propose a validation method."""
 
@@ -444,13 +308,13 @@ async def propose_validation_from_rule(rule_text: str, example_text: str, doc_ch
 
     logger.info("Requesting proposal for rule. rule_text=%s example_provided=%s doc_chunks=%d", _safe_str(rule_text), bool(example_text), len(doc_chunks))
     try:
-        logger.debug("Calling LLM at %s model=%s", DATABRICKS_BASE_URL, getattr(client, "_default_model", "databricks-llama-4-maverick"))
+        logger.debug("Calling LLM at %s model=%s", DATABRICKS_BASE_URL, DATABRICKS_LLM_MODEL)
         response = await _chat_completion_async(
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
             ],
-            model=getattr(client, "_default_model", "databricks-llama-4-maverick")
+            model=DATABRICKS_LLM_MODEL
         )
         raw = response.choices[0].message.content
         logger.debug("Raw AI response length=%d", len(_safe_str(raw)))
@@ -500,7 +364,7 @@ async def propose_validation_from_rule(rule_text: str, example_text: str, doc_ch
                         {"role": "system", "content": retry_system_prompt},
                         {"role": "user", "content": retry_user_prompt},
                     ],
-                    model=getattr(client, "_default_model", "databricks-llama-4-maverick"),
+                    model=DATABRICKS_LLM_MODEL,
                     temperature=0.0,
                 )
                 raw2 = retry_resp.choices[0].message.content
@@ -549,7 +413,7 @@ async def propose_validation_from_rule(rule_text: str, example_text: str, doc_ch
         st.error(f"An AI communication error occurred: {e}")
         return None
 
-@log_async
+
 async def refine_validation_from_chat(chat_history: List[dict], original_proposal: ProposedValidation, doc_chunks: List[DocumentChunk]) -> Optional[ProposedValidation]:
     """AI agent that refines a proposal based on user chat feedback."""
     full_text_context = "\n".join([chunk.content for chunk in doc_chunks])
@@ -609,13 +473,13 @@ async def refine_validation_from_chat(chat_history: List[dict], original_proposa
 
     logger.info("Refining validation from chat. chat_length=%d original_type=%s", len(chat_history), original_proposal.validation_type if original_proposal else None)
     try:
-        logger.debug("Calling LLM at %s model=%s", DATABRICKS_BASE_URL, getattr(client, "_default_model", "databricks-llama-4-maverick"))
+        logger.debug("Calling LLM at %s model=%s", DATABRICKS_BASE_URL, DATABRICKS_LLM_MODEL)
         response = await _chat_completion_async(
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
             ],
-            model=getattr(client, "_default_model", "databricks-llama-4-maverick")
+            model=DATABRICKS_LLM_MODEL
         )
         raw = response.choices[0].message.content
         logger.debug("Raw AI refinement response length=%d", len(_safe_str(raw)))
@@ -682,7 +546,7 @@ async def refine_validation_from_chat(chat_history: List[dict], original_proposa
         return None
 
 
-@log_async
+
 async def execute_validation_template(template: ValidationTemplate, doc_chunks: List[DocumentChunk]) -> List[ValidationResult]:
     """Runs all rules in a template against a document and collects the results.
     Uses the new Orchestrator (parallel multi-tool + evaluator). Falls back to legacy execution on error.
@@ -693,9 +557,20 @@ async def execute_validation_template(template: ValidationTemplate, doc_chunks: 
         len(template.rules) if template else 0,
         len(doc_chunks),
     )
+
+    # Log rule types for debugging
+    if template and template.rules:
+        rule_types = {}
+        for rule in template.rules:
+            vtype = getattr(rule, "validation_type", "unknown")
+            rule_types[vtype] = rule_types.get(vtype, 0) + 1
+        logger.info(f"Rule breakdown: {dict(rule_types)}")
+
     try:
         from src.keyword_code.agents.review_orchestrator import orchestrate_review
         ranked = await orchestrate_review(template, doc_chunks)
+        logger.info(f"Orchestrated review completed. Found {len(ranked)} ranked findings.")
+
         results: List[ValidationResult] = []
         for r in ranked:
             results.append(
@@ -708,6 +583,7 @@ async def execute_validation_template(template: ValidationTemplate, doc_chunks: 
                     context=r.context,
                 )
             )
+        logger.info(f"Validation template execution completed successfully. Returning {len(results)} results.")
         return results
     except Exception as e:
         logger.exception("Orchestrated review failed, falling back to legacy execution: %s", e)
@@ -719,9 +595,10 @@ async def execute_validation_template(template: ValidationTemplate, doc_chunks: 
         list_of_results_per_task = await asyncio.gather(*tasks)
         for result_list in list_of_results_per_task:
             all_results.extend(result_list)
+        logger.info(f"Legacy execution completed. Returning {len(all_results)} results.")
         return all_results
 
-@log_async
+
 async def run_rule_on_chunk(rule: Rule, chunk: DocumentChunk) -> List[ValidationResult]:
     """Helper function to run a single rule on a single chunk."""
     results = []
@@ -751,10 +628,10 @@ async def run_rule_on_chunk(rule: Rule, chunk: DocumentChunk) -> List[Validation
         system_prompt = """
         You are an AI document validation assistant. You will be given a chunk of text and a rule.
         Your task is to check if the text violates the rule.
-        - If you find a violation, respond with "Violation: [Explain the violation and quote the specific text]".
+        - If you find a violation, respond with ONLY the exact string of text from the document that violates the rule. Do NOT include explanations, commentary, or corrections. Extract and return ONLY the verbatim erroneous text.
         - If there are no violations, respond *only* with the text "No violation found.".
         - Do NOT flag numeric expressions that already satisfy the rule; for example, if decimal precision like "1.0 billion" is required, values like "67.3 billion" are compliant and must not be flagged; only integer forms like "67 billion" should be flagged.
-        Do not be conversational. Provide only the violation report or "No violation found.".
+        Do not be conversational. Provide only the exact erroneous text or "No violation found.".
         """
         prompt = f"""
         --- RULE ---
@@ -764,13 +641,13 @@ async def run_rule_on_chunk(rule: Rule, chunk: DocumentChunk) -> List[Validation
         {chunk.content}
         """
         try:
-            logger.debug("Calling semantic AI for page %d rule=%s; base_url=%s model=%s", chunk.page_num, _safe_str(rule.description, max_len=200), DATABRICKS_BASE_URL, getattr(client, "_default_model", "databricks-llama-4-maverick"))
+            logger.debug("Calling semantic AI for page %d rule=%s; base_url=%s model=%s", chunk.page_num, _safe_str(rule.description, max_len=200), DATABRICKS_BASE_URL, DATABRICKS_LLM_MODEL)
             response = await _chat_completion_async(
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": prompt}
                 ],
-                model=getattr(client, "_default_model", "databricks-llama-4-maverick"),
+                model=DATABRICKS_LLM_MODEL,
                 temperature=0.1,
             )
             message_content = response.choices[0].message.content
@@ -793,7 +670,7 @@ async def run_rule_on_chunk(rule: Rule, chunk: DocumentChunk) -> List[Validation
 
 # --- UI Rendering Functions ---
 
-@log_sync
+
 def render_validation_view():
     """Renders the main UI for validating documents against saved templates."""
     logger.debug("Rendering validation view")
@@ -857,7 +734,7 @@ def render_validation_view():
                     st.caption("Context")
                     st.markdown(f"> {result.context.replace('...', ' ... ')}")
 
-@log_sync
+
 def render_rule_definition_view():
     """Renders the UI for the interactive rule creation process."""
     logger.debug("Rendering rule definition view")
@@ -990,13 +867,15 @@ def render_rule_definition_view():
             st.rerun()
 
 
-# --- Main App Logic ---
+# --- Session State Initialization ---
 
-def initialize_session_state():
-    """Initializes all required keys in Streamlit's session state."""
-    logger.debug("Initializing session state")
-    state_defaults = {
-        'app_mode': 'validation', # 'validation' or 'rule_definition'
+def initialize_smartreview_session_state():
+    """Initialize SmartReview-specific session state variables."""
+    logger.debug("Initializing SmartReview session state")
+
+    # SmartReview-specific state defaults
+    smartreview_defaults = {
+        'app_mode': 'validation',  # 'validation' or 'rule_definition'
         'templates': {},
         'validation_results': None,
         # State for rule definition view
@@ -1009,42 +888,7 @@ def initialize_session_state():
         'is_refining': False,
         'refinement_chat_history': []
     }
-    for key, value in state_defaults.items():
+
+    for key, value in smartreview_defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
-
-def main():
-    logger.info("Starting Streamlit app main")
-    # Set page config to match template cues (wide layout, collapsed sidebar)
-    st.set_page_config(layout="wide", page_title="SmartReview - Document Intelligence", initial_sidebar_state="collapsed")
-    st.markdown("<h1 style='text-align: center;'>SmartReview</h1>", unsafe_allow_html=True)
-    # Small CSS refresh for a cleaner, modern look
-    st.markdown(
-        """
-        <style>
-        /* Tighten up spacing and use a neutral font-size for captions */
-        .stApp { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial; }
-        .stButton>button { border-radius: 6px; }
-        .stCaption { font-size: 0.9rem; color: #6c757d; }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    # Apply the template-like styling and branding
-    try:
-        apply_ui_styling()
-        render_branding()
-    except Exception:
-        # Styling/branding should never block the app; swallow errors
-        logger.debug("Branding/styling helpers failed to render, continuing without them.")
-
-    initialize_session_state()
-
-    if st.session_state.app_mode == 'validation':
-        render_validation_view()
-    elif st.session_state.app_mode == 'rule_definition':
-        render_rule_definition_view()
-
-if __name__ == "__main__":
-    main()

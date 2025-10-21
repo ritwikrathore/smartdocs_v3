@@ -23,7 +23,7 @@ except Exception:  # pragma: no cover - graceful fallback if not installed
 
 # Import SmartReview to reuse Databricks config constants if available
 try:
-    import SmartReview as SR  # type: ignore
+    import src.keyword_code.smartreview.smartreview as SR  # type: ignore
 except Exception:  # pragma: no cover
     SR = None  # allow import without failing
 
@@ -101,6 +101,16 @@ async def evaluate_findings(findings: List[ToolFinding]) -> List[RankedFinding]:
             # Embed findings as JSON in the prompt for now. For larger batches, consider
             # chunking or passing via deps and custom tools.
             payload = json.dumps([f.model_dump() for f in findings])
+
+            # Log breakdown of findings by rule and kind
+            from collections import defaultdict
+            breakdown = defaultdict(lambda: {"regex": 0, "semantic": 0})
+            for f in findings:
+                breakdown[f.rule_description][f.kind] += 1
+            logger.info(f"Running AI evaluation on {len(findings)} findings...")
+            for rule_desc, counts in breakdown.items():
+                logger.info(f"  Rule: '{rule_desc[:80]}...' - regex: {counts['regex']}, semantic: {counts['semantic']}")
+
             result = await agent.run(
                 (
                     "Evaluate these findings and return ONLY the ones that are TRUE VIOLATIONS of their rules.\n"
@@ -108,6 +118,10 @@ async def evaluate_findings(findings: List[ToolFinding]) -> List[RankedFinding]:
                     "For example, if the rule requires decimal precision for billion values:\n"
                     "- REJECT findings like '5.5 billion' or '1.0 billion' (these are compliant, not violations)\n"
                     "- INCLUDE findings like '5 billion' or '1 billion' (these are violations)\n"
+                    "\n"
+                    "For semantic rules (case sensitivity, word confusion, etc.), INCLUDE findings that identify violations.\n"
+                    "Do NOT reject semantic findings just because they don't match the regex example above.\n"
+                    "\n"
                     "Return a JSON array of RankedFinding with the exact fields: "
                     "id, page_num, rule_description, violation_type, finding, analysis, context, confidence, severity.\n"
                     "Be strict about rejecting partial/embedded regex matches unless the rule explicitly allows them.\n"
@@ -115,9 +129,25 @@ async def evaluate_findings(findings: List[ToolFinding]) -> List[RankedFinding]:
                     f"INPUT (JSON array of ToolFinding):\n\n{payload}\n"
                 ),
             )
+
+            # Log breakdown of results by rule
+            result_breakdown = defaultdict(lambda: {"regex": 0, "semantic": 0})
+            if result.output:
+                for r in result.output:
+                    vtype = getattr(r, "violation_type", "unknown")
+                    result_breakdown[r.rule_description][vtype] += 1
+
+            logger.info(f"AI evaluation completed. Returned {len(result.output) if result.output else 0} ranked findings.")
+            for rule_desc, counts in result_breakdown.items():
+                logger.info(f"  Rule: '{rule_desc[:80]}...' - regex: {counts['regex']}, semantic: {counts['semantic']}")
+
             return result.output
         except Exception as e:
-            logger.warning("AI evaluation failed; using deterministic fallback: %s", e)
+            logger.error(
+                f"AI evaluation failed with error: {e}. Falling back to deterministic scoring. "
+                f"This may result in lower quality filtering of false positives.",
+                exc_info=True
+            )
             # Fall back below on any runtime issue
             pass
 
