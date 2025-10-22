@@ -240,13 +240,7 @@ def display_analysis_results(results: List[Dict[str, Any]]):
                                         any_needs_review = True
                                         break
 
-                            # Determine expansion behavior based on mode
-                            # Review mode: always expanded
-                            # Ask mode: only expanded when status is "needs review"
-                            current_mode = st.session_state.get("smartdocs_mode", "Ask")
-                            should_expand = (current_mode == "Review") or any_needs_review
-
-                            with st.expander("Supporting Citations", expanded=should_expand):
+                            with st.expander("Supporting Citations", expanded=any_needs_review):
                                 # If optimized RAG results exist for this section, use them to REPLACE the citations display
                                 # Disabled displaying optimized RAG results separately; use verified citations from analysis
                                 new_results = []

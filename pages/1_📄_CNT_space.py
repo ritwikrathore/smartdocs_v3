@@ -521,6 +521,8 @@ def process_rag_requests(results: list[dict[str, any]]) -> tuple[list[dict[str, 
                                 derived_sub_prompt = sp_entry.get("sub_prompt", derived_sub_prompt)
 
                             # Prepare single sub-prompt with retried relevant chunks
+                            # Note: We don't include the original index here since we're only analyzing one sub-prompt
+                            # The analyzer will assign index 1 to this single sub-prompt
                             sub_prompts_with_contexts = [{
                                 "title": derived_title,
                                 "sub_prompt": derived_sub_prompt,
@@ -548,10 +550,13 @@ def process_rag_requests(results: list[dict[str, any]]) -> tuple[list[dict[str, 
                                     supporting_quotes = parsed.get("supporting_quotes", [])
                                     if not isinstance(supporting_quotes, list):
                                         supporting_quotes = [str(supporting_quotes)]
+                                    # Use the analysis_context from LLM (natural language description of where info was found)
+                                    # instead of showing the sub-prompt text
+                                    analysis_context = parsed.get("analysis_context", f"From sub-prompt: {derived_sub_prompt}")
                                     ai_section = {
                                         "Analysis": analysis_text,
                                         "Supporting_Phrases": supporting_quotes or ["No relevant phrase found."],
-                                        "Context": f"From retried sub-prompt: {derived_sub_prompt}",
+                                        "Context": analysis_context,
                                     }
                                 except Exception as parse_err:
                                     logger.error(f"Failed to parse retried AI analysis for {section_key}: {parse_err}")

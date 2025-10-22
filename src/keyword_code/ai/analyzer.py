@@ -276,7 +276,9 @@ Generate a structured analysis for EACH sub-prompt, strictly following the JSON 
                         original_sub_prompt = sub_prompts_with_contexts[original_index].get('sub_prompt', '')
                         original_title = sub_prompts_with_contexts[original_index].get('title', '')
                     else:
-                        logger.warning(f"Invalid sub_prompt_index: {sub_prompt_index}, using provided values")
+                        # This is expected when retrying a single sub-prompt from a multi-prompt analysis
+                        # The LLM may return the original index (e.g., 2) but we only have 1 item in the list
+                        logger.debug(f"Sub-prompt index {sub_prompt_index} out of range for {len(sub_prompts_with_contexts)} sub-prompts (expected for retry scenarios), using LLM-provided values")
                         original_sub_prompt = analysis.get("sub_prompt_analyzed", "Unknown sub-prompt")
                         original_title = analysis.get("sub_prompt_title", "Unknown title")
 
