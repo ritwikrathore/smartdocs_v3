@@ -52,7 +52,7 @@ class FactExtractionService:
         query: str,
         analysis_text: str,
         context: str = "",
-        max_retries: int = 2
+        max_retries: int = 3
     ) -> FactExtractionResult:
         """
         Extract facts from analysis text (async version).
@@ -122,7 +122,7 @@ class FactExtractionService:
         query: str,
         analysis_text: str,
         context: str = "",
-        max_retries: int = 2
+        max_retries: int = 3
     ) -> FactExtractionResult:
         """
         Extract facts from analysis text (synchronous version).

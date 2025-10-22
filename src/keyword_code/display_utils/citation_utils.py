@@ -86,7 +86,7 @@ def process_chat_response_for_numbered_citations(raw_response_text: str) -> Tupl
     return processed_text.strip(), citation_details_for_footer
 
 
-def display_followup_citations_like_main_analysis(citation_details: List[Dict[str, Any]], qa_index: int = 0, answer_text: str = ""):
+def display_followup_citations_like_main_analysis(citation_details: List[Dict[str, Any]], qa_index: int = 0, answer_text: str = "", relevant_chunks: List[Dict[str, Any]] = None):
     """
     Displays follow-up citations in the same format as the main analysis supporting citations.
     Uses the same styling with quoted text, verification badges, and "Go" buttons.
@@ -95,6 +95,7 @@ def display_followup_citations_like_main_analysis(citation_details: List[Dict[st
         citation_details: List of citation dictionaries from process_chat_response_for_numbered_citations
         qa_index: Index of the Q&A pair for unique keys
         answer_text: The raw answer text to try to extract context from
+        relevant_chunks: List of RAG chunks with score information (optional)
     """
     if not citation_details:
         st.info("No supporting citations were identified for this follow-up question.")
@@ -112,6 +113,18 @@ def display_followup_citations_like_main_analysis(citation_details: List[Dict[st
 
         # For follow-up citations, we'll assume they're verified since they come from the RAG system
         is_verified = True  # Follow-up citations are from RAG retrieval, so considered verified
+
+        # Extract confidence score from relevant_chunks if available
+        confidence_score = None
+        if relevant_chunks:
+            # Find the chunk that matches this citation's filename and page
+            for chunk in relevant_chunks:
+                chunk_filename = chunk.get('filename', '')
+                # page_num in citation is 1-based, chunk page_num is 0-based
+                chunk_page = chunk.get('page_num', -1) + 1
+                if chunk_filename == filename and chunk_page == page_num:
+                    confidence_score = chunk.get('score', None)
+                    break
 
         # Extract the actual relevant phrase from the AI response
         citation_text = f"Referenced content from {filename}, Page {page_num}"  # Default fallback
@@ -209,6 +222,12 @@ def display_followup_citations_like_main_analysis(citation_details: List[Dict[st
         else:
             badge_html = '<span style="display: inline-block; background-color: #ffeacc; color: #a05e03; padding: 1px 6px; border-radius: 0.25rem; font-size: 0.8em; margin-left: 5px; border: 1px solid #f8c78d; font-weight: 600;">⚠️ Needs Review</span>'
 
+        # Format score info (same as main analysis)
+        if confidence_score is not None:
+            score_info = f"Score: {confidence_score:.1%}"
+        else:
+            score_info = "RAG Retrieved"
+
         # Create columns for citation and Go button (same layout as main analysis)
         cite_col, btn_col = st.columns([0.90, 0.10], gap="small")
 
@@ -218,7 +237,7 @@ def display_followup_citations_like_main_analysis(citation_details: List[Dict[st
             <div style="border: 1px solid #e0e0e0; border-radius: 5px; padding: 8px 12px; margin-top: 5px; margin-bottom: 8px; background-color: #f9f9f9;">
                 <div style="margin-bottom: 5px; display: flex; justify-content: space-between; align-items: center;">
                     <span style="font-weight: bold;">Citation {citation_counter} {badge_html}</span>
-                    <span style="font-size: 0.8em; color: #555;">Page {page_num} | RAG Retrieved</span>
+                    <span style="font-size: 0.8em; color: #555;">Page {page_num} | {score_info}</span>
                 </div>
                 <div style="color: #333; line-height: 1.4; font-size: 0.95em;"><i>"{citation_text}"</i></div>
             </div>

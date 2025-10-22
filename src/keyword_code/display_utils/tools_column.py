@@ -46,6 +46,7 @@ def display_tools_column(results_with_real_analysis: List, tools_col):
         with st.container():
             # SmartChat Expander
             with st.expander("💬 SmartChat (Multi-Document Chat)", expanded=False):
+                st.caption("Chat with multiple documents simultaneously to get cross-referenced answers and insights.")
                 if not st.session_state.get("preprocessed_data"):
                     st.info("Upload and process documents to enable chat.")
                 else:
@@ -114,6 +115,7 @@ def display_tools_column(results_with_real_analysis: List, tools_col):
 
             # Export Results Expander
             with st.expander("📊 Export Results", expanded=False):
+                st.caption("Export analysis results in Excel or Word format for further review and documentation.")
                 # Prepare data for export
                 exportable_results_list = []
 
@@ -256,7 +258,7 @@ def display_tools_column(results_with_real_analysis: List, tools_col):
 
             # Fact Extraction (beta) Expander - Separate expander as in original
             with st.expander("🧪 Fact Extraction (beta)", expanded=False):
-                st.caption("Uses custom LLM-based extraction to intelligently identify fact types and extract structured information from analysis text.")
+                st.caption("Identify fact types and extract structured information from analysis text.")
 
                 if st.button("Generate Facts", key="compute_fact_definitions_beta"):
                     with st.spinner("Extracting facts using LLM-based analysis..."):

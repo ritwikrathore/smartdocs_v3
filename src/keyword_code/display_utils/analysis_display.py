@@ -405,6 +405,7 @@ def display_analysis_results(results: List[Dict[str, Any]]):
             # Add Follow-up Question Interface at the bottom of the analysis results
             st.markdown('<hr style="margin: 20px 0; border: 0; border-top: 2px solid #e0e0e0;">', unsafe_allow_html=True)
             st.markdown('<div class="header-title" style="font-size: 1.3rem;">Follow-up Questions [Beta]</div>', unsafe_allow_html=True)
+            st.caption("This feature is still in beta. Some features like PDF annotation might not function as expected.")
             st.markdown('<hr style="margin: 12px 0; border: 0; border-top: 1px solid #e0e0e0;">', unsafe_allow_html=True)
 
             # Display existing follow-up Q&A if any
@@ -434,23 +435,27 @@ def display_analysis_results(results: List[Dict[str, Any]]):
                             with st.expander("Supporting Citations", expanded=False):
                                 # Use processed_text which contains the citation numbers [1], [2], etc.
                                 processed_answer_text = qa_pair.get("processed_text", qa_pair.get("answer", ""))
-                                display_followup_citations_like_main_analysis(citation_details, i, processed_answer_text)
+                                relevant_chunks = qa_pair.get("relevant_chunks", [])
+                                display_followup_citations_like_main_analysis(citation_details, i, processed_answer_text, relevant_chunks)
 
-            # Follow-up question input
-            followup_question = st.text_input(
-                "Ask a follow-up question about the analysis:",
-                placeholder="e.g., Can you provide more details about the investment timeline?",
-                key="followup_question_input"
-            )
-
-            col1, _ = st.columns([1, 4])
-            with col1:
+            # Follow-up question input with inline arrow button
+            input_col, button_col = st.columns([0.90, 0.10], gap="small")
+            with input_col:
+                followup_question = st.text_input(
+                    "Ask a follow-up question about the analysis:",
+                    placeholder="e.g., Can you provide more details about the investment timeline?",
+                    key="followup_question_input"
+                )
+            with button_col:
+                # Add spacing to align button with input field
+                st.markdown('<div style="margin-top: 28px;"></div>', unsafe_allow_html=True)
                 ask_followup = st.button(
-                    "Ask Follow-up Question",
+                    "➤",
                     key="ask_followup_button",
                     type="primary",
                     disabled=not followup_question.strip(),
-                    use_container_width=True
+                    use_container_width=True,
+                    help="Submit follow-up question"
                 )
 
             # Process follow-up question
@@ -487,12 +492,13 @@ def display_analysis_results(results: List[Dict[str, Any]]):
                         except Exception as _e:
                             logger.warning(f"Could not refresh PDF highlights for follow-up: {_e}")
 
-                        # Store the Q&A pair
+                        # Store the Q&A pair with relevant chunks for score information
                         qa_pair = {
                             "question": followup_question,
                             "answer": raw_response,
                             "processed_text": processed_text,
                             "citation_details": citation_details,
+                            "relevant_chunks": relevant_chunks,  # Store chunks for score information
                             "timestamp": datetime.now().isoformat()
                         }
 

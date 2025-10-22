@@ -344,5 +344,3 @@ Generate a structured analysis for EACH sub-prompt, strictly following the JSON 
             "sub_prompt": sub_prompt,
             "analysis_json": json.dumps(error_response, indent=2)
         }
-
-
