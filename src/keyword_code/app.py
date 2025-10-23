@@ -638,15 +638,40 @@ def display_page():
     # Check if results exist
     if st.session_state.get("analysis_results"):
         # --- RESULTS VIEW ---
-        st.markdown(
-            """
-            <div class="smartdocs-logo-container">
-                <h1><span style='color: #002345;'>CNT</span> <span style='color: #00ADE4;'>SmartDocs</span></h1>
-                <p>AI Powered Document Intelligence</p>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+        try:
+            logo_base64 = get_base64_encoded_image("src/keyword_code/assets/smartdocslogo.png")
+            if logo_base64:
+                st.markdown(
+                    f"""
+                    <div class="smartdocs-logo-container" style="text-align: center;">
+                        <img src="data:image/png;base64,{logo_base64}" alt="CNT SmartDocs" style="max-width: 500px; width: 100%; height: auto;">
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+            else:
+                # Fallback to text if image fails to load
+                st.markdown(
+                    """
+                    <div class="smartdocs-logo-container">
+                        <h1><span style='color: #002345;'>CNT</span> <span style='color: #00ADE4;'>SmartDocs</span></h1>
+                        <p>AI Powered Document Intelligence</p>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+        except Exception as e:
+            logger.error(f"Failed to load SmartDocs logo: {e}")
+            # Fallback to text if image fails to load
+            st.markdown(
+                """
+                <div class="smartdocs-logo-container">
+                    <h1><span style='color: #002345;'>CNT</span> <span style='color: #00ADE4;'>SmartDocs</span></h1>
+                    <p>AI Powered Document Intelligence</p>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
         if st.button("🚀 Start New Analysis", key="new_analysis_button", use_container_width=True, type="primary"):
             # Use our new function to clear session state and temporary files
@@ -700,15 +725,40 @@ def display_page():
     else:
         # --- INPUT VIEW ---
 
-        st.markdown(
-            """
-            <div class="smartdocs-logo-container">
-                <h1><span style='color: #002345;'>CNT</span> <span style='color: #00ADE4;'>SmartDocs</span></h1>
-                <p>AI Powered Document Intelligence</p>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+        try:
+            logo_base64 = get_base64_encoded_image("src/keyword_code/assets/smartdocslogo.png")
+            if logo_base64:
+                st.markdown(
+                    f"""
+                    <div class="smartdocs-logo-container" style="text-align: center;">
+                        <img src="data:image/png;base64,{logo_base64}" alt="CNT SmartDocs" style="max-width: 500px; width: 100%; height: auto;">
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+            else:
+                # Fallback to text if image fails to load
+                st.markdown(
+                    """
+                    <div class="smartdocs-logo-container">
+                        <h1><span style='color: #002345;'>CNT</span> <span style='color: #00ADE4;'>SmartDocs</span></h1>
+                        <p>AI Powered Document Intelligence</p>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+        except Exception as e:
+            logger.error(f"Failed to load SmartDocs logo: {e}")
+            # Fallback to text if image fails to load
+            st.markdown(
+                """
+                <div class="smartdocs-logo-container">
+                    <h1><span style='color: #002345;'>CNT</span> <span style='color: #00ADE4;'>SmartDocs</span></h1>
+                    <p>AI Powered Document Intelligence</p>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
         # Check if embedding model loaded successfully (important for input view too)
         if embedding_model is None:

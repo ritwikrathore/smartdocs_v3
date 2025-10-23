@@ -57,18 +57,45 @@ async def run_regex(rule, chunk) -> List[ToolFinding]:
 
 
 async def run_semantic(rule, chunk) -> List[ToolFinding]:
+    # Extract examples from rule if available
+    extracted_examples = getattr(rule, "extracted_examples", [])
+    examples_warning = ""
+    if extracted_examples:
+        examples_list = ", ".join([f"'{ex}'" for ex in extracted_examples])
+        examples_warning = (
+            f"\n\nIMPORTANT - EXAMPLES TO IGNORE:\n"
+            f"The following text strings are EXAMPLES ONLY from the rule definition. "
+            f"Do NOT flag these as violations unless they actually appear in the document being validated:\n"
+            f"{examples_list}\n"
+            f"These are for illustration purposes only. Only flag actual violations found in the document text below."
+        )
+
     system_prompt = (
         "You are an AI document validation assistant. You will be given a chunk of text and a rule.\n"
-        "Your task is to check if the text violates the rule.\n"
-        "- If you find a violation, respond with ONLY the exact string of text from the document that violates the rule. "
+        "Your task is to check if the text violates the rule.\n\n"
+
+        "CRITICAL - ONLY FLAG TRUE VIOLATIONS:\n"
+        "- Do NOT flag text that is COMPLIANT with the rule\n"
+        "- Do NOT flag text where there is NO CONFUSION or error\n"
+        "- Do NOT flag text that MEETS the requirements\n"
+        "- Do NOT flag text that is NOT RELEVANT to the rule (e.g., proper acronyms like 'U.S. GAAP' when checking capitalization)\n"
+        "- Do NOT flag numeric expressions that already satisfy the rule (e.g., '67.3 billion' is compliant if rule requires decimal precision)\n\n"
+
+        "RESPONSE FORMAT:\n"
+        "- If you find a TRUE VIOLATION, respond with ONLY the exact string of text from the document that violates the rule. "
         "Do NOT include explanations, commentary, or corrections. Extract and return ONLY the verbatim erroneous text.\n"
-        "- If there are no violations, respond only with \"No violation found.\".\n"
-        "- Do NOT flag numeric expressions that already satisfy the rule; for example, if decimal precision like \"1.0 billion\" is required, values like \"67.3 billion\" are compliant and must not be flagged; only integer forms like \"67 billion\" should be flagged.\n"
+        "- If there are NO VIOLATIONS (including compliant cases, correct usage, or irrelevant matches), respond only with \"No violation found.\".\n\n"
+
         "Do not be conversational. Provide only the exact erroneous text or \"No violation found.\"."
+        f"{examples_warning}"
     )
+
+    # Use clarified rule if available, otherwise use validator
+    rule_text = getattr(rule, 'clarified_rule', None) or getattr(rule, 'validator', '')
+
     prompt = f"""
         --- RULE ---
-        {rule.validator}
+        {rule_text}
 
         --- TEXT TO VALIDATE ---
         {chunk.content}
@@ -116,7 +143,10 @@ async def run_semantic_batch(rule, doc_chunks: List) -> List[ToolFinding]:
     logger = logging.getLogger(__name__)
     logger.info(f"Starting batch semantic validation for rule: '{getattr(rule, 'description', 'unknown')[:80]}...' across {len(doc_chunks)} chunks")
 
-    TARGET_TOKENS = 30000  # fixed; simple starting point as requested
+    # Create a mapping of page_num to chunk content for context extraction
+    page_content_map = {getattr(ch, "page_num", -1): getattr(ch, "content", "") for ch in doc_chunks}
+
+    TARGET_TOKENS = 20000  # Optimized for better processing efficiency
     OVERLAP_TOKENS = 300  # fixed overlap between batches (words)
 
     def _tail_words(s: str, n: int) -> str:
@@ -154,20 +184,44 @@ async def run_semantic_batch(rule, doc_chunks: List) -> List[ToolFinding]:
     findings: List[ToolFinding] = []
 
     # 2) For each batch, ask the LLM to enumerate violations with page numbers
+    # Extract examples from rule if available
+    extracted_examples = getattr(rule, "extracted_examples", [])
+    examples_warning = ""
+    if extracted_examples:
+        examples_list = ", ".join([f"'{ex}'" for ex in extracted_examples])
+        examples_warning = (
+            f"\n\nIMPORTANT - EXAMPLES TO IGNORE:\n"
+            f"The following text strings are EXAMPLES ONLY from the rule definition. "
+            f"Do NOT flag these as violations unless they actually appear in the document being validated:\n"
+            f"{examples_list}\n"
+            f"These are for illustration purposes only. Only flag actual violations found in the document pages below."
+        )
+
     system_prompt = (
         "You are an AI document validation assistant. You will be given a rule and multiple pages of text,"
-        " each labeled as 'Page N:'.\n"
-        "Identify ALL violations of the rule anywhere in the provided pages.\n"
+        " each labeled as 'Page N:'.\n\n"
+
+        "CRITICAL - ONLY FLAG TRUE VIOLATIONS:\n"
+        "- Do NOT flag text that is COMPLIANT with the rule\n"
+        "- Do NOT flag text where there is NO CONFUSION or error\n"
+        "- Do NOT flag text that MEETS the requirements\n"
+        "- Do NOT flag text that is NOT RELEVANT to the rule (e.g., proper acronyms like 'U.S. GAAP' when checking capitalization)\n"
+        "- Do NOT flag numeric expressions that already satisfy the rule (e.g., '67.3 billion' is compliant if rule requires decimal precision)\n\n"
+
+        "TASK:\n"
+        "Identify ALL TRUE VIOLATIONS of the rule anywhere in the provided pages.\n"
         "Return ONLY a JSON array. Each item must be an object with exactly these keys: \n"
-        "- page_num (integer)\n- finding (string).\n"
+        "- page_num (integer)\n- finding (string).\n\n"
+
         "CRITICAL: The 'finding' field MUST contain ONLY the exact string of text from the document that violates the rule. "
         "Do NOT include explanations, commentary, or corrections in the 'finding' field. "
         "Extract and return ONLY the verbatim erroneous text as it appears in the document.\n"
         "Example: If the text says 'primarily representing reversals of unrealized losses upon sales that have deceased', "
         "the finding should be ONLY: 'primarily representing reversals of unrealized losses upon sales that have deceased'\n"
-        "Do NOT return: 'The sentence is \"...\" The correct word is \"decreased\"...'\n"
-        "No prose outside JSON.\n"
-        "Do NOT flag numeric expressions that already satisfy the rule; for example, if decimal precision like \"1.0 billion\" is required, values like \"67.3 billion\" are compliant and must not be flagged; only integer forms like \"67 billion\" should be flagged."
+        "Do NOT return: 'The sentence is \"...\" The correct word is \"decreased\"...'\n\n"
+
+        "No prose outside JSON. Return empty array [] if no violations found."
+        f"{examples_warning}"
     )
 
     prev_last_page = None
@@ -186,9 +240,12 @@ async def run_semantic_batch(rule, doc_chunks: List) -> List[ToolFinding]:
         body = "\n\n".join(pages_text)
         prev_last_page = batch[-1] if batch else prev_last_page
 
+        # Use clarified rule if available, otherwise use validator
+        rule_text = getattr(rule, 'clarified_rule', None) or getattr(rule, 'validator', '')
+
         user_prompt = f"""
         --- RULE ---
-        {getattr(rule, 'validator', '')}
+        {rule_text}
 
         --- PAGES ---
         {body}
@@ -230,6 +287,31 @@ async def run_semantic_batch(rule, doc_chunks: List) -> List[ToolFinding]:
                     finding_text = str(it.get("finding", "")).strip()
                     if not finding_text or page_num not in page_nums_in_batch:
                         continue
+
+                    # Extract actual context from the document chunk
+                    context_snippet = "Semantic check"
+                    if page_num in page_content_map:
+                        page_content = page_content_map[page_num]
+                        # Try to find the finding text in the page content
+                        finding_pos = page_content.find(finding_text)
+                        if finding_pos != -1:
+                            # Extract context around the finding (50 chars before and after)
+                            start = max(0, finding_pos - 50)
+                            end = min(len(page_content), finding_pos + len(finding_text) + 50)
+                            context_snippet = f"...{page_content[start:end]}..."
+                        else:
+                            # If exact match not found, try case-insensitive search
+                            finding_lower = finding_text.lower()
+                            content_lower = page_content.lower()
+                            finding_pos = content_lower.find(finding_lower)
+                            if finding_pos != -1:
+                                start = max(0, finding_pos - 50)
+                                end = min(len(page_content), finding_pos + len(finding_text) + 50)
+                                context_snippet = f"...{page_content[start:end]}..."
+                            else:
+                                # Fallback: use first 150 chars of page as context
+                                context_snippet = f"{page_content[:150]}..." if len(page_content) > 150 else page_content
+
                     findings.append(
                         ToolFinding(
                             id=str(uuid.uuid4()),
@@ -237,7 +319,7 @@ async def run_semantic_batch(rule, doc_chunks: List) -> List[ToolFinding]:
                             rule_description=getattr(rule, "description", ""),
                             kind="semantic",
                             snippet=finding_text,
-                            details={"context": "Batch semantic check across pages"},
+                            details={"context": context_snippet},
                         )
                     )
                 except Exception as e:

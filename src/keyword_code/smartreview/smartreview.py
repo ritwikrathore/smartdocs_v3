@@ -149,12 +149,16 @@ class ProposedValidation(BaseModel):
     validation_type: Literal['regex', 'semantic'] = Field(..., description="The type of validation method the AI has chosen.")
     validator: str = Field(..., description="The generated regex pattern or the detailed semantic prompt for the LLM.")
     example_finding: str = Field(..., description="A direct quote from the provided document text that this validator would find, to show the user it works as expected.")
+    clarified_rule: str = Field(..., description="A rewritten, clarified version of the user's rule that clearly explains what constitutes a violation vs. compliance.")
+    extracted_examples: List[str] = Field(default_factory=list, description="Examples extracted from the user's rule text (e.g., text in parentheses like '(e.g., ...)'). These should NOT be flagged as violations unless they actually appear in the document.")
 
 class Rule(BaseModel):
     """A user-confirmed, executable validation rule."""
     description: str
     validation_type: Literal['regex', 'semantic']
     validator: str
+    clarified_rule: Optional[str] = None  # Rewritten rule for clarity
+    extracted_examples: List[str] = Field(default_factory=list)  # Examples to exclude from flagging
 
 class ValidationTemplate(BaseModel):
     """A collection of rules saved by the user."""
@@ -254,13 +258,42 @@ async def propose_validation_from_rule(rule_text: str, example_text: str, doc_ch
     You are an expert AI system that converts a user's plain-text rule into a structured, machine-executable validation.
 
     Steps:
-    1) Analyze the rule and any provided example.
-    2) Choose validation_type: 'regex' (precise patterns like dates/currency/IDs) or 'semantic' (intent/tone/meaning/context).
-    3) Generate validator:
+    1) Extract any examples from the rule text (e.g., text in parentheses like "(e.g., ...)" or similar patterns).
+    2) Rewrite the rule to clearly explain the user's intent, removing ambiguity and clarifying what constitutes a violation vs. compliance.
+    3) Analyze the rule and any provided example.
+    4) Choose validation_type: 'regex' (precise patterns like dates/currency/IDs) or 'semantic' (intent/tone/meaning/context).
+    5) Generate validator:
        - If 'regex': produce a robust Python-compatible regex pattern string.
        - If 'semantic': produce a clear, concise evaluation prompt for another AI to check violations.
-    4) Find an example from the provided document text that your validator would identify.
-    5) Explain the approach in one or two sentences.
+    6) Find an example from the provided document text that your validator would identify.
+    7) Explain the approach in one or two sentences.
+
+    WHEN TO USE REGEX VS SEMANTIC:
+
+    Use REGEX when:
+    - The rule checks for a SPECIFIC, WELL-DEFINED pattern that can be exhaustively enumerated
+    - Examples: date formats (MM/DD/YYYY), specific numeric patterns (phone numbers, IDs), exact string matches
+    - The rule checks a SMALL, FIXED set of values (e.g., checking for 3-5 specific currency names)
+    - Pattern matching is deterministic and doesn't require understanding context or meaning
+
+    Use SEMANTIC when:
+    - The rule requires understanding MEANING, CONTEXT, or INTENT
+    - Examples: word confusion (decease vs decrease, principal vs principle, affect vs effect)
+    - The rule involves OPEN-ENDED sets that cannot be exhaustively listed
+    - Examples: "all currency references" (there are 180+ world currencies), "proper capitalization of country names"
+    - The rule requires CASE SENSITIVITY checks across diverse terms (e.g., "Indian rupee" vs "Indian Rupee")
+    - The rule involves CALCULATIONS, COMPARISONS, or LOGICAL REASONING
+    - The rule checks for TONE, STYLE, or APPROPRIATENESS
+
+    SPECIFIC GUIDANCE FOR COMMON RULES:
+    - Currency case sensitivity (e.g., "Indian rupee" not "Indian Rupee"): Use SEMANTIC
+      Reason: There are 180+ currencies; regex cannot enumerate all. Semantic can understand capitalization rules.
+    - Word confusion (decease/decrease, principal/principle): Use SEMANTIC
+      Reason: Requires understanding context to determine if the word is used correctly.
+    - Specific date format (e.g., "Month DD, YYYY"): Use REGEX if checking format only; use SEMANTIC if also validating logical correctness
+    - Decimal precision for numbers (e.g., "1.0 billion" not "1 billion"): Use REGEX
+      Reason: This is a specific numeric pattern that can be precisely matched.
+    - ISO currency codes (USD, EUR, GBP): Use REGEX if checking a small set; use SEMANTIC if checking all possible codes
 
     CRITICAL REGEX GUIDELINES:
     When creating regex patterns, be aware of word boundaries and decimal numbers:
@@ -285,12 +318,31 @@ async def propose_validation_from_rule(rule_text: str, example_text: str, doc_ch
       2. Add (?!\\.\\d+) after your number pattern
       3. This prevents matching decimal parts as separate integers
 
+    EXAMPLE EXTRACTION:
+    - Look for examples in the rule text, typically in parentheses like "(e.g., ...)" or "(for example, ...)"
+    - Extract these examples as a list of strings
+    - These examples are for ILLUSTRATION ONLY and should NOT be flagged as violations unless they actually appear in the document
+    - Example: "Check currency case (e.g., 'U.S. dollar' not 'U.S. Dollar')" should extract: ["U.S. dollar", "U.S. Dollar"]
+
+    RULE CLARIFICATION:
+    - Rewrite the user's rule to clearly state:
+      * What the rule is checking for
+      * What constitutes a VIOLATION (non-compliant text)
+      * What constitutes COMPLIANCE (correct text)
+    - Remove ambiguity and make the intent crystal clear
+    - Example: "Check currency case (e.g., 'U.S. dollar' not 'U.S. Dollar')" becomes:
+      "Currency names must use proper case sensitivity where only the country/region name is capitalized, not the currency unit.
+       VIOLATION: 'U.S. Dollar', 'Indian Rupee' (currency unit capitalized).
+       COMPLIANT: 'U.S. dollar', 'Indian rupee' (only country capitalized)."
+
     STRICT OUTPUT REQUIREMENTS:
     - Output MUST be a single JSON object with EXACTLY these keys:
       - "explanation": string
       - "validation_type": "regex" | "semantic"
       - "validator": string
       - "example_finding": string
+      - "clarified_rule": string (the rewritten, clarified rule)
+      - "extracted_examples": array of strings (examples found in the rule text)
     - Do not include any additional keys, prose, comments, markdown, or code fences.
     - Return ONLY the JSON object.
     """
@@ -628,9 +680,18 @@ async def run_rule_on_chunk(rule: Rule, chunk: DocumentChunk) -> List[Validation
         system_prompt = """
         You are an AI document validation assistant. You will be given a chunk of text and a rule.
         Your task is to check if the text violates the rule.
-        - If you find a violation, respond with ONLY the exact string of text from the document that violates the rule. Do NOT include explanations, commentary, or corrections. Extract and return ONLY the verbatim erroneous text.
-        - If there are no violations, respond *only* with the text "No violation found.".
-        - Do NOT flag numeric expressions that already satisfy the rule; for example, if decimal precision like "1.0 billion" is required, values like "67.3 billion" are compliant and must not be flagged; only integer forms like "67 billion" should be flagged.
+
+        CRITICAL - ONLY FLAG TRUE VIOLATIONS:
+        - Do NOT flag text that is COMPLIANT with the rule
+        - Do NOT flag text where there is NO CONFUSION or error
+        - Do NOT flag text that MEETS the requirements
+        - Do NOT flag text that is NOT RELEVANT to the rule (e.g., proper acronyms like 'U.S. GAAP' when checking capitalization)
+        - Do NOT flag numeric expressions that already satisfy the rule (e.g., '67.3 billion' is compliant if rule requires decimal precision)
+
+        RESPONSE FORMAT:
+        - If you find a TRUE VIOLATION, respond with ONLY the exact string of text from the document that violates the rule. Do NOT include explanations, commentary, or corrections. Extract and return ONLY the verbatim erroneous text.
+        - If there are NO VIOLATIONS (including compliant cases, correct usage, or irrelevant matches), respond *only* with the text "No violation found.".
+
         Do not be conversational. Provide only the exact erroneous text or "No violation found.".
         """
         prompt = f"""
@@ -793,6 +854,8 @@ def render_rule_definition_view():
                         description=st.session_state.current_rule_text,
                         validation_type=proposal.validation_type,
                         validator=proposal.validator,
+                        clarified_rule=getattr(proposal, 'clarified_rule', None),
+                        extracted_examples=getattr(proposal, 'extracted_examples', []),
                     )
                     st.session_state.current_rules.append(accepted_rule)
                     st.session_state.proposed_validation = None

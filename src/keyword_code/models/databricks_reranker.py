@@ -26,7 +26,7 @@ from ..config import (
 )
 from transformers import AutoTokenizer
 
-# Databricks endpoint URL
+# Databricks [Reranker ONLY] endpoint URL
 DATABRICKS_BASE_URL = "https://int.api.worldbank.org/portfoliointelligence/serving-endpoints"
 DATABRICKS_RERANKER_MODEL_NAME = "cpm-marco-ms"
 DATABRICKS_RERANKER_ENDPOINT = f"{DATABRICKS_BASE_URL}/{DATABRICKS_RERANKER_MODEL_NAME}/invocations"

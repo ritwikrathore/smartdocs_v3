@@ -11,7 +11,7 @@ from typing import Dict, Any, Optional, List, Tuple
 from ..config import logger
 
 # Default memory thresholds (in percentage)
-DEFAULT_WARNING_THRESHOLD = 75.0  # 75% memory usage triggers a warning
+DEFAULT_WARNING_THRESHOLD = 85.0  # 75% memory usage triggers a warning
 DEFAULT_CRITICAL_THRESHOLD = 90.0  # 90% memory usage triggers cleanup
 
 # Global flag to track if memory monitoring is enabled

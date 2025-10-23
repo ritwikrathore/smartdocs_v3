@@ -10,6 +10,47 @@ from ..config import logger
 from ..processors.pdf_processor import PDFProcessor
 
 
+def restore_original_bytes_if_needed(filename: str) -> Optional[bytes]:
+    """
+    Restore original PDF bytes from analysis_results if they were cleared by memory cleanup.
+
+    This function checks if original_bytes exists in preprocessed_data for the given filename.
+    If not found (likely cleared by memory cleanup), it attempts to restore them from the
+    annotated PDF stored in analysis_results.
+
+    Args:
+        filename: Name of the file to restore bytes for
+
+    Returns:
+        The original PDF bytes if found or restored, None otherwise
+    """
+    # First check if we already have it in preprocessed_data
+    pre_doc = st.session_state.get("preprocessed_data", {}).get(filename, {})
+    orig_bytes = pre_doc.get("original_bytes")
+
+    if orig_bytes:
+        return orig_bytes
+
+    # If not found, try to restore from analysis_results
+    logger.info(f"Original PDF bytes not in preprocessed_data for {filename}; attempting to restore from analysis_results.")
+
+    for result in st.session_state.get("analysis_results", []):
+        if isinstance(result, dict) and result.get("filename") == filename and result.get("annotated_pdf"):
+            try:
+                orig_bytes = base64.b64decode(result["annotated_pdf"])
+                # Restore it to preprocessed_data for future use
+                if filename in st.session_state.get("preprocessed_data", {}):
+                    st.session_state.preprocessed_data[filename]["original_bytes"] = orig_bytes
+                logger.info(f"Successfully restored original PDF bytes for {filename} from analysis_results.")
+                return orig_bytes
+            except Exception as e:
+                logger.error(f"Failed to restore PDF bytes for {filename} from analysis_results: {e}")
+                break
+
+    logger.warning(f"Original PDF bytes not found for {filename} in preprocessed_data or analysis_results.")
+    return None
+
+
 def find_annotated_pdf_for_filename(filename: str) -> Optional[bytes]:
     """Finds the base64 decoded annotated PDF bytes for a given filename from session state."""
     for result in st.session_state.get("analysis_results", []):
@@ -30,6 +71,9 @@ def regenerate_annotated_pdfs_from_chat_chunks(relevant_chunks: List[Dict[str, A
     and chunk metadata (including bboxes) from session_state.preprocessed_data,
     builds a minimal phrase_locations structure using the union bbox of each retrieved
     chunk, and regenerates the annotated PDF via PDFProcessor.add_annotations.
+
+    If original_bytes has been cleared by memory cleanup, attempts to restore it from
+    the existing annotated PDF in analysis_results.
     """
     try:
         if not relevant_chunks:
@@ -46,11 +90,13 @@ def regenerate_annotated_pdfs_from_chat_chunks(relevant_chunks: List[Dict[str, A
         pre = st.session_state.get("preprocessed_data", {}) or {}
 
         for filename, file_chunks in chunks_by_file.items():
-            pre_doc = pre.get(filename, {}) or {}
-            orig_bytes = pre_doc.get("original_bytes")
+            # Try to get or restore original_bytes
+            orig_bytes = restore_original_bytes_if_needed(filename)
             if not orig_bytes:
                 logger.warning(f"Original PDF bytes not found for {filename}; skipping re-annotation.")
                 continue
+
+            pre_doc = pre.get(filename, {}) or {}
 
             # Map chunk_id -> chunk metadata to access page_num and bboxes
             meta_chunks: List[Dict[str, Any]] = pre_doc.get("chunks", []) or []

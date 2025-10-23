@@ -25,6 +25,7 @@ st.set_page_config(
 from src.keyword_code.models.embedding import load_embedding_model
 from src.keyword_code.app import preprocess_file, process_file_wrapper
 from src.keyword_code.display_utils import display_analysis_results, display_pdf_viewer, update_pdf_view
+from src.keyword_code.display_utils.pdf_utils import restore_original_bytes_if_needed
 from src.keyword_code.utils.async_utils import run_async
 from src.keyword_code.utils.helpers import get_base64_encoded_image
 from src.keyword_code.utils.ui_helpers import apply_ui_styling, render_branding, initialize_session_state, display_welcome_features, display_review_features
@@ -156,6 +157,25 @@ def run_auto_review_update():
         if not rule_lines:
             return
 
+        # Decompose the review prompt to get concise titles for each rule (like Ask mode)
+        # This provides better headers in the UI instead of using the full rule text
+        from src.keyword_code.ai.analyzer import DocumentAnalyzer
+        from src.keyword_code.ai.decomposition import decompose_prompt
+
+        analyzer = DocumentAnalyzer()
+        decomposed_rules = run_async(decompose_prompt(analyzer, rules_text))
+
+        # Create a mapping from rule text to concise title
+        # The decomposition should return one item per rule line
+        rule_to_title = {}
+        for i, rule_line in enumerate(rule_lines):
+            if i < len(decomposed_rules):
+                # Use the title from decomposition
+                rule_to_title[rule_line] = decomposed_rules[i].get("title", f"Rule {i+1}")
+            else:
+                # Fallback if decomposition didn't return enough items
+                rule_to_title[rule_line] = f"Rule {i+1}"
+
         aggregated_results = []
         for filename, pre_doc in pre.items():
             # Build document chunks for AI proposal context
@@ -210,12 +230,12 @@ def run_auto_review_update():
             analysis_sections = {}
             sub_prompt_results = []
 
-            # Use rule descriptions directly as titles (no RAG decomposition needed in Review mode)
-            # This avoids unnecessary LLM calls and keeps Review mode fast and focused on validation
+            # Use concise titles from decomposition (like Ask mode)
+            # This provides clean, readable headers instead of long slugified rule text
             for idx, (rule_desc, group_items) in enumerate(grouped_by_rule.items(), start=1):
-                # Use rule description directly as title
-                display_title = str(rule_desc)
-                # Derive a slug from the rule description for the section key base
+                # Get the concise title from decomposition
+                display_title = rule_to_title.get(rule_desc, f"Rule {idx}")
+                # Derive a slug from the concise title (not the full rule description)
                 slug_base = _re.sub(r"[^a-z0-9]+", "_", display_title.lower()).strip("_") or f"rule_{idx}"
 
                 # Create one analysis section per violation (finding)
@@ -263,7 +283,8 @@ def run_auto_review_update():
             aggregated_str = _json.dumps(aggregated, indent=2)
 
             # Verify and annotate using existing SmartDocs PDF pipeline
-            orig_bytes = pre_doc.get("original_bytes")
+            # Try to get or restore original_bytes
+            orig_bytes = restore_original_bytes_if_needed(filename)
             if not orig_bytes:
                 continue
             processor = _PDFProcessor(orig_bytes)
@@ -565,9 +586,8 @@ def process_rag_requests(results: list[dict[str, any]]) -> tuple[list[dict[str, 
                             verification_results, phrase_locations = {}, {}
                             try:
                                 if ai_section:
-                                    pdf_bytes = (st.session_state.get("preprocessed_data", {})
-                                                 .get(filename, {})
-                                                 .get("original_bytes"))
+                                    # Try to get or restore original_bytes
+                                    pdf_bytes = restore_original_bytes_if_needed(filename)
                                     if pdf_bytes:
                                         processor = PDFProcessor(pdf_bytes)
                                         mini_aggregated = {
@@ -633,7 +653,8 @@ def process_rag_requests(results: list[dict[str, any]]) -> tuple[list[dict[str, 
 
                                 # Regenerate annotated PDF based on merged locations (optional but improves UX)
                                 try:
-                                    orig_bytes = st.session_state.get("preprocessed_data", {}).get(filename, {}).get("original_bytes")
+                                    # Try to get or restore original_bytes
+                                    orig_bytes = restore_original_bytes_if_needed(filename)
                                     if orig_bytes:
                                         processor_for_update = PDFProcessor(orig_bytes)
                                         updated_pdf_bytes = processor_for_update.add_annotations(existing_locs)
@@ -680,15 +701,40 @@ def process_rag_requests(results: list[dict[str, any]]) -> tuple[list[dict[str, 
 # Check if results exist to determine view
 if st.session_state.get("analysis_results"):
     # --- RESULTS VIEW ---
-    st.markdown(
-        """
-        <div class="smartdocs-logo-container">
-            <h1><span style='color: #002345;'>CNT</span> <span style='color: #00ADE4;'>SmartDocs</span><sup style='font-size: 1rem; color: #FF5733;'>BETA</sup></h1>
-            <p>AI Powered Document Intelligence</p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    try:
+        logo_base64 = get_base64_encoded_image("src/keyword_code/assets/smartdocslogo.png")
+        if logo_base64:
+            st.markdown(
+                f"""
+                <div class="smartdocs-logo-container" style="text-align: center;">
+                    <img src="data:image/png;base64,{logo_base64}" alt="CNT SmartDocs" style="max-width: 350px; width: 100%; height: auto;">
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        else:
+            # Fallback to text if image fails to load
+            st.markdown(
+                """
+                <div class="smartdocs-logo-container">
+                    <h1><span style='color: #002345;'>CNT</span> <span style='color: #00ADE4;'>SmartDocs</span><sup style='font-size: 1rem; color: #FF5733;'>BETA</sup></h1>
+                    <p>AI Powered Document Intelligence</p>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+    except Exception as e:
+        logger.error(f"Failed to load SmartDocs logo: {e}")
+        # Fallback to text if image fails to load
+        st.markdown(
+            """
+            <div class="smartdocs-logo-container">
+                <h1><span style='color: #002345;'>CNT</span> <span style='color: #00ADE4;'>SmartDocs</span><sup style='font-size: 1rem; color: #FF5733;'>BETA</sup></h1>
+                <p>AI Powered Document Intelligence</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
     if st.button("🚀 Start New Analysis", key="new_analysis_button", use_container_width=True, type="primary"):
         # Clear relevant session state variables
@@ -756,15 +802,40 @@ if st.session_state.get("analysis_results"):
 
 else:
     # --- INPUT VIEW ---
-    st.markdown(
-        """
-        <div class="smartdocs-logo-container">
-            <h1><span style='color: #002345;'>CNT</span> <span style='color: #00ADE4;'>SmartDocs</span><sup style='font-size: 1rem; color: #FF5733;'>BETA</sup></h1>
-            <p>AI Powered Document Intelligence</p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    try:
+        logo_base64 = get_base64_encoded_image("src/keyword_code/assets/smartdocslogo.png")
+        if logo_base64:
+            st.markdown(
+                f"""
+                <div class="smartdocs-logo-container" style="text-align: center;">
+                    <img src="data:image/png;base64,{logo_base64}" alt="CNT SmartDocs" style="max-width: 350px; width: 100%; height: auto;">
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        else:
+            # Fallback to text if image fails to load
+            st.markdown(
+                """
+                <div class="smartdocs-logo-container">
+                    <h1><span style='color: #002345;'>CNT</span> <span style='color: #00ADE4;'>SmartDocs</span><sup style='font-size: 1rem; color: #FF5733;'>BETA</sup></h1>
+                    <p>AI Powered Document Intelligence</p>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+    except Exception as e:
+        logger.error(f"Failed to load SmartDocs logo: {e}")
+        # Fallback to text if image fails to load
+        st.markdown(
+            """
+            <div class="smartdocs-logo-container">
+                <h1><span style='color: #002345;'>CNT</span> <span style='color: #00ADE4;'>SmartDocs</span><sup style='font-size: 1rem; color: #FF5733;'>BETA</sup></h1>
+                <p>AI Powered Document Intelligence</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
     # Check if embedding model loaded successfully
     if embedding_model is None:

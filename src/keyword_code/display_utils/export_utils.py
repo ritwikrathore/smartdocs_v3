@@ -13,6 +13,7 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from datetime import datetime
 from typing import Dict, List, Any, Tuple
 from ..config import logger
+from .pdf_utils import restore_original_bytes_if_needed
 
 
 def create_report_package_content(issue_description: str, results: List[Tuple[Dict[str, Any], Dict[str, Any]]]) -> bytes:
@@ -71,7 +72,8 @@ def create_report_package_content(issue_description: str, results: List[Tuple[Di
             # Add the original document if available
             if "preprocessed_data" in st.session_state and filename in st.session_state.preprocessed_data:
                 try:
-                    original_bytes = st.session_state.preprocessed_data[filename].get("original_bytes")
+                    # Try to get or restore original_bytes
+                    original_bytes = restore_original_bytes_if_needed(filename)
                     if original_bytes:
                         zip_file.writestr(
                             f"original_documents/{filename}",

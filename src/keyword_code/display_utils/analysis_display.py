@@ -399,7 +399,8 @@ def display_analysis_results(results: List[Dict[str, Any]]):
             # Add Follow-up Question Interface at the bottom of the analysis results
             st.markdown('<hr style="margin: 20px 0; border: 0; border-top: 2px solid #e0e0e0;">', unsafe_allow_html=True)
             st.markdown('<div class="header-title" style="font-size: 1.3rem;">Follow-up Questions [Beta]</div>', unsafe_allow_html=True)
-            st.caption("This feature is still in beta. Some features like PDF annotation might not function as expected.")
+            st.caption("Ask follow-up questions to get more specific insights about your documents. AI will use the same document context to provide detailed answers.")
+            st.caption("⚠ This feature is still in beta. Some features like PDF annotation might not function as expected.")
             st.markdown('<hr style="margin: 12px 0; border: 0; border-top: 1px solid #e0e0e0;">', unsafe_allow_html=True)
 
             # Display existing follow-up Q&A if any
@@ -508,9 +509,6 @@ def display_analysis_results(results: List[Dict[str, Any]]):
                     except Exception as e:
                         logger.error(f"Error processing follow-up question: {e}", exc_info=True)
                         st.error(f"Sorry, an error occurred while processing your follow-up question: {str(e)}")
-
-            if not st.session_state.get("followup_qa") and not followup_question.strip():
-                st.info("💡 Ask follow-up questions to get more specific insights about your documents. The AI will use the same document context to provide detailed answers.")
 
     # Right Column: Tools & PDF Viewer
     from .tools_column import display_tools_column

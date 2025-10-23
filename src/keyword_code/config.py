@@ -51,7 +51,7 @@ RERANKER_MODEL_PATH = os.environ.get("RERANKER_MODEL_PATH", "src/keyword_code/re
 
 # --- Interaction Logging Configuration ---
 # Set to True to enable detailed logging of BM25, semantic search, reranker, and LLM interactions
-ENABLE_INTERACTION_LOGGING = True  # Disabled by default
+ENABLE_INTERACTION_LOGGING = False  # Disabled by default
 
 # --- Databricks Models ---
 # Configuration for Databricks services
