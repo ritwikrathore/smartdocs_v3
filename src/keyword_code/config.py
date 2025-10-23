@@ -13,7 +13,7 @@ env_path = root_dir / '.env'
 
 # --- Logging Configuration ---
 logging.basicConfig(
-    level=logging.INFO,  # Temporarily set to DEBUG to help diagnose reranker token issue
+    level=logging.INFO,  # Set to INFO to enable logging
     format="%(asctime)s - %(threadName)s - %(name)s - %(levelname)s - %(message)s"  # Added threadName
 )
 logger = logging.getLogger(__name__)
@@ -51,7 +51,7 @@ RERANKER_MODEL_PATH = os.environ.get("RERANKER_MODEL_PATH", "src/keyword_code/re
 
 # --- Interaction Logging Configuration ---
 # Set to True to enable detailed logging of BM25, semantic search, reranker, and LLM interactions
-ENABLE_INTERACTION_LOGGING = False  # Disabled by default
+ENABLE_INTERACTION_LOGGING = True  # Enabled by default
 
 # --- Databricks Models ---
 # Configuration for Databricks services
@@ -86,49 +86,52 @@ SAVED_PROMPTS = {
             {
                 "label": "Loans Analysis",
                 "prompt": (
-                    "1. What is the currency of the loan?\n"
-                    "2. What is the loan amount for different tranches and loan types such as 'A Loan', 'B1 Loan', 'C Loan'??\n"
-                    "3. What is the spread rate or margin rate for different loans?\n"
-                    "4. What are the business day definitions?\n"
-                    "5. What are the interest payment dates?\n"
-                    "6. What are the interest terms, variable or fixed rate? Is it Term SOFR, NON-USD Index, or NCCR for different loans?\n"
-                    "7. Interest shall accrue from day to day on what basis?\n"
-                    "8. What are the terms for partial prepayment / prepayment premium and allocation of principal amounts outstanding.\n"
-                    "9. What are the repayment terms and schedule?\n"
-                    "10. What are all the fees the borrower shall pay and the amounts?\n"
-                    "11. what is the commitment fee on undisbursed amount of the loan?\n"
-                    "12. What are the terms for default interest?\n"
-                    "13. What is the maturity date?\n"
-                    "14. When does the availability period end?"
+                    "1. What is the currency of the loan? \n"
+                    "2. What is the loan amount for different tranches and loan types such as 'A Loan', 'B1 Loan', 'C Loan'? \n"
+                    "3. What is the spread rate or margin rate for different loans? \n"
+                    "4. What are the business day definitions? \n"
+                    "5. What is the applicable business day convention for adjusting the interest payment date if the scheduled date falls on a non-business day? \n"
+                    "6. What are the interest payment dates? \n"
+                    "7. What are the interest terms, variable or fixed rate? Is it Term SOFR, NON-USD Index, or NCCR for different loans? \n"
+                    "8. What rounding adjustments, if any, are required for the interest rates? \n"
+                    "9. Interest shall accrue from day to day on what basis? \n"
+                    "10. What are the terms for partial prepayment / prepayment premium and allocation of principal amounts outstanding? \n"
+                    "11. What is the method for applying prepayments—is it pro rata basis or in inverse order of maturity? \n"
+                    "12. What are the repayment terms and can you list the full repayment schedule with dates? \n"
+                    "13. What are all the fees the borrower shall pay and the percentages / amounts? \n"
+                    "14. what is the commitment fee percentage on undisbursed amount of the loan? \n"
+                    "15. What are the terms for default interest? \n"
+                    "16. What is the maturity date? \n"
+                    "17. When does the availability period end? \n"
                 ),
             },
             {
                 "label": "Equity Analysis",
                 "prompt": (
-                    "1. What is the name of the issuing company?\n"
-                    "2. Who are the investors involved in this transaction?\n"
-                    "3. What is the investment commitment amount that IFC (International Finance Corporation) has agreed to in this transaction?\n"
-                    "4. What type of equity shares is IFC committing to in this agreement?\n"
-                    "5. How many shares or units is IFC subscribing to?\n"
-                    "6. What is the price per share or unit for IFC's subscription?\n"
-                    "7. What is the signing date of the agreement?\n"
-                    "8. Are there any fees or expenses associated with the agreement that affect IFC?\n"
-                    "9. What type of expense is it, such as equalization fee, mobilization, advisory, admin fee, etc.?\n"
-                    "10. What fees or expenses are explicitly paid to or paid by IFC in this transaction?\n"
-                    "11. Does IFC have any special rights or preferences, such as voting rights, dividends, or liquidation preferences, in this agreement?\n"
-                    "12. Are there any specific conditions or contingencies related to IFC's participation in the transaction?"
+                    "1. What is the name of the issuing company? \n"
+                    "2. Who are the investors involved in this transaction? \n"
+                    "3. What is the investment commitment amount that IFC (International Finance Corporation) has agreed to in this transaction? \n"
+                    "4. What type of equity shares is IFC committing to in this agreement? \n"
+                    "5. How many shares or units is IFC subscribing to? \n"
+                    "6. What is the price per share or unit for IFC's subscription? \n"
+                    "7. What is the signing date of the agreement? \n"
+                    "8. Are there any fees or expenses associated with the agreement that affect IFC? \n"
+                    "9. What type of expense is it, such as equalization fee, mobilization, advisory, admin fee, etc.? \n"
+                    "10. What fees or expenses are explicitly paid to or paid by IFC in this transaction? \n"
+                    "11. Does IFC have any special rights or preferences, such as voting rights, dividends, or liquidation preferences, in this agreement? \n"
+                    "12. Are there any specific conditions or contingencies related to IFC's participation in the transaction? \n"
                 ),
             },
             {
                 "label": "Guarentee Analysis",
                 "explanation": "CNTPI Guarentee Agreement Analysis",
                 "prompt": (
-                    "Check if clauses relating to the following keywords are present in the agreement:\n"
-                    "1. Default\n"
-                    "2. Restructuring\n"
-                    "3. Distressed sale\n"
-                    "4. Bankruptcy\n"
-                    "5. Rating downgrade"
+                    "Check if clauses relating to the following keywords are present in the agreement: \n"
+                    "1. Default \n"
+                    "2. Restructuring \n"
+                    "3. Distressed sale \n"
+                    "4. Bankruptcy \n"
+                    "5. Rating downgrade \n"
                 ),
             },
         ]

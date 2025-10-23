@@ -145,7 +145,7 @@ class DocumentAnalyzer:
             # Create the system prompt for the comprehensive analysis
             system_prompt = """You are an intelligent document analyzer specializing in legal and financial documents. You will be given a main prompt, multiple sub-prompts derived from it, and relevant document excerpts for each sub-prompt. Your task is to analyze each sub-prompt using its specific context and provide a structured response.
 
-### Core Instructions:
+### IMPORTANT Core Instructions:
 1. **Analyze Each Sub-prompt Separately:** For each sub-prompt, provide a focused analysis using ONLY the context provided for that specific sub-prompt.
 2. **Structured Response:** Your response must follow the JSON structure specified below, with an analysis for each sub-prompt.
 3. **Direct Answers:** For each sub-prompt, provide a comprehensive analysis that directly answers the question.
@@ -153,6 +153,19 @@ class DocumentAnalyzer:
 5. **No Cross-Referencing:** Do not use context from one sub-prompt to answer another sub-prompt, even if they seem related.
 6. **No Information Found:** If the context for a sub-prompt does not contain information to answer it, clearly state this in the analysis.
 7. **Natural Section References:** When referring to where information is found in the document, use natural language references to document sections (e.g., "Section 9 of the Loan Agreement", "Definitions Section", "Article 5", "Schedule A") based on the content of the text excerpts. Do NOT mention chunk IDs or technical identifiers. You may reference page numbers when helpful.
+
+### IMPORTANT Formatting Guidelines:
+You MUST use Markdown formatting in your analysis_summary to improve readability when appropriate:
+- **Bullet points** (using *, -, or +) for concise lists of up to 10 items (e.g., schedule of dates, list of violations, enumerated findings)
+- **Numbered lists** (using 1., 2., etc.) for sequential or ordered information
+- **Bold text** (using **text**) to emphasize important information like dates, percentages, amounts, facts, or key definitions
+- **Italic text** (using *text*) for subtle emphasis or document references
+
+DO NOT use any of the following:
+- Headers (#, ##, etc.) - the UI provides its own section headers
+- Code blocks (```) - not applicable for document analysis
+- Tables - not supported in the UI
+- Other complex Markdown elements
 
 ### JSON Output Schema:
 ```json
@@ -162,7 +175,7 @@ class DocumentAnalyzer:
       "sub_prompt_index": 1,
       "sub_prompt_title": "Title of the first sub-prompt",
       "sub_prompt_analyzed": "The exact first sub-prompt being analyzed",
-      "analysis_summary": "Detailed analysis directly answering the first sub-prompt...",
+      "analysis_summary": "Detailed analysis directly answering the **first sub-prompt**...",
       "supporting_quotes": [
         "Exact quote 1 from the document text for the first sub-prompt...",
         "Exact quote 2, potentially longer..."
@@ -173,7 +186,7 @@ class DocumentAnalyzer:
       "sub_prompt_index": 2,
       "sub_prompt_title": "Title of the second sub-prompt",
       "sub_prompt_analyzed": "The exact second sub-prompt being analyzed",
-      "analysis_summary": "Detailed analysis directly answering the second sub-prompt...",
+      "analysis_summary": "Detailed analysis directly answering the **second sub-prompt**...",
       "supporting_quotes": [
         "Exact quote 1 from the document text for the second sub-prompt...",
         "Exact quote 2, potentially longer..."
@@ -185,7 +198,7 @@ class DocumentAnalyzer:
 }
 ```
 
-Your entire response MUST be a single JSON object following this schema. Do not include any introductory text, explanations, or markdown formatting outside the JSON structure.
+Your entire response MUST be a single JSON object following this schema and Formatting Guidelines. Do not include any introductory text, explanations, or markdown formatting outside the JSON structure.
 """
 
             # Create the human prompt with all sub-prompts and their contexts
@@ -213,7 +226,7 @@ Relevant Document Excerpts for Sub-prompt {item['index']}:
 """
 
             human_prompt += """
-Generate a structured analysis for EACH sub-prompt, strictly following the JSON schema provided in the system instructions. Ensure each analysis only addresses its specific sub-prompt and uses only the context provided for that sub-prompt.
+Generate a structured analysis for EACH sub-prompt, strictly following the JSON schema and Formatting Guidelines provided in the system instructions. Ensure each analysis only addresses its specific sub-prompt and uses only the context provided for that sub-prompt.
 """
 
             messages = [

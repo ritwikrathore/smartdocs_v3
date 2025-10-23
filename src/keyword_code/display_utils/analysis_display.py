@@ -24,6 +24,7 @@ from .citation_utils import (
     display_chat_message_with_citations
 )
 from .export_utils import export_to_word
+from ..utils.helpers import render_limited_markdown
 
 # Load the embedding model using the cached function
 embedding_model = load_embedding_model()
@@ -198,12 +199,16 @@ def display_analysis_results(results: List[Dict[str, Any]]):
                                 context_content = section_data.get("Context")
 
                                 if analysis_content:
+                                    # Render limited Markdown in analysis content
+                                    rendered_analysis = render_limited_markdown(analysis_content)
+
                                     analysis_html_parts = [
                                         f"<div style='background-color: #f8f9fa; padding: .5rem; border-radius: 0.5rem; margin-bottom: 1rem;'>",
                                         f"<h4 style='color: #1e88e5; font-size: 1.1rem;'>Analysis</h4>",
-                                        f"<div style='color: #424242; line-height: 1.6;'>{analysis_content}"
+                                        f"<div style='color: #424242; line-height: 1.6;'>{rendered_analysis}"
                                     ]
                                     if context_content:
+                                        # Context is NOT rendered with Markdown - keep as plain text
                                         analysis_html_parts.extend([
                                             f"<div style='margin-top: 0.8rem; border-top: 1px solid #e0e0e0; padding-top: 0.8rem;'>",
                                             f"<span style='color: #1b5e20; font-size: 0.9rem; line-height: 1.4;'>{context_content}</span>",
@@ -212,6 +217,7 @@ def display_analysis_results(results: List[Dict[str, Any]]):
                                     analysis_html_parts.extend(["</div></div>"])
                                     st.markdown("".join(analysis_html_parts), unsafe_allow_html=True)
                                 elif context_content:  # Display context even if analysis is missing
+                                    # Context is NOT rendered with Markdown - keep as plain text
                                     st.markdown(f"""
                                         <div style='background-color: #f8f9fa; padding: .5rem; border-radius: 0.5rem; margin-bottom: 1rem;'>
                                             <h4 style='color: #1e88e5; font-size: 1.1rem;'>Context</h4>
@@ -418,10 +424,11 @@ def display_analysis_results(results: List[Dict[str, Any]]):
                         processed_text = qa_pair.get("processed_text", qa_pair.get("answer", ""))
                         citation_details = qa_pair.get("citation_details", [])
 
-                        # Display the answer text
+                        # Display the answer text with Markdown rendering
+                        rendered_answer = render_limited_markdown(processed_text)
                         st.markdown(f"""
                         <div style='background-color: #f8f9fa; padding: 12px; border-radius: 8px; margin-bottom: 8px;'>
-                            <div style='color: #424242; line-height: 1.6;'>{processed_text}</div>
+                            <div style='color: #424242; line-height: 1.6;'>{rendered_answer}</div>
                         </div>
                         """, unsafe_allow_html=True)
 
@@ -608,11 +615,13 @@ def display_rag_results_section(section_key: str):
         ai_section = retry_data.get("ai_section")
         if ai_section:
             with st.expander("🧠 AI Response (Retry) + Validation", expanded=True):
-                # Analysis text
+                # Analysis text with Markdown rendering
                 analysis_text = ai_section.get("Analysis", "")
                 if analysis_text:
                     st.markdown("**Analysis (Retry):**")
-                    st.markdown(analysis_text)
+                    # Render limited Markdown in retry analysis
+                    rendered_retry_analysis = render_limited_markdown(analysis_text)
+                    st.markdown(rendered_retry_analysis, unsafe_allow_html=True)
                 else:
                     st.info("No analysis text available from retry.")
 

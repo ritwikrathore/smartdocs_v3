@@ -162,8 +162,13 @@ The "📄 CNT space" page should then appear in the Streamlit sidebar navigation
 *   **Multi-Document Upload**: Process multiple PDF and DOCX files simultaneously.
 *   **AI-Powered Analysis**: Get detailed analysis based on your specific prompts using advanced AI models.
 *   **Unified RAG Approach**: Sends all sub-prompts and their contexts to the LLM in a single call, allowing for cross-referencing and more coherent answers.
+*   **Dynamic RAG Channeling**: Intelligently adjusts the balance between BM25 keyword search and semantic search based on query characteristics, optimizing retrieval for different types of queries (e.g., more BM25 weight for structured queries like MT599 Swift messages).
 *   **Hybrid RAG Retrieval**: Combines BM25 keyword search, semantic search, and Databricks reranker for highly relevant context selection.
+*   **RAG Retry Functionality**: Allows users to retry RAG retrieval with adjusted parameters (BM25/semantic weighting) for individual sub-prompts, providing fine-grained control over context retrieval without re-running the entire analysis.
 *   **Databricks Integration**: Uses Databricks API for LLM (LLama 3), embeddings, and reranking, providing high-quality results with automatic token limit handling.
+*   **Fallback LLM Re-ranker**: When the Databricks reranker API is unavailable or fails, automatically falls back to an LLM-based reranking system that leverages the full context window without token truncation limitations.
+*   **Fact Extraction (Beta)**: Extract structured facts and definitions from AI analysis results with a dedicated "Generate Facts" feature, using Google LangExtract for high-quality extraction and exporting to Excel format.
+*   **Review Mode**: Streamlined interface for document review workflows with pre-configured prompts, expanded supporting citations, and optimized UI for verification tasks.
 *   **Prompt Decomposition**: Automatically breaks down complex prompts into smaller, manageable analysis tasks.
 *   **Phrase Verification**: Automatically verifies AI-extracted supporting phrases against the source documents using fuzzy matching.
 *   **PDF Annotation**: Highlights verified phrases directly within the PDF viewer.
@@ -174,6 +179,33 @@ The "📄 CNT space" page should then appear in the Streamlit sidebar navigation
 
 ## Recent Updates
 
+*   **Dynamic RAG Channeling**: Implemented intelligent BM25/semantic search weighting that automatically adjusts based on query characteristics:
+    *   Analyzes query patterns to determine optimal retrieval strategy
+    *   Increases BM25 weight for structured queries (e.g., MT599 Swift messages, technical identifiers)
+    *   Increases semantic weight for conceptual or natural language queries
+    *   Provides better context retrieval across diverse query types
+*   **RAG Retry Functionality**: Added per-subprompt RAG retry capability:
+    *   Users can retry individual sub-prompts with adjusted BM25/semantic weighting
+    *   Retry buttons integrated into analysis section headers
+    *   Avoids re-running entire analysis when only specific sections need refinement
+    *   Displays updated analysis seamlessly without showing separate retry results
+*   **Fact Extraction (Beta)**: Integrated Google LangExtract for structured fact extraction:
+    *   Extracts facts and definitions from AI analysis results on-demand
+    *   Separate "Fact Extraction (beta)" expander in the UI
+    *   "Generate Facts" button to trigger extraction (doesn't run automatically)
+    *   Exports to Excel with standardized two-column format (Fact, Definition)
+    *   Uses single LLM call per document with increased retry count for reliability
+*   **Review Mode**: Added streamlined review interface:
+    *   Pre-configured prompts optimized for document review workflows
+    *   Supporting citations expander always expanded by default
+    *   Four feature bullets highlighting key capabilities
+    *   Centralized prompt configuration to eliminate duplication
+    *   Optimized UI for verification and compliance tasks
+*   **Fallback LLM Re-ranker**: Implemented robust fallback reranking system:
+    *   Automatically activates when Databricks reranker API is unavailable
+    *   Uses LLM-based reranking without token truncation limitations
+    *   Leverages full context window for better relevance scoring
+    *   Provides seamless failover to maintain system reliability
 *   **Reranker Token Limit Fix**: Implemented robust token-based truncation for the Databricks reranker model to handle the 512 token limit:
     *   Added BERT tokenizer for accurate token counting instead of character-based approximations
     *   Implemented proportional token allocation between query (10-30%) and document (70-90%) text
