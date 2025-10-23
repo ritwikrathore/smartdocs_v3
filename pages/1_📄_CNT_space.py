@@ -14,12 +14,9 @@ import threading
 import streamlit_pills as stp
 import streamlit.components.v1 as components
 
-# --- Page Config ---
-st.set_page_config(
-    page_title="CNT SmartDocs - Document Intelligence",
-    layout="wide",
-    initial_sidebar_state="collapsed"
-)
+# Note: Page-level `set_page_config` removed to ensure the main app
+# calls `st.set_page_config()` exactly once and as the first Streamlit
+# command.
 
 # Import necessary components directly from the modules
 from src.keyword_code.models.embedding import load_embedding_model

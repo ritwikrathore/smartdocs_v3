@@ -206,16 +206,10 @@ The "📄 CNT space" page should then appear in the Streamlit sidebar navigation
     *   Uses LLM-based reranking without token truncation limitations
     *   Leverages full context window for better relevance scoring
     *   Provides seamless failover to maintain system reliability
-*   **Reranker Token Limit Fix**: Implemented robust token-based truncation for the Databricks reranker model to handle the 512 token limit:
-    *   Added BERT tokenizer for accurate token counting instead of character-based approximations
-    *   Implemented proportional token allocation between query (10-30%) and document (70-90%) text
-    *   Added automatic truncation with intelligent boundary detection (sentence/word boundaries)
-    *   Configured `RERANKER_MAX_TOKENS = 512` in config for centralized token limit management
     *   Added comprehensive logging for truncation operations and token usage
-*   **Improved Code Organization**: Moved LLM reranking functionality from `rag/retrieval.py` to `ai/llm_reranker.py` for better code organization, keeping AI-related functionality in the appropriate directory.
-*   **Streamlined Document Analysis**: Removed legacy `analyze_document` method in favor of the unified `analyze_document_with_all_contexts` approach, which provides more coherent analysis by allowing cross-referencing between sub-prompts.
-*   **Enhanced PDF Processing**: Implemented a sentence-based chunking strategy using spaCy in the PDF processor, creating more semantically meaningful chunks (3 sentences per chunk) for improved retrieval.
-*   **Consistent Word Document Handling**: Word documents are now converted to PDF format and processed using the same chunking strategy as PDF files, ensuring consistent handling across document types.
+*   **Improved Code Organization**: Refactored display.py into smaller, focused modules for better maintainability:
+    *   Smaller, targeted modules for specific display logic under display_utils/
+
 
 ## Memory and File Management
 

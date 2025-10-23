@@ -139,18 +139,11 @@ SAVED_PROMPTS = {
     "Review": {
         "Financial Statement Review": [
             {
-                "label": "Comprehensive Financial Statement Validation",
-                "explanation": "Comprehensive checklist covering numeric formatting, currency conventions, terminology accuracy, calculation verification, and consistency checks.",
+                "label": "IFC MD&A / FS Review",
+                "explanation": "Comprehensive checklist covering formatting, currency checks, and terminology accuracy checks",
                 "prompt": """1) Verify that all billion values are expressed with decimal precision (e.g., '1.0 billion' not '1 billion')
 2) Check that all currency references use proper case sensitivity where only the first letter is capitalized (e.g., 'Indian rupee' not 'Indian Rupee' or 'indian rupee')
-3) Identify potential word confusion errors such as 'decease' vs 'decrease', 'principal' vs 'principle', 'affect' vs 'effect'
-4) Confirm that percentage rates include a '%' symbol and at least one decimal place (e.g., '5.5%' not '5%')
-5) Flag numbers >= 1,000 that lack thousands separators (e.g., '10000' should be '10,000')
-6) Ensure ISO currency codes are uppercase three-letter codes when used as codes (e.g., 'USD 1,000,000' not 'Usd 1,000,000' or '$US 1,000,000')
-7) Ensure all dates follow the 'Month DD, YYYY' format (e.g., 'June 30, 2024' not '30/06/2024')
-8) Verify that 'Total Liabilities' equals 'Current Liabilities' + 'Non-current Liabilities' within a rounding tolerance of 1 unit
-9) Check that amounts are consistently reported in the stated presentation unit (e.g., 'US$ in millions'); flag mixed units or missing unit declarations
-10) Ensure negative amounts are displayed in parentheses (e.g., '(1,234)' not '-1,234')""",
+3) Identify potential word confusion errors such as 'decease' vs 'decrease', 'principal' vs 'principle', 'affect' vs 'effect'""",
             },
         ]
     },
