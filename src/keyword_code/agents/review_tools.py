@@ -146,7 +146,7 @@ async def run_semantic_batch(rule, doc_chunks: List) -> List[ToolFinding]:
     # Create a mapping of page_num to chunk content for context extraction
     page_content_map = {getattr(ch, "page_num", -1): getattr(ch, "content", "") for ch in doc_chunks}
 
-    TARGET_TOKENS = 20000  # Optimized for better processing efficiency
+    TARGET_TOKENS = 15000  # Optimized for better processing efficiency
     OVERLAP_TOKENS = 300  # fixed overlap between batches (words)
 
     def _tail_words(s: str, n: int) -> str:
