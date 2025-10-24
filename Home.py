@@ -1,5 +1,4 @@
 import streamlit as st
-from src.keyword_code.utils.helpers import get_base64_encoded_image
 
 st.set_page_config(
     page_title="CNT SmartDocs",
@@ -7,6 +6,7 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="collapsed"
 )
+from src.keyword_code.utils.helpers import get_base64_encoded_image
 
 # Display SmartDocs logo
 try:

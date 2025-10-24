@@ -51,7 +51,7 @@ RERANKER_MODEL_PATH = os.environ.get("RERANKER_MODEL_PATH", "src/keyword_code/re
 
 # --- Interaction Logging Configuration ---
 # Set to True to enable detailed logging of BM25, semantic search, reranker, and LLM interactions
-ENABLE_INTERACTION_LOGGING = True  # Enabled by default
+ENABLE_INTERACTION_LOGGING = False  # Disabled by default
 
 # --- Databricks Models ---
 # Configuration for Databricks services
@@ -139,11 +139,11 @@ SAVED_PROMPTS = {
     "Review": {
         "Financial Statement Review": [
             {
-                "label": "IFC MD&A / FS Review",
-                "explanation": "Comprehensive checklist covering formatting, currency checks, and terminology accuracy checks",
+                "label": "Comprehensive Financial Statement Validation",
+                "explanation": "Comprehensive checklist covering numeric formatting, currency conventions, terminology accuracy, calculation verification, and consistency checks.",
                 "prompt": """1) Verify that all billion values are expressed with decimal precision (e.g., '1.0 billion' not '1 billion')
-2) Check that all currency references use proper case sensitivity where only the first letter is capitalized (e.g., 'Indian rupee' not 'Indian Rupee' or 'indian rupee')
-3) Identify potential word confusion errors such as 'decease' vs 'decrease', 'principal' vs 'principle', 'affect' vs 'effect'""",
+2) Check that all currency references in paragraph text use proper case sensitivity such that only the first letter of the country name is capitalized and the name of the currency itself is not capitalised (e.g., 'Indian rupee' not 'Indian Rupee' or 'indian rupee')
+3) Identify potential word confusion errors such as 'principal' instead of 'principle' or 'affect' instead of 'effect'""",
             },
         ]
     },

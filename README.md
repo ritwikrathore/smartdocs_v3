@@ -9,8 +9,8 @@ A Streamlit page providing AI-powered document intelligence capabilities, design
 ├── src/
 │   └── keyword_code/               # Core document analysis backend
 │       ├── ai/                     # AI integration modules
-│       │   ├── analyzer.py         # Document analysis with LLM
 │       │   ├── chat.py             # Chat functionality
+│       │   ├── analyzer.py         # Document analysis with LLM
 │       │   ├── databricks_llm.py   # Databricks LLM client
 │       │   ├── decomposition.py    # Prompt decomposition
 │       ├── assets/                 # Application assets (images, logos)
@@ -24,9 +24,27 @@ A Streamlit page providing AI-powered document intelligence capabilities, design
 │       ├── rag/                    # Retrieval-Augmented Generation
 │       │   ├── retrieval.py        # Hybrid retrieval system (BM25 + semantic)
 │       │   └── chunking.py         # Isolates chunking process
+│       ├── display_utils/          # UI display functions
+│       │   ├── ui_components.py    # UI component utilities
+│       │   ├── pdf_utils.py        # PDF display utilities
+│       │   ├── citation_utils.py   # Citation processing and display utilities
+│       │   ├── analysis_display.py # Main analysis results display
+│       │   ├── tools_column.py     # Tools column display
+│       │   └── export_utils.py     # Report export utilities
+│       ├── agents/                 # Agents for specialized tasks
+│       │   ├── rag_agent.py        # RAG optimization agent
+│       │   ├── fact_extraction_agent.py # Fact extraction agent
+│       │   └── review_evaluator.py # Review mode evaluation agent
+│       │   └── review_types.py     # Shared types for review mode
+│       │   └── review_tools.py     # Review mode tools and utilities
+│       │   └── review_scoring.py   # Review mode scoring utilities
+│       │   └── review_orchestrator.py # Review mode orchestration
+│       ├── smartreview/            # SmartReview module
+│       │   ├── smartreview.py      # SmartReview core logic
+│       ├── services/               # Fact Extraction services
+│       │   ├── fact_extraction_service.py # fact extraction service
 │       ├── utils/                  # Utility functions
 │       │   ├── async_utils.py      # Asynchronous processing utilities
-│       │   ├── display.py          # UI display functions
 │       │   ├── file_manager.py     # Temporary file management
 │       │   ├── helpers.py          # General helper functions
 │       │   ├── interaction_logger.py # Logging for search and LLM interactions
@@ -38,7 +56,8 @@ A Streamlit page providing AI-powered document intelligence capabilities, design
 ├── models/                         # Local storage for downloaded models
 │   └── spacy/                      # Local spaCy models
 ├── tmp/                            # Temporary file storage
-├── logs/                           # Log files directory (temporary, to be disabled before moving to prod)
+├── logs/                           # Log files directory
+├── Home.py                         # Host application entry point [PLACEHOLDER]
 ├── requirements.txt                # Python dependencies
 └── README.md                       # This file
 ```
@@ -189,12 +208,9 @@ The "📄 CNT space" page should then appear in the Streamlit sidebar navigation
     *   Retry buttons integrated into analysis section headers
     *   Avoids re-running entire analysis when only specific sections need refinement
     *   Displays updated analysis seamlessly without showing separate retry results
-*   **Fact Extraction (Beta)**: Integrated Google LangExtract for structured fact extraction:
+*   **Fact Extraction (Beta)**: Integrated custom LLM-based fact extraction system for structured fact extraction:
     *   Extracts facts and definitions from AI analysis results on-demand
     *   Separate "Fact Extraction (beta)" expander in the UI
-    *   "Generate Facts" button to trigger extraction (doesn't run automatically)
-    *   Exports to Excel with standardized two-column format (Fact, Definition)
-    *   Uses single LLM call per document with increased retry count for reliability
 *   **Review Mode**: Added streamlined review interface:
     *   Pre-configured prompts optimized for document review workflows
     *   Supporting citations expander always expanded by default
