@@ -90,6 +90,18 @@ class DatabricksLLMClient:
                     # Default to user for unknown roles
                     openai_messages.append({"role": "user", "content": content})
 
+            # Log the full request in DEBUG mode
+            logger.debug("=" * 80)
+            logger.debug("AI API REQUEST")
+            logger.debug("=" * 80)
+            logger.debug(f"Model: {self.model_name}")
+            logger.debug(f"Max Tokens: {max_tokens}")
+            logger.debug("Messages:")
+            for i, msg in enumerate(openai_messages):
+                logger.debug(f"  Message {i+1} ({msg['role']}):")
+                logger.debug(f"    {msg['content']}")
+            logger.debug("=" * 80)
+
             # Make the API call
             response = self.client.chat.completions.create(
                 messages=openai_messages,
@@ -99,7 +111,18 @@ class DatabricksLLMClient:
 
             # Extract the generated text
             if response.choices and len(response.choices) > 0:
-                return response.choices[0].message.content
+                response_content = response.choices[0].message.content
+
+                # Log the full response in DEBUG mode
+                logger.debug("=" * 80)
+                logger.debug("AI API RESPONSE")
+                logger.debug("=" * 80)
+                logger.debug(f"Response Length: {len(response_content)} characters")
+                logger.debug("Response Content:")
+                logger.debug(response_content)
+                logger.debug("=" * 80)
+
+                return response_content
             else:
                 logger.warning("Empty response from Databricks LLM API")
                 return None

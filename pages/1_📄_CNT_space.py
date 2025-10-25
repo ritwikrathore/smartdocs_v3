@@ -92,7 +92,8 @@ from src.keyword_code.smartreview import (
     Rule as SRRule,
     ValidationTemplate,
     DocumentChunk,
-    propose_validation_from_rule,
+    propose_validation_from_rule,  # Legacy version (with document text)
+    propose_validation_from_rule_v2,  # New version (without document text)
     execute_validation_template,
 )
 
@@ -154,37 +155,47 @@ def run_auto_review_update():
         if not rule_lines:
             return
 
-        # Decompose the review prompt to get concise titles for each rule (like Ask mode)
+        # Decompose the review prompt to get concise titles for each rule
         # This provides better headers in the UI instead of using the full rule text
         from src.keyword_code.ai.analyzer import DocumentAnalyzer
-        from src.keyword_code.ai.decomposition import decompose_prompt
+        from src.keyword_code.ai.decomposition import decompose_review_mode_prompt
 
         analyzer = DocumentAnalyzer()
-        decomposed_rules = run_async(decompose_prompt(analyzer, rules_text))
+        decomposed_rules = run_async(decompose_review_mode_prompt(analyzer, rules_text))
 
         # Create a mapping from rule text to concise title
-        # The decomposition should return one item per rule line
+        # The decomposition should return one ReviewModeSubPrompt per rule line
         rule_to_title = {}
         for i, rule_line in enumerate(rule_lines):
             if i < len(decomposed_rules):
-                # Use the title from decomposition
-                rule_to_title[rule_line] = decomposed_rules[i].get("title", f"Rule {i+1}")
+                # Use the title from decomposition (ReviewModeSubPrompt has .title attribute)
+                rule_to_title[rule_line] = decomposed_rules[i].title
             else:
                 # Fallback if decomposition didn't return enough items
                 rule_to_title[rule_line] = f"Rule {i+1}"
 
         aggregated_results = []
         for filename, pre_doc in pre.items():
-            # Build document chunks for AI proposal context
+            # Build document chunks for validation execution (not needed for decomposition anymore)
             doc_chunks = _build_document_chunks(pre_doc)
-            # Build rules via AI proposals
+            # Build rules via AI proposals (using V2 - no document text in decomposition)
             rules_final = []
             for rl in rule_lines:
                 try:
-                    pv = run_async(propose_validation_from_rule(rl, "", doc_chunks))
+                    # Use V2 version which doesn't require document chunks for decomposition
+                    pv = run_async(propose_validation_from_rule_v2(rl, ""))
                     if pv:
-                        rules_final.append(SRRule(description=rl, validation_type=pv.validation_type, validator=pv.validator))
-                except Exception:
+                        rules_final.append(SRRule(
+                            description=rl,
+                            validation_type=pv.validation_type,
+                            validator=pv.validator,
+                            clarified_rule=getattr(pv, 'clarified_rule', None),
+                            extracted_examples=getattr(pv, 'extracted_examples', [])
+                        ))
+                except Exception as e:
+                    import logging as _lg
+                    _logger = _lg.getLogger(__name__)
+                    _logger.error(f"Failed to create rule for '{rl}': {e}", exc_info=True)
                     # Skip rule on failure; continue others
                     pass
             if not rules_final:
@@ -321,11 +332,7 @@ def run_auto_review_update():
         _lg.getLogger(__name__).error(f"Auto review update failed: {_e}", exc_info=True)
 
 # --- Configuration ---
-# Setup logging (consider moving to a central config if used elsewhere)
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(threadName)s - %(name)s - %(levelname)s - %(message)s"
-)
+# Logging is configured in src.keyword_code.config - just get a logger here
 logger = logging.getLogger(__name__)
 
 # --- Constants (Consider moving to a config file or defining in app.py) ---

@@ -188,11 +188,23 @@ Respond with ONLY the scores, one per line, in order. Example format:
                 {"role": "user", "content": batch_prompt}
             ]
 
-            logger.debug(f"Batch prompt length: {len(batch_prompt)} characters")
-
             # Calculate appropriate max_tokens based on number of pairs
             # Each score is ~4 tokens (e.g., "0.85\n"), so we need ~4 * num_pairs tokens
             max_tokens = min(4 * len(sentence_pairs) + 20, 500)
+
+            # Log the full request in DEBUG mode
+            logger.debug("=" * 80)
+            logger.debug("LLM RERANKER API REQUEST")
+            logger.debug("=" * 80)
+            logger.debug(f"Model: {self.model_name}")
+            logger.debug(f"Max Tokens: {max_tokens}")
+            logger.debug(f"Temperature: 0.0")
+            logger.debug(f"Batch Size: {len(sentence_pairs)} pairs")
+            logger.debug("System Message:")
+            logger.debug(messages[0]["content"])
+            logger.debug("User Message (Batch Prompt):")
+            logger.debug(batch_prompt)
+            logger.debug("=" * 80)
 
             response = self.client.chat.completions.create(
                 messages=messages,
@@ -202,7 +214,15 @@ Respond with ONLY the scores, one per line, in order. Example format:
             )
 
             score_text = response.choices[0].message.content.strip()
-            logger.debug(f"LLM response: {score_text[:500]}...")
+
+            # Log the full response in DEBUG mode
+            logger.debug("=" * 80)
+            logger.debug("LLM RERANKER API RESPONSE")
+            logger.debug("=" * 80)
+            logger.debug(f"Response Length: {len(score_text)} characters")
+            logger.debug("Response Content:")
+            logger.debug(score_text)
+            logger.debug("=" * 80)
 
             lines = score_text.split('\n')
 

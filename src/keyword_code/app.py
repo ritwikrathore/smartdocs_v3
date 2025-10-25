@@ -370,7 +370,8 @@ def process_file_wrapper(args):
         # --- ASK MODE: Step 2 - Decompose the prompt into sub-prompts ---
         logger.info(f"Ask mode: Starting decomposition and RAG workflow for {filename}")
         analyzer = DocumentAnalyzer()
-        sub_prompts = run_async(decompose_prompt(analyzer, user_prompt))
+        from src.keyword_code.ai.decomposition import decompose_ask_mode_prompt
+        sub_prompts = run_async(decompose_ask_mode_prompt(analyzer, user_prompt))
         logger.info(f"Decomposed prompt into {len(sub_prompts)} sub-prompts for {filename}")
 
         # --- Step 3: Process all sub-prompts with RAG using the unified context approach ---

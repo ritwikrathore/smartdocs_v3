@@ -216,8 +216,6 @@ async def run_semantic_batch(rule, doc_chunks: List) -> List[ToolFinding]:
         "CRITICAL: The 'finding' field MUST contain ONLY the exact string of text from the document that violates the rule. "
         "Do NOT include explanations, commentary, or corrections in the 'finding' field. "
         "Extract and return ONLY the verbatim erroneous text as it appears in the document.\n"
-        "Example: If the text says 'primarily representing reversals of unrealized losses upon sales that have deceased', "
-        "the finding should be ONLY: 'primarily representing reversals of unrealized losses upon sales that have deceased'\n"
         "Do NOT return: 'The sentence is \"...\" The correct word is \"decreased\"...'\n\n"
 
         "No prose outside JSON. Return empty array [] if no violations found."

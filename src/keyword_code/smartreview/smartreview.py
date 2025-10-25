@@ -244,8 +244,96 @@ def extract_text_from_pdf(uploaded_file_bytes: bytes) -> List[DocumentChunk]:
     return chunks
 
 
+async def propose_validation_from_rule_v2(rule_text: str, example_text: str = "") -> Optional[ProposedValidation]:
+    """
+    NEW VERSION: AI agent to interpret a user's rule and propose a validation method.
+    This version does NOT use document text in the decomposition step, following the refactored workflow.
+
+    Workflow:
+    1. Use decompose_review_mode_prompt to analyze the rule (no document text)
+    2. For regex validation: call generate_regex_pattern to get the pattern
+    3. For semantic validation: use the clarified rule as the validator
+
+    Returns a ProposedValidation object compatible with the existing UI.
+    """
+    from src.keyword_code.ai.analyzer import DocumentAnalyzer
+    from src.keyword_code.ai.decomposition import decompose_review_mode_prompt, generate_regex_pattern
+
+    logger.info(f"[V2] Proposing validation for rule: '{_safe_str(rule_text, max_len=200)}'")
+
+    # Step 1: Decompose the rule (no document text)
+    analyzer = DocumentAnalyzer()
+
+    # If example_text is provided, include it in the rule text for decomposition
+    full_rule_text = rule_text
+    if example_text:
+        full_rule_text = f"{rule_text}\n\nUser-provided example: {example_text}"
+
+    decomposed = await decompose_review_mode_prompt(analyzer, full_rule_text)
+
+    if not decomposed or len(decomposed) == 0:
+        logger.error("Decomposition failed or returned empty list")
+        return None
+
+    # Take the first sub-prompt (for single rule input, there should be only one)
+    sub_prompt = decomposed[0]
+    logger.info(f"[V2] Decomposed rule: type={sub_prompt.validation_type}, title='{sub_prompt.title}'")
+
+    # Step 2: Generate validator based on validation type
+    validator = ""
+    example_finding = "No example available"
+
+    if sub_prompt.validation_type == "regex":
+        # Generate regex pattern
+        regex_result = await generate_regex_pattern(analyzer, sub_prompt)
+        if regex_result:
+            validator = regex_result.regex_pattern
+            # Use test_matches as example finding
+            if regex_result.test_matches:
+                example_finding = f"Would match: {regex_result.test_matches[0]}"
+            logger.info(f"[V2] Generated regex pattern: {validator[:100]}...")
+        else:
+            logger.error("Regex generation failed, falling back to semantic")
+            # Fallback to semantic if regex generation fails
+            sub_prompt.validation_type = "semantic"
+            sub_prompt.validation_reasoning = "Regex generation failed, using semantic validation as fallback"
+
+    if sub_prompt.validation_type == "semantic":
+        # Use clarified rule as the semantic validator prompt
+        validator = (
+            f"You must check the text for violations of this rule:\n\"{sub_prompt.sub_prompt}\"\n"
+            "- Quote the exact offending text if any.\n"
+            "- Provide a concise reason for the violation.\n"
+            "- Do NOT flag compliant cases; only clear violations.\n"
+            "- Be strict about boundaries; avoid partial/embedded matches.\n"
+        )
+        # Use violation examples as example finding
+        if sub_prompt.violation_examples:
+            example_finding = f"Would flag: {sub_prompt.violation_examples[0]}"
+        logger.info(f"[V2] Using semantic validation with clarified rule")
+
+    # Step 3: Build ProposedValidation object
+    proposal = ProposedValidation(
+        explanation=sub_prompt.validation_reasoning,
+        validation_type=sub_prompt.validation_type,
+        validator=validator,
+        example_finding=example_finding,
+        clarified_rule=sub_prompt.sub_prompt,
+        extracted_examples=sub_prompt.extracted_examples
+    )
+
+    logger.info(f"[V2] Proposal created: type={proposal.validation_type}")
+    return proposal
+
+
 async def propose_validation_from_rule(rule_text: str, example_text: str, doc_chunks: List[DocumentChunk]) -> Optional[ProposedValidation]:
-    """AI agent to interpret a user's rule and propose a validation method."""
+    """
+    LEGACY VERSION: AI agent to interpret a user's rule and propose a validation method.
+    This version includes document text in the API call (original implementation).
+
+    NOTE: This function is kept for backward compatibility with the interactive UI workflow.
+    For automated workflows, use propose_validation_from_rule_v2 instead.
+    """
 
     # Combine document chunks for context, but limit the size to avoid excessive token usage
     full_text_context = "\n".join([chunk.content for chunk in doc_chunks])
@@ -255,7 +343,7 @@ async def propose_validation_from_rule(rule_text: str, example_text: str, doc_ch
         full_text_context = full_text_context[:max_context_length] + "\n... [document truncated for brevity]"
 
     system_prompt = """
-    You are an expert AI system that converts a user's plain-text rule into a structured, machine-executable validation.
+    You are an expert AI system that converts a user's plain-text rule into a structured, machine-executable validation. You are primarily working with financial documents.
 
     Steps:
     1) Extract any examples from the rule text (e.g., text in parentheses like "(e.g., ...)" or similar patterns).
@@ -360,7 +448,18 @@ async def propose_validation_from_rule(rule_text: str, example_text: str, doc_ch
 
     logger.info("Requesting proposal for rule. rule_text=%s example_provided=%s doc_chunks=%d", _safe_str(rule_text), bool(example_text), len(doc_chunks))
     try:
-        logger.debug("Calling LLM at %s model=%s", DATABRICKS_BASE_URL, DATABRICKS_LLM_MODEL)
+        # Log the full request in DEBUG mode
+        logger.debug("=" * 80)
+        logger.debug("SMARTREVIEW AI API REQUEST")
+        logger.debug("=" * 80)
+        logger.debug(f"Endpoint: {DATABRICKS_BASE_URL}")
+        logger.debug(f"Model: {DATABRICKS_LLM_MODEL}")
+        logger.debug("System Prompt:")
+        logger.debug(system_prompt)
+        logger.debug("User Prompt:")
+        logger.debug(user_prompt)
+        logger.debug("=" * 80)
+
         response = await _chat_completion_async(
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -369,7 +468,15 @@ async def propose_validation_from_rule(rule_text: str, example_text: str, doc_ch
             model=DATABRICKS_LLM_MODEL
         )
         raw = response.choices[0].message.content
-        logger.debug("Raw AI response length=%d", len(_safe_str(raw)))
+
+        # Log the full response in DEBUG mode
+        logger.debug("=" * 80)
+        logger.debug("SMARTREVIEW AI API RESPONSE")
+        logger.debug("=" * 80)
+        logger.debug(f"Response Length: {len(raw)} characters")
+        logger.debug("Response Content:")
+        logger.debug(raw)
+        logger.debug("=" * 80)
         try:
             response_json = _parse_model_json(raw)
 

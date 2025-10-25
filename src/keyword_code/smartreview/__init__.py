@@ -12,19 +12,20 @@ from .smartreview import (
     ValidationTemplate,
     ValidationResult,
     DocumentChunk,
-    
+
     # Core Logic Functions
     decompose_rule_smartreview,
     extract_text_from_pdf,
-    propose_validation_from_rule,
+    propose_validation_from_rule,  # Legacy version (with document text)
+    propose_validation_from_rule_v2,  # New version (without document text)
     refine_validation_from_chat,
     execute_validation_template,
     run_rule_on_chunk,
-    
+
     # UI Rendering Functions
     render_validation_view,
     render_rule_definition_view,
-    
+
     # Session State
     initialize_smartreview_session_state,
 )

@@ -24,7 +24,9 @@ from ..config import (
     RERANKER_API_TIMEOUT,
     ENABLE_LLM_RERANKER_FALLBACK
 )
-from transformers import AutoTokenizer
+# Note: Removed transformers/AutoTokenizer usage to avoid any external HF or local tokenizer
+# dependencies. Reranker uses the Databricks/WorldBank API only and falls back to
+# a conservative character-based truncation strategy.
 
 # Databricks [Reranker ONLY] endpoint URL
 DATABRICKS_BASE_URL = "https://int.api.worldbank.org/portfoliointelligence/serving-endpoints"
@@ -111,8 +113,11 @@ class DatabricksRerankerModel:
         self.endpoint_url = DATABRICKS_RERANKER_ENDPOINT
         self.model_name = DATABRICKS_RERANKER_MODEL_NAME
         self.max_length = max_length if max_length is not None else RERANKER_MAX_TOKENS
-        # Load the tokenizer once per instance
-        self.tokenizer = AutoTokenizer.from_pretrained('cross-encoder/ms-marco-MiniLM-L12-v2')
+        # We do not use a local or HF-hosted tokenizer in this deployment — the
+        # reranker operates via the int.worldbank.org API only. Use a
+        # conservative character-based truncation strategy to fit inputs within
+        # the model's token limit.
+        self.tokenizer = None
 
     def _truncate_text_pair(self, query: str, document: str) -> Tuple[str, str]:
         """
@@ -124,29 +129,18 @@ class DatabricksRerankerModel:
         max_length_with_margin = max_length - margin
         special_tokens_count = 3
 
-        # Tokenize query and document separately
-        query_tokens = self.tokenizer.tokenize(query)
-        document_tokens = self.tokenizer.tokenize(document)
+        # Use a conservative character-based truncation strategy (no HF/tokenizer usage).
+        # Approximate token->char ratio conservatively as 4 chars per token.
+        approx_chars_per_token = 4
+        total_chars = int(self.max_length * approx_chars_per_token)
+        min_doc_chars = approx_chars_per_token  # reserve approximate space for at least one token
 
-        # Always reserve at least 1 token for the document
-        min_doc_tokens = 1
-        max_query_tokens = max_length_with_margin - special_tokens_count - min_doc_tokens
+        # Allocate a larger share to the query but ensure at least min_doc_chars for document
+        max_query_chars = int(total_chars * 0.6)
+        truncated_query = self._truncate_by_chars(query, max_chars=max_query_chars)
 
-        if len(query_tokens) > max_query_tokens:
-            truncated_query_tokens = query_tokens[:max_query_tokens]
-            logger.warning(f"Query truncated from {len(query_tokens)} to {len(truncated_query_tokens)} tokens (BERT tokens)")
-        else:
-            truncated_query_tokens = query_tokens
-
-        # Now allocate the rest to the document
-        remaining_tokens = max_length_with_margin - special_tokens_count - len(truncated_query_tokens)
-        truncated_document_tokens = document_tokens[:max(remaining_tokens, min_doc_tokens)]
-        if len(document_tokens) > len(truncated_document_tokens):
-            logger.warning(f"Document truncated from {len(document_tokens)} to {len(truncated_document_tokens)} tokens (BERT tokens)")
-
-        # Detokenize
-        truncated_query = self.tokenizer.convert_tokens_to_string(truncated_query_tokens)
-        truncated_document = self.tokenizer.convert_tokens_to_string(truncated_document_tokens)
+        remaining_chars = total_chars - len(truncated_query)
+        truncated_document = self._truncate_by_chars(document, max_chars=max(remaining_chars, min_doc_chars))
         return truncated_query, truncated_document
 
     def _truncate_by_chars(self, text: str, max_chars: int = 1500) -> str:
