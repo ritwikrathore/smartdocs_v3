@@ -150,6 +150,7 @@ def initialize_session_state():
     if "file_selection_changed_by_user" not in st.session_state: st.session_state.file_selection_changed_by_user = False
     if "current_file_objects_from_change" not in st.session_state: st.session_state.current_file_objects_from_change = None
     if "results_just_generated" not in st.session_state: st.session_state.results_just_generated = False
+    if "keyword_mode_active" not in st.session_state: st.session_state.keyword_mode_active = False
 
     # Track temporary files in session state
     if "temp_files" not in st.session_state: st.session_state.temp_files = []
@@ -236,6 +237,8 @@ def clear_session_for_new_query():
     for key in keys_to_clear:
         if key in st.session_state:
             del st.session_state[key]
+
+    st.session_state.keyword_mode_active = False
 
     # Reinitialize empty containers for tracking
     st.session_state.analysis_results = []

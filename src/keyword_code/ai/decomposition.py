@@ -1,24 +1,39 @@
-"""
+﻿"""
 Prompt decomposition functionality.
 """
 
 import json
 import re
-from typing import Dict, List, Optional, Literal
+from typing import Any, Dict, List, Optional, Literal, Set
+
 from pydantic import BaseModel, Field
+
 from ..config import logger, DECOMPOSITION_MODEL_NAME, USE_DATABRICKS_LLM
 
 
-async def decompose_ask_mode_prompt(analyzer, user_prompt: str) -> List[Dict[str, str]]:
-    """
-    Analyzes the user prompt with an LLM to break it down into individual questions/tasks,
-    each with a suggested concise title and optimal RAG retrieval parameters.
-    This function is specifically for Ask Mode, which requires RAG parameters.
-    Returns a list of dictionaries, each containing 'sub_prompt', 'title', and 'rag_params'.
-    Returns [{'sub_prompt': user_prompt, 'title': 'Overall Analysis', 'rag_params': {...}}] on failure.
-    """
-    logger.info(f"[ASK MODE] Decomposing prompt with RAG optimization: '{user_prompt[:100]}...'")
+async def decompose_ask_mode_prompt(analyzer, user_prompt: str) -> Dict[str, Any]:
+    """Decompose the prompt and decide whether keyword mode should run."""
+
+    logger.info("[ASK MODE] Decomposing prompt with RAG optimization: '%s'", user_prompt[:100])
+
     system_prompt = """You are a helpful assistant specializing in financial and legal document analysis. Your task is to analyze the user's prompt and identify distinct questions or analysis tasks within it.
+
+First, decide whether the request is best served by a deterministic keyword-only retrieval (Keyword Mode).
+
+Trigger Keyword Mode when ALL of the following are true:
+- The user is asking for exact term lookups, specific form fields, codes, or literal phrases.
+- The desired outputs are counts or locations of those exact terms.
+
+Do NOT use Keyword Mode when the prompt requires interpretation, synthesis, summarization, or reasoning beyond literal keyword matches.
+
+If you choose Keyword Mode you MUST also emit the explicit keywords that should be searched.
+
+Return your answer as a single JSON object with the keys:
+- "keyword_mode": boolean
+- "keyword_reasoning": short string justifying your decision
+- "keywords": list where each item is either a single keyword string or a list of related keywords/phrases that should be searched together (e.g., slash-separated synonyms)
+- "user_request_context": short string capturing any explicit instructions the user included about how to handle the results (return an empty string if none were provided)
+- "decomposition": list of sub-prompt objects exactly as described below
 
 Break down the prompt into a list of self-contained, individual questions or tasks. For each task, provide:
 1. A concise, descriptive title (max 5-6 words)
@@ -33,7 +48,7 @@ RAG Parameters Guidelines:
 - BM25 weight + semantic weight should always equal 1.0
 - Provide brief reasoning for your weight selection
 
-Your entire response MUST be a single JSON object containing a single key "decomposition", whose value is a list of JSON objects. Each object must have:
+Your entire response MUST be a single JSON object with the keys described earlier. Each item in the "decomposition" list must have:
 - "title": string (the concise title)
 - "sub_prompt": string (the full sub-prompt text)
 - "rag_params": object with:
@@ -50,6 +65,10 @@ What is the loan amount and currency?"
 
 Example JSON Output:
 {
+  "keyword_mode": false,
+  "keyword_reasoning": "Prompt requests broader analysis, not literal matches",
+  "keywords": [],
+  "user_request_context": "",
   "decomposition": [
     {
       "title": "Lawful Loan Currency",
@@ -95,6 +114,10 @@ Example Input Prompt:
 
 Example JSON Output:
 {
+  "keyword_mode": false,
+  "keyword_reasoning": "Requires interpretive legal analysis",
+  "keywords": [],
+  "user_request_context": "",
   "decomposition": [
     {
       "title": "Termination Clause Analysis",
@@ -122,6 +145,10 @@ Example Input Prompt:
 
 Example JSON Output:
 {
+  "keyword_mode": true,
+  "keyword_reasoning": "Prompt is focused on specific SWIFT terminology",
+  "keywords": ["MT599", "Field 79"],
+  "user_request_context": "",
   "decomposition": [
     {
       "title": "MT599 Swift Format",
@@ -149,6 +176,10 @@ Example Input Prompt:
 
 Example JSON Output:
 {
+  "keyword_mode": false,
+  "keyword_reasoning": "Requires numerical comparison and interpretation",
+  "keywords": [],
+  "user_request_context": "",
   "decomposition": [
     {
       "title": "Loan Interest Rates",
@@ -171,30 +202,106 @@ Example JSON Output:
   ]
 }
 """
-    human_prompt = f"Analyze the following prompt and return the decomposed questions/tasks with their titles and optimal RAG parameters as a JSON list of objects according to the system instructions:\n\n{user_prompt}"
+
+    human_prompt = (
+        "Analyze the following prompt and follow the system instructions to decide on Keyword Mode, "
+        "identify keywords if applicable, and produce the decomposed sub-prompts in JSON format:\n\n"
+        f"{user_prompt}"
+    )
 
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": human_prompt},
     ]
 
-    # Fallback result in case of errors - includes default balanced RAG params
-    fallback_result = [{
-        "title": "Overall Analysis",
-        "sub_prompt": user_prompt,
-        "rag_params": {
-            "bm25_weight": 0.5,
-            "semantic_weight": 0.5,
-            "reasoning": "Default balanced weights due to decomposition failure"
-        }
-    }]
+    fallback_result = {
+        "keyword_mode": False,
+        "keyword_reasoning": "Fallback: unable to run keyword decision.",
+        "keywords": [],
+        "keyword_groups": [],
+        "user_request_context": "",
+        "decomposition": [{
+            "title": "Overall Analysis",
+            "sub_prompt": user_prompt,
+            "rag_params": {
+                "bm25_weight": 0.5,
+                "semantic_weight": 0.5,
+                "reasoning": "Default balanced weights due to decomposition failure"
+            }
+        }]
+    }
+
+    def _clean_keyword_text(value: Any) -> str:
+        if not isinstance(value, str):
+            return ""
+        return re.sub(r"\s+", " ", value.strip())
+
+    def _split_synonyms_if_needed(value: Any) -> List[str]:
+        cleaned = _clean_keyword_text(value)
+        if not cleaned:
+            return []
+        if re.search(r"\s*/\s*", cleaned):
+            parts = [_clean_keyword_text(part) for part in re.split(r"\s*/\s*", cleaned)]
+            parts = [part for part in parts if part]
+            if len(parts) > 1:
+                return parts
+        return [cleaned]
+
+    def _extract_terms_from_dict(payload: Dict[str, Any]) -> List[str]:
+        if not isinstance(payload, dict):
+            return []
+        collected: List[str] = []
+        for key in ("keywords", "terms", "phrases", "variants", "values"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                for item in value:
+                    collected.extend(_split_synonyms_if_needed(item))
+            elif isinstance(value, str):
+                collected.extend(_split_synonyms_if_needed(value))
+        if not collected:
+            fallback_value = payload.get("keyword") or payload.get("term") or payload.get("phrase")
+            collected.extend(_split_synonyms_if_needed(fallback_value))
+        unique_terms: List[str] = []
+        seen_terms: Set[str] = set()
+        for candidate in collected:
+            lowered = candidate.lower()
+            if lowered in seen_terms:
+                continue
+            seen_terms.add(lowered)
+            unique_terms.append(candidate)
+        return unique_terms
+
+    def _add_keyword_group(
+        group_terms: List[str],
+        keyword_groups: List[List[str]],
+        normalized_keywords: List[str],
+        seen_keywords: Set[str],
+    ) -> None:
+        deduped_group: List[str] = []
+        seen_group_terms: Set[str] = set()
+        for term in group_terms:
+            cleaned_term = _clean_keyword_text(term)
+            if not cleaned_term:
+                continue
+            lowered_term = cleaned_term.lower()
+            if lowered_term in seen_group_terms:
+                continue
+            seen_group_terms.add(lowered_term)
+            deduped_group.append(cleaned_term)
+        if not deduped_group:
+            return
+        keyword_groups.append(deduped_group)
+        for term in deduped_group:
+            lowered_term = term.lower()
+            if lowered_term in seen_keywords:
+                continue
+            seen_keywords.add(lowered_term)
+            normalized_keywords.append(term)
 
     try:
         response_content = await analyzer._get_completion(messages, model_name=DECOMPOSITION_MODEL_NAME)
 
-        # Attempt to parse the JSON
         try:
-            # Clean potential markdown fences (same logic as before)
             cleaned_response = response_content.strip()
             match = re.search(r"```json\s*(\{.*?\})\s*```", cleaned_response, re.DOTALL)
             if match:
@@ -202,39 +309,36 @@ Example JSON Output:
             elif cleaned_response.startswith("{") and cleaned_response.endswith("}"):
                 json_str = cleaned_response
             else:
-                 first_brace = cleaned_response.find('{')
-                 last_brace = cleaned_response.rfind('}')
-                 if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
-                     json_str = cleaned_response[first_brace:last_brace+1]
-                     logger.warning("Used basic brace finding for JSON extraction in decomposition.")
-                 else:
-                     raise json.JSONDecodeError("Could not find JSON structure.", cleaned_response, 0)
+                first_brace = cleaned_response.find("{")
+                last_brace = cleaned_response.rfind("}")
+                if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+                    json_str = cleaned_response[first_brace:last_brace + 1]
+                    logger.warning("Used basic brace finding for JSON extraction in decomposition.")
+                else:
+                    raise json.JSONDecodeError("Could not find JSON structure.", cleaned_response, 0)
 
             parsed_json = json.loads(json_str)
 
-            # Validate the new structure with RAG params
             if isinstance(parsed_json, dict) and "decomposition" in parsed_json:
                 decomposition_list = parsed_json["decomposition"]
                 if isinstance(decomposition_list, list):
-                    valid_items = []
+                    valid_items: List[Dict[str, Any]] = []
 
                     for item in decomposition_list:
-                        # Validate basic structure
                         if not isinstance(item, dict) or "title" not in item or "sub_prompt" not in item:
-                            logger.warning(f"Skipping invalid decomposition item (missing title or sub_prompt): {item}")
+                            logger.warning("Skipping invalid decomposition item (missing title or sub_prompt): %s", item)
                             continue
 
                         if not isinstance(item["title"], str) or not isinstance(item["sub_prompt"], str):
-                            logger.warning(f"Skipping invalid decomposition item (non-string title or sub_prompt): {item}")
+                            logger.warning("Skipping invalid decomposition item (non-string title or sub_prompt): %s", item)
                             continue
 
                         if not item["title"].strip() or not item["sub_prompt"].strip():
-                            logger.warning(f"Skipping decomposition item with empty title or sub_prompt")
+                            logger.warning("Skipping decomposition item with empty title or sub_prompt")
                             continue
 
-                        # Validate and normalize RAG params
                         if "rag_params" not in item or not isinstance(item["rag_params"], dict):
-                            logger.warning(f"Missing or invalid rag_params for '{item['title']}', using defaults")
+                            logger.warning("Missing or invalid rag_params for '%s', using defaults", item["title"])
                             item["rag_params"] = {
                                 "bm25_weight": 0.5,
                                 "semantic_weight": 0.5,
@@ -242,42 +346,51 @@ Example JSON Output:
                             }
                         else:
                             rag_params = item["rag_params"]
-
-                            # Validate weights
                             bm25_weight = rag_params.get("bm25_weight", 0.5)
                             semantic_weight = rag_params.get("semantic_weight", 0.5)
 
-                            # Ensure weights are numbers in valid range
                             try:
                                 bm25_weight = float(bm25_weight)
                                 semantic_weight = float(semantic_weight)
 
                                 if not (0.0 <= bm25_weight <= 1.0) or not (0.0 <= semantic_weight <= 1.0):
-                                    logger.warning(f"RAG weights out of range for '{item['title']}': bm25={bm25_weight}, semantic={semantic_weight}. Using defaults.")
+                                    logger.warning(
+                                        "RAG weights out of range for '%s': bm25=%s, semantic=%s. Using defaults.",
+                                        item["title"],
+                                        bm25_weight,
+                                        semantic_weight,
+                                    )
                                     bm25_weight, semantic_weight = 0.5, 0.5
 
-                                # Normalize weights to sum to 1.0
                                 weight_sum = bm25_weight + semantic_weight
-                                if abs(weight_sum - 1.0) > 0.01:  # Allow small floating point errors
-                                    logger.warning(f"RAG weights don't sum to 1.0 for '{item['title']}' (sum={weight_sum:.3f}). Normalizing.")
+                                if abs(weight_sum - 1.0) > 0.01:
+                                    logger.warning(
+                                        "RAG weights don't sum to 1.0 for '%s' (sum=%.3f). Normalizing.",
+                                        item["title"],
+                                        weight_sum,
+                                    )
                                     if weight_sum > 0:
                                         bm25_weight = bm25_weight / weight_sum
                                         semantic_weight = semantic_weight / weight_sum
                                     else:
                                         bm25_weight, semantic_weight = 0.5, 0.5
 
-                                # Update normalized weights
                                 item["rag_params"]["bm25_weight"] = bm25_weight
                                 item["rag_params"]["semantic_weight"] = semantic_weight
 
-                                # Ensure reasoning exists
-                                if "reasoning" not in rag_params or not isinstance(rag_params["reasoning"], str):
+                                if "reasoning" not in rag_params or not isinstance(rag_params.get("reasoning"), str):
                                     item["rag_params"]["reasoning"] = "No reasoning provided"
 
-                                logger.info(f"RAG params for '{item['title']}': BM25={bm25_weight:.2f}, Semantic={semantic_weight:.2f}, Reasoning: {rag_params.get('reasoning', 'N/A')}")
+                                logger.info(
+                                    "RAG params for '%s': BM25=%.2f, Semantic=%.2f, Reasoning: %s",
+                                    item["title"],
+                                    bm25_weight,
+                                    semantic_weight,
+                                    rag_params.get("reasoning", "N/A"),
+                                )
 
-                            except (ValueError, TypeError) as e:
-                                logger.warning(f"Invalid RAG weight types for '{item['title']}': {e}. Using defaults.")
+                            except (ValueError, TypeError) as err:
+                                logger.warning("Invalid RAG weight types for '%s': %s. Using defaults.", item["title"], err)
                                 item["rag_params"] = {
                                     "bm25_weight": 0.5,
                                     "semantic_weight": 0.5,
@@ -290,31 +403,88 @@ Example JSON Output:
                         logger.warning("Decomposition resulted in an empty list after filtering. Falling back.")
                         return fallback_result
 
-                    logger.info(f"Successfully decomposed prompt into {len(valid_items)} sub-prompts with titles and RAG parameters.")
-                    return valid_items
-                else:
-                    logger.warning("Decomposition JSON found, but 'decomposition' key is not a list. Falling back.")
-                    return fallback_result
-            else:
-                logger.warning("Decomposition JSON parsed, but missing 'decomposition' key or wrong structure. Falling back.")
+                    keyword_mode_value = bool(parsed_json.get("keyword_mode", False))
+                    raw_keywords = parsed_json.get("keywords", [])
+                    keyword_reasoning = parsed_json.get("keyword_reasoning")
+                    user_request_context = parsed_json.get("user_request_context", "")
+
+                    if not isinstance(user_request_context, str):
+                        user_request_context = ""
+                    else:
+                        user_request_context = user_request_context.strip()
+
+                    keyword_groups: List[List[str]] = []
+                    normalized_keywords: List[str] = []
+                    seen_keywords: Set[str] = set()
+
+                    if isinstance(raw_keywords, list):
+                        for entry in raw_keywords:
+                            group_terms: List[str] = []
+                            if isinstance(entry, str):
+                                group_terms.extend(_split_synonyms_if_needed(entry))
+                            elif isinstance(entry, list):
+                                local_seen: Set[str] = set()
+                                for candidate in entry:
+                                    for term in _split_synonyms_if_needed(candidate):
+                                        lowered = term.lower()
+                                        if lowered in local_seen:
+                                            continue
+                                        local_seen.add(lowered)
+                                        group_terms.append(term)
+                            elif isinstance(entry, dict):
+                                group_terms.extend(_extract_terms_from_dict(entry))
+
+                            if group_terms:
+                                _add_keyword_group(group_terms, keyword_groups, normalized_keywords, seen_keywords)
+                    elif isinstance(raw_keywords, str):
+                        _add_keyword_group(_split_synonyms_if_needed(raw_keywords), keyword_groups, normalized_keywords, seen_keywords)
+
+                    if keyword_mode_value and not normalized_keywords:
+                        logger.warning("keyword_mode was true but no valid keywords were returned. Forcing keyword_mode to false.")
+                        keyword_mode_value = False
+
+                    result_payload = {
+                        "keyword_mode": keyword_mode_value,
+                        "keyword_reasoning": keyword_reasoning or "LLM did not supply keyword reasoning.",
+                        "keywords": normalized_keywords,
+                        "keyword_groups": keyword_groups,
+                        "user_request_context": user_request_context,
+                        "decomposition": valid_items,
+                    }
+
+                    logger.info(
+                        "Successfully decomposed prompt into %d sub-prompts (keyword_mode=%s, keywords=%s, user_context_present=%s)",
+                        len(valid_items),
+                        keyword_mode_value,
+                        normalized_keywords,
+                        bool(user_request_context),
+                    )
+                    if keyword_groups:
+                        logger.debug("Keyword groups extracted: %s", keyword_groups)
+                    return result_payload
+
+                logger.warning("Decomposition JSON found, but 'decomposition' key is not a list. Falling back.")
                 return fallback_result
 
+            logger.warning("Decomposition JSON parsed, but missing 'decomposition' key or wrong structure. Falling back.")
+            return fallback_result
+
         except json.JSONDecodeError as json_err:
-            logger.error(f"Failed to parse decomposition response as JSON: {json_err}. Raw response: {response_content}")
+            logger.error("Failed to parse decomposition response as JSON: %s. Raw response: %s", json_err, response_content)
             logger.warning("Falling back to using the original prompt due to JSON parsing error.")
             return fallback_result
 
     except TimeoutError:
-        logger.error(f"Prompt decomposition request timed out. Falling back to original prompt.")
+        logger.error("Prompt decomposition request timed out. Falling back to original prompt.")
         return fallback_result
-    except Exception as e:
-        logger.error(f"Error during prompt decomposition LLM call: {str(e)}", exc_info=True)
+    except Exception as err:
+        logger.error("Error during prompt decomposition LLM call: %s", err, exc_info=True)
         logger.warning("Falling back to using the original prompt.")
         return fallback_result
 
 
 # Backward compatibility alias
-async def decompose_prompt(analyzer, user_prompt: str) -> List[Dict[str, str]]:
+async def decompose_prompt(analyzer, user_prompt: str) -> Dict[str, Any]:
     """
     Backward compatibility wrapper for decompose_ask_mode_prompt.
     This function is deprecated and will be removed in a future version.
@@ -322,7 +492,6 @@ async def decompose_prompt(analyzer, user_prompt: str) -> List[Dict[str, str]]:
     """
     logger.warning("decompose_prompt is deprecated. Use decompose_ask_mode_prompt instead.")
     return await decompose_ask_mode_prompt(analyzer, user_prompt)
-
 
 # --- Review Mode Decomposition Models ---
 
@@ -573,8 +742,8 @@ Your task is to generate a regex pattern based on the provided validation rule a
   Pattern: (?<!\\.)(?<!\\d\\.)\\b(?:\\d{1,3}(?:,\\d{3})*|\\d+)(?!\\.\\d+)\\s+billion\\b
 
   This pattern:
-  ✓ Matches: "67 billion", "1,234 billion", "5 billion"
-  ✗ Does NOT match: "67.3 billion", "1.0 billion", "5.5 billion"
+  Γ£ô Matches: "67 billion", "1,234 billion", "5 billion"
+  Γ£ù Does NOT match: "67.3 billion", "1.0 billion", "5.5 billion"
 
 ### General Best Practices:
 1. Use raw strings (r"...") for Python regex patterns

@@ -455,6 +455,15 @@ def process_rag_requests(results: list[dict[str, any]]) -> tuple[list[dict[str, 
                 if request_data.get("status") == "requested":
                     requests_processed = True
                     try:
+                        result_meta = request_data.get("result", {}) or {}
+                        if isinstance(result_meta, dict) and result_meta.get("keyword_mode"):
+                            st.session_state.rag_retry_requests[section_key]["status"] = "skipped_keyword_mode"
+                            logger.info(
+                                "Skipping RAG retry for section %s because keyword mode does not support retrials",
+                                section_key,
+                            )
+                            continue
+
                         # Ensure results store exists
                         if "rag_retry_results" not in st.session_state:
                             st.session_state.rag_retry_results = {}
@@ -1079,7 +1088,8 @@ else:
                 process_args_list = []
                 files_read_ok = True
                 # Determine mode for process_file_wrapper: 'ask' or 'review'
-                current_mode = st.session_state.smartdocs_mode.lower()  # 'ask' or 'review'
+                current_mode = st.session_state.smartdocs_mode.lower()
+
                 logger.info(f"Preparing to process {len(files_to_process_objs)} files in '{current_mode}' mode")
 
                 for uploaded_file in files_to_process_objs:

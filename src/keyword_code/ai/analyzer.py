@@ -72,6 +72,27 @@ class DocumentAnalyzer:
             )
             raise
 
+    @staticmethod
+    def _extract_json_from_response(response_content: str) -> Any:
+        """Extract the first JSON object from a model response."""
+
+        cleaned_response = response_content.strip()
+        match = re.search(r"```json\s*(\{.*?\})\s*```", cleaned_response, re.DOTALL)
+        if match:
+            json_str = match.group(1)
+        elif cleaned_response.startswith("{") and cleaned_response.endswith("}"):
+            json_str = cleaned_response
+        else:
+            first_brace = cleaned_response.find("{")
+            last_brace = cleaned_response.rfind("}")
+            if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+                json_str = cleaned_response[first_brace:last_brace + 1]
+                logger.warning("Used brace slicing heuristic to extract JSON from model response.")
+            else:
+                raise json.JSONDecodeError("Could not locate JSON payload in response.", cleaned_response, 0)
+
+        return json.loads(json_str)
+
     @property
     def output_schema_analysis(self) -> dict:
         """Defines the expected JSON structure for document analysis."""
@@ -338,6 +359,116 @@ Generate a structured analysis for EACH sub-prompt, strictly following the JSON 
             logger.error(f"Error during comprehensive AI document analysis for {filename}: {str(e)}", exc_info=True)
             return self._create_fallback_analyses(sub_prompts_with_contexts)
 
+    async def analyze_keyword_occurrences(
+        self,
+        *,
+        filename: str,
+        main_prompt: str,
+        keyword_sections: Dict[str, Dict[str, Any]],
+        total_occurrences: int,
+        keyword_reasoning: Optional[str] = None,
+        user_request_context: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Ask the analysis model to summarise keyword occurrences and return structured citations.
+
+        If the decomposition captured additional instructions from the user (user_request_context),
+        pass them through so the analysis summary can reflect that guidance.
+        """
+
+        keyword_payload = []
+        for section_key, section in keyword_sections.items():
+            keyword = section.get("keyword")
+            occurrences = section.get("occurrences", []) or []
+            keyword_payload.append({
+                "section_key": section_key,
+                "keyword": keyword,
+                "occurrences": [
+                    {
+                        "occurrence_id": occ.get("id"),
+                        "page_label": occ.get("page_label"),
+                        "match_score": occ.get("match_score"),
+                        "snippet": occ.get("snippet"),
+                    }
+                    for occ in occurrences if isinstance(occ, dict)
+                ],
+            })
+
+        structured_input = {
+            "document": filename,
+            "user_prompt": main_prompt,
+            "keyword_reasoning": keyword_reasoning,
+            "total_occurrences": total_occurrences,
+            "keywords": keyword_payload,
+        }
+
+        if isinstance(user_request_context, str) and user_request_context.strip():
+            structured_input["user_request_context"] = user_request_context.strip()
+
+        system_prompt = """You are assisting with keyword-based document analysis. The decomposition model has already determined that keyword mode should run and has supplied exact keyword occurrences (IDs, page information, and snippets).
+
+You MUST follow these requirements:
+1. For each keyword, write an "analysis_summary" that references the provided occurrences and mentions the exact count.
+2. Produce a "occurrence_citations" list that contains one entry per occurrence. Do not omit or add occurrences.
+3. Each citation entry must include:
+   - "occurrence_id" (exactly as provided)
+   - "page_label" (use the provided number)
+   - "match_score" (reuse the provided value)
+   - "citation_text" (a concise supporting quote or paraphrase grounded in the provided snippet)
+   - "context_note" (short explanation of why this occurrence matters)
+4. Do NOT invent new snippets, page numbers, or occurrences. Use only the supplied data.
+5. Write clear, professional prose; reference page numbers naturally (e.g., "on page 4").
+6. If "user_request_context" is provided, incorporate its guidance into the analysis_summary phrasing while staying grounded in the supplied occurrences.
+
+Return a single JSON object with the structure:
+{
+  "keywords": [
+    {
+      "keyword": "...",
+      "total_occurrences": <int>,
+      "analysis_summary": "...",
+      "occurrence_citations": [
+        {
+          "occurrence_id": "...",
+          "page_label": <int>,
+          "match_score": <float>,
+          "citation_text": "...",
+          "context_note": "..."
+        }
+      ]
+    }
+  ]
+}
+
+Do not include any additional keys and do not wrap the JSON in Markdown fences."""
+
+        additional_context = ""
+        if isinstance(user_request_context, str) and user_request_context.strip():
+            additional_context = (
+                "\n\nAdditional user context to respect in your analysis summary: "
+                f"{user_request_context.strip()}"
+            )
+
+        human_prompt = (
+            "Summarise the provided keyword occurrences. Here is the structured data you must use:\n\n"
+            f"{json.dumps(structured_input, indent=2)}"
+            f"{additional_context}"
+        )
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": human_prompt},
+        ]
+
+        fallback_result = self._keyword_analysis_fallback(keyword_sections, keyword_reasoning)
+
+        try:
+            response_content = await self._get_completion(messages, model_name=ANALYSIS_MODEL_NAME)
+            parsed_json = self._extract_json_from_response(response_content)
+            return self._sanitize_keyword_analysis(parsed_json, keyword_sections, keyword_reasoning)
+        except Exception as err:
+            logger.error("Keyword mode analysis failed: %s", err, exc_info=True)
+            return fallback_result
+
     def _create_fallback_analyses(self, sub_prompts_with_contexts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Create fallback analyses for all sub-prompts when the main analysis fails."""
         return [self._create_fallback_analysis(item) for item in sub_prompts_with_contexts]
@@ -359,3 +490,129 @@ Generate a structured analysis for EACH sub-prompt, strictly following the JSON 
             "sub_prompt": sub_prompt,
             "analysis_json": json.dumps(error_response, indent=2)
         }
+
+    def _sanitize_keyword_analysis(
+        self,
+        parsed_json: Dict[str, Any],
+        keyword_sections: Dict[str, Dict[str, Any]],
+        keyword_reasoning: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Ensure keyword analysis output matches available occurrences."""
+
+        sanitized_entries: List[Dict[str, Any]] = []
+
+        parsed_lookup: Dict[str, Dict[str, Any]] = {}
+        for item in parsed_json.get("keywords", []) or []:
+            keyword = item.get("keyword")
+            if isinstance(keyword, str) and keyword.strip():
+                parsed_lookup[keyword.strip()] = item
+
+        for section_key, section in keyword_sections.items():
+            keyword = section.get("keyword")
+            occurrences = section.get("occurrences", []) or []
+            expected_by_id = {occ.get("id"): occ for occ in occurrences if isinstance(occ, dict) and occ.get("id")}
+
+            parsed_item = parsed_lookup.get(keyword)
+            sanitized_citations: List[Dict[str, Any]] = []
+            used_occurrence_ids = set()
+
+            if parsed_item:
+                for citation in parsed_item.get("occurrence_citations", []) or []:
+                    occurrence_id = citation.get("occurrence_id")
+                    if occurrence_id not in expected_by_id:
+                        continue
+                    occ_data = expected_by_id[occurrence_id]
+                    sanitized_citations.append({
+                        "occurrence_id": occurrence_id,
+                        "page_label": occ_data.get("page_label"),
+                        "match_score": occ_data.get("match_score", 0.0),
+                        "citation_text": citation.get("citation_text") or occ_data.get("snippet"),
+                        "context_note": citation.get("context_note", ""),
+                        "snippet": occ_data.get("snippet"),
+                    })
+                    used_occurrence_ids.add(occurrence_id)
+
+            for occurrence_id, occ_data in expected_by_id.items():
+                if occurrence_id in used_occurrence_ids:
+                    continue
+                sanitized_citations.append({
+                    "occurrence_id": occurrence_id,
+                    "page_label": occ_data.get("page_label"),
+                    "match_score": occ_data.get("match_score", 0.0),
+                    "citation_text": occ_data.get("snippet"),
+                    "context_note": "Automatically generated citation based on provided snippet.",
+                    "snippet": occ_data.get("snippet"),
+                })
+
+            sanitized_citations.sort(key=lambda entry: entry.get("occurrence_id", ""))
+
+            analysis_summary = None
+            if parsed_item and isinstance(parsed_item.get("analysis_summary"), str):
+                analysis_summary = parsed_item["analysis_summary"].strip()
+
+            if not analysis_summary:
+                analysis_summary = self._build_keyword_summary(keyword, sanitized_citations)
+
+            sanitized_entries.append({
+                "section_key": section_key,
+                "keyword": keyword,
+                "analysis_summary": analysis_summary,
+                "occurrence_citations": sanitized_citations,
+                "total_occurrences": len(sanitized_citations),
+            })
+
+        return {
+            "keywords": sanitized_entries,
+            "total_occurrences": sum(entry["total_occurrences"] for entry in sanitized_entries),
+            "keyword_reasoning": keyword_reasoning,
+        }
+
+    def _keyword_analysis_fallback(
+        self,
+        keyword_sections: Dict[str, Dict[str, Any]],
+        keyword_reasoning: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        fallback_entries: List[Dict[str, Any]] = []
+        for section_key, section in keyword_sections.items():
+            keyword = section.get("keyword")
+            occurrences = section.get("occurrences", []) or []
+            citations = []
+            for occ in occurrences:
+                if not isinstance(occ, dict):
+                    continue
+                citations.append({
+                    "occurrence_id": occ.get("id"),
+                    "page_label": occ.get("page_label"),
+                    "match_score": occ.get("match_score", 0.0),
+                    "citation_text": occ.get("snippet"),
+                    "context_note": "Automatically generated citation based on provided snippet.",
+                    "snippet": occ.get("snippet"),
+                })
+
+            fallback_entries.append({
+                "section_key": section_key,
+                "keyword": keyword,
+                "analysis_summary": self._build_keyword_summary(keyword, citations),
+                "occurrence_citations": citations,
+                "total_occurrences": len(citations),
+            })
+
+        return {
+            "keywords": fallback_entries,
+            "total_occurrences": sum(entry["total_occurrences"] for entry in fallback_entries),
+            "keyword_reasoning": keyword_reasoning,
+        }
+
+    @staticmethod
+    def _build_keyword_summary(keyword: Optional[str], citations: List[Dict[str, Any]]) -> str:
+        keyword_label = keyword or "the keyword"
+        count = len(citations)
+        if not citations:
+            return f"No occurrences of '{keyword_label}' were detected in the supplied snippets." if keyword else "No keyword occurrences were detected."
+
+        pages = sorted({citation.get("page_label") for citation in citations if isinstance(citation.get("page_label"), (int, float))})
+        if pages:
+            page_part = "page" if len(pages) == 1 else "pages"
+            page_numbers = ", ".join(str(int(p)) for p in pages)
+            return f"Found {count} occurrence(s) of '{keyword_label}' on {page_part} {page_numbers}."
+        return f"Found {count} occurrence(s) of '{keyword_label}'."

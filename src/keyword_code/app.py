@@ -21,7 +21,7 @@ import time
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import fitz  # PyMuPDF
 import numpy as np
@@ -71,8 +71,8 @@ from .processors.pdf_processor import PDFProcessor
 from .processors.word_processor import WordProcessor
 from .rag.retrieval import retrieve_relevant_chunks, retrieve_relevant_chunks_for_chat
 from .ai.analyzer import DocumentAnalyzer
-from .ai.decomposition import decompose_prompt
 from .ai.chat import generate_chat_response
+from .services.keyword_mode_service import KeywordModeService
 
 # --- OpenAI client for Databricks API ---
 # The OpenAI client is configured in the Databricks LLM client
@@ -102,6 +102,14 @@ embedding_model = load_embedding_model()
 # to an LLM-based reranker that provides the same functionality.
 # See docs/RERANKER_FALLBACK.md for details.
 reranker_model = load_reranker_model()
+
+# Initialize keyword mode service (stateless helper)
+keyword_mode_service = KeywordModeService()
+
+
+def slugify_keyword_label(text: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
+    return slug or "keyword"
 
 # Check for incompatible embeddings in session state after model loading
 # This needs to be called within the Streamlit context, so we'll do it in display_page()
@@ -268,9 +276,8 @@ def process_file_wrapper(args):
     Wrapper for processing a single file: decompose prompt, run RAG & analysis per sub-prompt, aggregate results.
     Now uses precomputed embeddings when available.
 
-    Supports two modes:
-    - 'ask': Full RAG workflow with decomposition, retrieval, and analysis
-    - 'review': Validation-only workflow (no decomposition, no RAG)
+    Supports explicit 'ask' and 'review' modes. Keyword mode is triggered automatically
+    by the decomposition model when the prompt calls for deterministic keyword retrieval.
     """
     # Monitor memory usage before processing
     memory_before = get_memory_usage()
@@ -284,7 +291,7 @@ def process_file_wrapper(args):
             user_prompt,
             use_advanced_extraction,
             preprocessed_data_for_file,
-            mode  # 'ask' or 'review'
+            mode  # 'ask', 'keyword', or 'review'
         ) = args
     else:
         # Backward compatibility: default to 'ask' mode if not specified
@@ -298,6 +305,10 @@ def process_file_wrapper(args):
         mode = 'ask'
 
     logger.info(f"Processing {filename} in '{mode}' mode")
+
+    if mode == 'keyword':
+        logger.warning("Explicit keyword mode flag is deprecated. Falling back to decomposition-driven flow.")
+        mode = 'ask'
 
     if embedding_model is None:
         logger.error(f"Skipping processing for {filename}: Embedding model not loaded.")
@@ -350,7 +361,7 @@ def process_file_wrapper(args):
 
         # --- CONDITIONAL EXECUTION BASED ON MODE ---
         # Review mode: Skip decomposition and RAG, return minimal result
-        # Ask mode: Full RAG workflow with decomposition, retrieval, and analysis
+        # Ask mode (default): Full RAG workflow with decomposition, retrieval, and analysis
 
         if mode == 'review':
             logger.info(f"Review mode: Skipping decomposition and RAG for {filename}")
@@ -367,11 +378,299 @@ def process_file_wrapper(args):
                 "ai_analysis": json.dumps({"message": "Review mode: Validation handled separately"})
             }
 
-        # --- ASK MODE: Step 2 - Decompose the prompt into sub-prompts ---
-        logger.info(f"Ask mode: Starting decomposition and RAG workflow for {filename}")
         analyzer = DocumentAnalyzer()
         from src.keyword_code.ai.decomposition import decompose_ask_mode_prompt
-        sub_prompts = run_async(decompose_ask_mode_prompt(analyzer, user_prompt))
+
+        decomposition_output = run_async(decompose_ask_mode_prompt(analyzer, user_prompt))
+
+        if isinstance(decomposition_output, dict):
+            sub_prompts = decomposition_output.get("decomposition", []) or []
+            keyword_mode_flag = bool(decomposition_output.get("keyword_mode"))
+            detected_keywords = decomposition_output.get("keywords", []) or []
+            keyword_reasoning = decomposition_output.get("keyword_reasoning")
+            keyword_groups = decomposition_output.get("keyword_groups", []) or []
+            user_request_context = decomposition_output.get("user_request_context", "")
+            if not isinstance(user_request_context, str):
+                user_request_context = ""
+            else:
+                user_request_context = user_request_context.strip()
+        else:
+            sub_prompts = decomposition_output or []
+            keyword_mode_flag = False
+            detected_keywords = []
+            keyword_reasoning = None
+            keyword_groups = []
+            user_request_context = ""
+
+        if keyword_mode_flag and detected_keywords:
+            logger.info(
+                "Keyword mode activated for %s with keywords: %s",
+                filename,
+                detected_keywords,
+            )
+
+            keyword_chunks = preprocessed_data["chunks"] if preprocessed_data else chunks
+            if not keyword_chunks:
+                raise ValueError("Keyword mode requires chunked document text.")
+
+            pdf_bytes_for_keyword = original_pdf_bytes_for_annotation or uploaded_file_data
+            keyword_result = keyword_mode_service.run(
+                filename=filename,
+                keywords=detected_keywords,
+                chunks=keyword_chunks,
+                original_pdf_bytes=pdf_bytes_for_keyword,
+            )
+
+            keyword_groups_data: List[Dict[str, Any]] = []
+            variant_to_group_key: Dict[str, str] = {}
+            if keyword_groups:
+                for idx, group in enumerate(keyword_groups, start=1):
+                    sanitized_variants: List[str] = []
+                    seen_variants: Set[str] = set()
+                    candidates = group if isinstance(group, (list, tuple, set)) else [group]
+                    for candidate in candidates:
+                        if not isinstance(candidate, str):
+                            continue
+                        cleaned_candidate = re.sub(r"\s+", " ", candidate.strip())
+                        if not cleaned_candidate:
+                            continue
+                        lowered_candidate = cleaned_candidate.lower()
+                        if lowered_candidate in seen_variants:
+                            continue
+                        seen_variants.add(lowered_candidate)
+                        sanitized_variants.append(cleaned_candidate)
+                    if not sanitized_variants:
+                        continue
+                    group_label = " / ".join(sanitized_variants)
+                    group_key = f"group_{idx}_{slugify_keyword_label(group_label)}"
+                    keyword_groups_data.append({
+                        "key": group_key,
+                        "label": group_label,
+                        "variants": sanitized_variants,
+                    })
+                    for variant in sanitized_variants:
+                        variant_to_group_key[variant.lower()] = group_key
+
+            raw_keyword_sections = keyword_result.get("keyword_mode_sections", {}) or {}
+            original_verifications = keyword_result.get("verification_results", {}) or {}
+            original_locations = keyword_result.get("phrase_locations", {}) or {}
+
+            aggregated_sections: Dict[str, Dict[str, Any]] = {}
+            occurrence_ids_by_section: Dict[str, Set[str]] = {}
+
+            if keyword_groups_data:
+                for meta in keyword_groups_data:
+                    aggregated_sections[meta["key"]] = {
+                        "keyword": meta["label"],
+                        "variant_keywords": meta["variants"],
+                        "occurrences": [],
+                    }
+                    occurrence_ids_by_section[meta["key"]] = set()
+
+            for section_key, section_data in raw_keyword_sections.items():
+                if not isinstance(section_data, dict):
+                    continue
+                variant_keyword = (section_data.get("keyword") or "").strip()
+                normalized_variant = variant_keyword.lower()
+                target_key = variant_to_group_key.get(normalized_variant)
+                if not target_key:
+                    target_key = section_key
+                    if target_key not in aggregated_sections:
+                        aggregated_sections[target_key] = {
+                            "keyword": variant_keyword or "Keyword",
+                            "variant_keywords": [variant_keyword] if variant_keyword else [],
+                            "occurrences": [],
+                        }
+                        occurrence_ids_by_section[target_key] = set()
+                id_set = occurrence_ids_by_section.setdefault(target_key, set())
+                for occ in section_data.get("occurrences", []) or []:
+                    if not isinstance(occ, dict):
+                        continue
+                    occ_id = occ.get("id")
+                    if occ_id and occ_id in id_set:
+                        continue
+                    if occ_id:
+                        id_set.add(occ_id)
+                    aggregated_sections[target_key]["occurrences"].append(occ)
+
+            if aggregated_sections:
+                effective_keyword_sections = aggregated_sections
+            else:
+                effective_keyword_sections = {}
+                for section_key, section_data in raw_keyword_sections.items():
+                    if not isinstance(section_data, dict):
+                        continue
+                    variant_keywords = section_data.get("variant_keywords")
+                    if not isinstance(variant_keywords, list):
+                        variant_list = [section_data.get("keyword")] if section_data.get("keyword") else []
+                    else:
+                        variant_list = variant_keywords
+                    effective_keyword_sections[section_key] = {
+                        "keyword": section_data.get("keyword"),
+                        "variant_keywords": variant_list,
+                        "occurrences": section_data.get("occurrences", []) or [],
+                    }
+
+            aggregated_total_occurrences = sum(len(section.get("occurrences", [])) for section in effective_keyword_sections.values())
+
+            keyword_analysis = run_async(
+                analyzer.analyze_keyword_occurrences(
+                    filename=filename,
+                    main_prompt=user_prompt,
+                    keyword_sections=effective_keyword_sections,
+                    total_occurrences=aggregated_total_occurrences,
+                    keyword_reasoning=keyword_reasoning,
+                    user_request_context=user_request_context,
+                )
+            )
+
+            verification_results_by_phrase: Dict[str, Dict[str, Any]] = {}
+            phrase_locations_by_phrase: Dict[str, Any] = {}
+            sanitized_keyword_sections: Dict[str, Dict[str, Any]] = {}
+
+            aggregated_analysis = {
+                "title": f"Keyword Analysis of {filename}",
+                "analysis_sections": {},
+            }
+
+            for entry in keyword_analysis.get("keywords", []):
+                section_key = entry.get("section_key") or f"section_keyword_{len(aggregated_analysis['analysis_sections']) + 1}"
+                keyword_label = entry.get("keyword") or "Keyword"
+                analysis_summary = entry.get("analysis_summary") or f"No analysis available for '{keyword_label}'."
+                phrase_counts: Dict[str, int] = {}
+                supporting_phrases: List[str] = []
+                sanitized_citations: List[Dict[str, Any]] = []
+
+                for citation in entry.get("occurrence_citations", []) or []:
+                    occurrence_id = citation.get("occurrence_id")
+                    base_phrase = (citation.get("citation_text") or citation.get("snippet") or "").strip()
+                    if not base_phrase:
+                        base_phrase = f"{keyword_label} occurrence {len(sanitized_citations) + 1}"
+
+                    phrase_index = phrase_counts.get(base_phrase, 0)
+                    phrase_counts[base_phrase] = phrase_index + 1
+                    phrase_key = base_phrase if phrase_index == 0 else f"{base_phrase} ({phrase_index + 1})"
+
+                    supporting_phrases.append(phrase_key)
+                    sanitized_citation = {
+                        **citation,
+                        "display_phrase": phrase_key,
+                    }
+                    sanitized_citations.append(sanitized_citation)
+
+                    if occurrence_id:
+                        verification_source = original_verifications.get(occurrence_id, {})
+                        score_value = citation.get("match_score")
+                        method_value = "keyword_mode_bm25"
+                        verified_flag = True
+
+                        if isinstance(verification_source, dict):
+                            verified_flag = verification_source.get("verified", True)
+                            method_value = verification_source.get("method", method_value)
+                            if score_value is None and verification_source.get("score") is not None:
+                                score_value = verification_source.get("score")
+                        elif isinstance(verification_source, bool):
+                            verified_flag = verification_source
+
+                        verification_results_by_phrase[phrase_key] = {
+                            "verified": bool(verified_flag),
+                            "score": score_value,
+                            "method": method_value,
+                            "occurrence_id": occurrence_id,
+                            "page_label": citation.get("page_label"),
+                        }
+
+                        location_payload = original_locations.get(occurrence_id)
+                        if location_payload is not None:
+                            phrase_locations_by_phrase[phrase_key] = location_payload
+
+                if not supporting_phrases:
+                    supporting_phrases = ["No relevant phrase found."]
+
+                total_matches = len(sanitized_citations)
+                base_section = effective_keyword_sections.get(section_key, {}) if isinstance(effective_keyword_sections, dict) else {}
+                variant_keywords = base_section.get("variant_keywords", []) if isinstance(base_section, dict) else []
+                context_message = f"Keyword mode analysis for '{keyword_label}'. Total occurrences: {total_matches}."
+                if variant_keywords:
+                    context_message += f" Variants: {', '.join(variant_keywords)}."
+
+                aggregated_analysis["analysis_sections"][section_key] = {
+                    "Analysis": analysis_summary,
+                    "Supporting_Phrases": supporting_phrases,
+                    "Context": context_message,
+                }
+
+                sanitized_keyword_sections[section_key] = {
+                    "keyword": keyword_label,
+                    "analysis_summary": analysis_summary,
+                    "total_occurrences": total_matches,
+                    "occurrence_citations": sanitized_citations,
+                    "original_occurrences": base_section.get("occurrences", []) if isinstance(base_section, dict) else [],
+                    "variant_keywords": variant_keywords,
+                }
+
+            aggregated_ai_analysis_json_str = json.dumps(aggregated_analysis, indent=2)
+
+            ordered_sections = [entry.get("section_key") or f"section_keyword_{idx + 1}" for idx, entry in enumerate(keyword_analysis.get("keywords", []))]
+            sub_prompt_results = []
+            for idx, order_key in enumerate(ordered_sections):
+                section_details = sanitized_keyword_sections.get(order_key)
+                if not section_details:
+                    continue
+                keyword_label = section_details.get("keyword", "Keyword")
+                sub_prompt_payload = {
+                    "keyword": keyword_label,
+                    "analysis_summary": section_details.get("analysis_summary"),
+                    "occurrence_citations": section_details.get("occurrence_citations", []),
+                    "total_occurrences": section_details.get("total_occurrences", 0),
+                    "variant_keywords": section_details.get("variant_keywords", []),
+                }
+                sub_prompt_results.append(
+                    {
+                        "title": f"Keyword Group: {keyword_label}",
+                        "sub_prompt": f"Occurrences of '{keyword_label}'",
+                        "analysis_json": json.dumps(sub_prompt_payload, indent=2),
+                    }
+                )
+
+            keyword_payload = {
+                "filename": filename,
+                "annotated_pdf": keyword_result.get("annotated_pdf"),
+                "verification_results": verification_results_by_phrase,
+                "phrase_locations": phrase_locations_by_phrase,
+                "ai_analysis": aggregated_ai_analysis_json_str,
+                "sub_prompt_results": sub_prompt_results,
+                "keyword_mode": True,
+                "keyword_mode_sections": sanitized_keyword_sections,
+                "keyword_analysis": keyword_analysis,
+                "keywords": [meta["label"] for meta in keyword_groups_data] if keyword_groups_data else keyword_result.get("keywords", detected_keywords),
+                "keyword_groups": keyword_groups,
+                "keyword_group_metadata": keyword_groups_data,
+                "total_occurrences": aggregated_total_occurrences,
+                "keyword_reasoning": keyword_reasoning,
+                "user_request_context": user_request_context,
+                "raw_keyword_occurrences": raw_keyword_sections,
+            }
+
+            memory_after_keyword = get_memory_usage()
+            memory_used_keyword = memory_after_keyword['used'] - memory_before['used']
+            logger.debug(
+                f"Keyword mode memory usage: {format_bytes(memory_after_keyword['used'])} used, "
+                f"{memory_after_keyword['percent']}% of total (delta {format_bytes(memory_used_keyword)})"
+            )
+
+            if memory_after_keyword['percent'] > 75:
+                logger.warning(
+                    f"High memory usage after keyword mode processing {filename}: {memory_after_keyword['percent']}%"
+                )
+                cleanup_result = cleanup_memory(force=True)
+                logger.info(
+                    f"Memory cleanup performed post keyword mode: {cleanup_result.get('freed_formatted', '0 B')} freed"
+                )
+
+            return keyword_payload
+
+        logger.info(f"Ask mode: Starting decomposition and RAG workflow for {filename}")
         logger.info(f"Decomposed prompt into {len(sub_prompts)} sub-prompts for {filename}")
 
         # --- Step 3: Process all sub-prompts with RAG using the unified context approach ---

@@ -124,6 +124,7 @@ def display_analysis_results(results: List[Dict[str, Any]]):
                     with tabs[i]:
                         filename = result.get("filename", "Unknown File")
                         annotated_pdf_b64 = result.get("annotated_pdf")
+                        annotated_pdf_bytes = base64.b64decode(annotated_pdf_b64) if annotated_pdf_b64 else None
 
                         # File info and download button row (app.py.bak style)
                         file_col1, file_col2 = st.columns([0.8, 0.2])
@@ -137,8 +138,7 @@ def display_analysis_results(results: List[Dict[str, Any]]):
                             """, unsafe_allow_html=True)
 
                         with file_col2:
-                            if annotated_pdf_b64:
-                                annotated_pdf_bytes = base64.b64decode(annotated_pdf_b64)
+                            if annotated_pdf_bytes:
                                 # Simpler label from app.py.bak
                                 download_label = "💾 PDF"
                                 st.download_button(
@@ -231,6 +231,8 @@ def display_analysis_results(results: List[Dict[str, Any]]):
                             supporting_phrases = section_data.get("Supporting_Phrases", [])
                             verification_results = result.get("verification_results", {})
                             phrase_locations = result.get("phrase_locations", {})
+                            keyword_mode_sections = result.get("keyword_mode_sections", {}) or {}
+                            keyword_section_details = keyword_mode_sections.get(section_key) if isinstance(keyword_mode_sections, dict) else None
 
                             any_needs_review = False
                             if supporting_phrases and supporting_phrases != ["No relevant phrase found."]:
@@ -246,9 +248,25 @@ def display_analysis_results(results: List[Dict[str, Any]]):
                                         any_needs_review = True
                                         break
 
-                            with st.expander("Supporting Citations", expanded=any_needs_review):
+                            total_keyword_matches = None
+                            if keyword_section_details and isinstance(keyword_section_details, dict):
+                                total_keyword_matches = keyword_section_details.get("total_occurrences")
+                                if total_keyword_matches is None:
+                                    total_keyword_matches = keyword_section_details.get("count")
+
+                            expand_state = any_needs_review or bool(total_keyword_matches)
+
+                            with st.expander("Supporting Citations", expanded=expand_state):
                                 # If optimized RAG results exist for this section, use them to REPLACE the citations display
                                 # Disabled displaying optimized RAG results separately; use verified citations from analysis
+                                if keyword_section_details and total_keyword_matches:
+                                    keyword_label = keyword_section_details.get("keyword")
+                                    summary_parts = []
+                                    if keyword_label:
+                                        summary_parts.append(f"**Keyword:** `{keyword_label}`")
+                                    summary_parts.append(f"**Total Matches:** {total_keyword_matches}")
+                                    st.markdown(" • ".join(summary_parts))
+
                                 new_results = []
 
                                 if new_results:
@@ -281,26 +299,22 @@ def display_analysis_results(results: List[Dict[str, Any]]):
                                             else:
                                                 try:
                                                     is_verified = bool(phrase_verification)
-                                                except:
+                                                except Exception:
                                                     is_verified = False
 
                                             current_page_num_info = "Page unknown"
                                             current_score_info = "N/A"
 
-                                            # Choose the best location instead of taking the first one
-                                            best_location_dict = {}
                                             candidate_locs = []
                                             if isinstance(phrase_location_data, list):
                                                 candidate_locs = [loc for loc in phrase_location_data if isinstance(loc, dict)]
                                             elif isinstance(phrase_location_data, dict):
-                                                # Some pipelines might store a single dict or include a 'best_match'
                                                 if 'best_match' in phrase_location_data and isinstance(phrase_location_data['best_match'], dict):
                                                     candidate_locs = [phrase_location_data['best_match']]
                                                 else:
                                                     candidate_locs = [phrase_location_data]
 
                                             if candidate_locs:
-                                                # Prefer exact > cross-page/special > fuzzy > individual fallback > fallback; then by highest score
                                                 method_priority = {
                                                     'exact': 5,
                                                     'exact_cleaned_search': 5,
@@ -334,14 +348,12 @@ def display_analysis_results(results: List[Dict[str, Any]]):
                                                         current_score_info = f"{float(score_val):.1f}"
                                                     except Exception:
                                                         current_score_info = str(score_val)
-                                                else:
-                                                    if score:
-                                                        try:
-                                                            current_score_info = f"{float(score):.1f}"
-                                                        except Exception:
-                                                            current_score_info = str(score)
+                                                elif score:
+                                                    try:
+                                                        current_score_info = f"{float(score):.1f}"
+                                                    except Exception:
+                                                        current_score_info = str(score)
 
-                                                # Log all candidates to help diagnose selection issues
                                                 try:
                                                     cand_summaries = []
                                                     for loc in candidate_locs:
@@ -531,6 +543,9 @@ def display_rag_retry_button_header(section_key: str, result: Dict[str, Any], se
         result: Result dictionary containing analysis data
         section_data: The specific section data
     """
+    if result.get("keyword_mode"):
+        return
+
     # Create a unique key for this section's retry button
     retry_key = f"retry_rag_{section_key}_{result.get('filename', 'unknown')}"
 
