@@ -156,6 +156,8 @@ def display_analysis_results(results: List[Dict[str, Any]]):
                         # Display analysis sections
                         analysis_sections = ai_analysis.get("analysis_sections", {})
                         citation_counter = 0  # For numbering citations within a tab
+                        is_keyword_mode_result = bool(result.get("keyword_mode"))
+                        keyword_mode_sections = result.get("keyword_mode_sections", {}) or {}
 
                         for section_key, section_data in analysis_sections.items():
                             # Extract the actual title from the section key (removing "section_n_" prefix)
@@ -168,6 +170,13 @@ def display_analysis_results(results: List[Dict[str, Any]]):
 
                             # Format section name for display
                             display_section_name = section_title.replace("_", " ").title()
+                            keyword_section_details = None
+                            if is_keyword_mode_result and isinstance(keyword_mode_sections, dict):
+                                keyword_section_details = keyword_mode_sections.get(section_key)
+                                if isinstance(keyword_section_details, dict):
+                                    keyword_label = keyword_section_details.get("keyword")
+                                    if isinstance(keyword_label, str) and keyword_label.strip():
+                                        display_section_name = keyword_label.strip()
 
                             # Create a container for the section title with improved styling and RAG retry button
                             with st.container(border=False):
@@ -231,8 +240,7 @@ def display_analysis_results(results: List[Dict[str, Any]]):
                             supporting_phrases = section_data.get("Supporting_Phrases", [])
                             verification_results = result.get("verification_results", {})
                             phrase_locations = result.get("phrase_locations", {})
-                            keyword_mode_sections = result.get("keyword_mode_sections", {}) or {}
-                            keyword_section_details = keyword_mode_sections.get(section_key) if isinstance(keyword_mode_sections, dict) else None
+                            keyword_section_details = keyword_section_details if isinstance(keyword_section_details, dict) else (keyword_mode_sections.get(section_key) if isinstance(keyword_mode_sections, dict) else None)
 
                             any_needs_review = False
                             if supporting_phrases and supporting_phrases != ["No relevant phrase found."]:

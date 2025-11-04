@@ -222,7 +222,10 @@ def preprocess_file(file_data: bytes, filename: str, use_advanced_extraction: bo
 
         if not chunks:
             logger.warning(f"No chunks extracted for {filename} during preprocessing.")
-            return {"status": "warning", "message": "No text chunks could be extracted"}
+            return {
+                "status": "error", 
+                "message": "Error processing the PDF - possibly due to it being a scanned document. Please upload an OCR-converted version of the document."
+            }
 
         # Generate embeddings for all chunks
         logger.info(f"Generating embeddings for {len(chunks)} chunks from {filename}")
@@ -232,7 +235,10 @@ def preprocess_file(file_data: bytes, filename: str, use_advanced_extraction: bo
 
         if not valid_chunk_texts:
             logger.warning(f"No valid chunk texts found for {filename} during preprocessing.")
-            return {"status": "warning", "message": "No valid chunk texts found"}
+            return {
+                "status": "error",
+                "message": "Error processing the PDF - possibly due to it being a scanned document. Please upload an OCR-converted version of the document."
+            }
 
         chunk_embeddings = embedding_model.encode(
             valid_chunk_texts, convert_to_tensor=True, show_progress_bar=False

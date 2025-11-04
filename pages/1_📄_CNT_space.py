@@ -901,9 +901,10 @@ else:
             for removed_file in removed_files:
                 if removed_file in st.session_state.preprocessed_data:
                     del st.session_state.preprocessed_data[removed_file]
-                    if removed_file in st.session_state.preprocessing_status:
-                        del st.session_state.preprocessing_status[removed_file]
                     logger.info(f"Removed preprocessing data for {removed_file}")
+                if removed_file in st.session_state.preprocessing_status:
+                    del st.session_state.preprocessing_status[removed_file]
+                    logger.info(f"Removed preprocessing status for {removed_file}")
 
             # Clear results if files change
             if new_files or removed_files:
@@ -948,10 +949,10 @@ else:
                                         success_count += 1
                                         st.write(f"✅ {filename} processed successfully.")
                                     elif result['status'] == 'warning':
-                                        st.write(f"⚠️ {filename}: {result['message']}")
+                                        st.warning(f"⚠️ {filename}: {result['message']}")
                                         preprocessing_failed = True # Treat warning as needing attention
                                     else: # Error
-                                        st.write(f"❌ Error processing {filename}: {result['message']}")
+                                        st.error(f"❌ {filename}: {result['message']}")
                                         preprocessing_failed = True
 
                                 except Exception as e:
@@ -982,8 +983,27 @@ else:
             # Rerun to reflect preprocessing status and potentially hide welcome message
             st.rerun()
 
+    # Display preprocessing errors if any exist
+    preprocessing_errors = {
+        filename: status 
+        for filename, status in st.session_state.get("preprocessing_status", {}).items() 
+        if status.get("status") in ["error", "warning"]
+    }
+    
+    if preprocessing_errors:
+        with preprocessing_or_features_container.container():
+            st.error("**Preprocessing Errors**")
+            for filename, status in preprocessing_errors.items():
+                if status.get("status") == "error":
+                    st.error(f"**{filename}**: {status.get('message', 'Unknown error')}")
+                else:
+                    st.warning(f"**{filename}**: {status.get('message', 'Unknown warning')}")
+            
+            st.info("💡 **Tip**: Please remove the failed file(s) and upload corrected versions, or upload additional files to continue.")
+
     # Welcome Features Section - Ask vs Review
-    if not st.session_state.get("preprocessed_data") and not st.session_state.get("file_selection_changed_by_user"):
+    # Only show if no preprocessing data AND no preprocessing errors
+    if not st.session_state.get("preprocessed_data") and not preprocessing_errors and not st.session_state.get("file_selection_changed_by_user"):
         with preprocessing_or_features_container.container():
             if st.session_state.smartdocs_mode == "Review":
                 display_review_features()
@@ -1040,7 +1060,7 @@ else:
             label = "Analysis Prompt" if st.session_state.smartdocs_mode == "Ask" else "Validation Rules"
             st.session_state.user_prompt = st.text_area(
                 label,
-                placeholder="Ask: enter your analysis instructions. Review: type validation checks (one per line); they run automatically.",
+                placeholder="Enter your analysis instructions. Be descriptive in your prompt in order to get best results.",
                 height=150,
                 key="prompt_input_main",
                 value=st.session_state.get("user_prompt", ""),
