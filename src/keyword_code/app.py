@@ -21,7 +21,7 @@ import time
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import fitz  # PyMuPDF
 import numpy as np
@@ -412,27 +412,36 @@ def process_file_wrapper(args):
             keyword_groups = []
             user_request_context = ""
 
-        if keyword_mode_flag and detected_keywords:
-            logger.info(
-                "Keyword mode activated for %s with keywords: %s",
-                filename,
-                detected_keywords,
-            )
+        keyword_only_sub_prompts: List[Dict[str, Any]] = []
+        rag_enabled_sub_prompts: List[Dict[str, Any]] = []
+        for sub_prompt_entry in sub_prompts:
+            if not isinstance(sub_prompt_entry, dict):
+                continue
+            rag_params_entry = sub_prompt_entry.get("rag_params", {}) or {}
+            retrieval_mode_entry = rag_params_entry.get("retrieval_mode", "")
+            if isinstance(retrieval_mode_entry, str) and retrieval_mode_entry.lower() == "keyword":
+                keyword_only_sub_prompts.append(sub_prompt_entry)
+            else:
+                rag_enabled_sub_prompts.append(sub_prompt_entry)
 
+        keyword_context: Optional[Dict[str, Any]] = None
+        keyword_result_payload: Optional[Dict[str, Any]] = None
+
+        def run_keyword_sidecar(keywords_to_use: Sequence[str]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
             keyword_mode_service = get_keyword_mode_service()
             keyword_chunks = preprocessed_data["chunks"] if preprocessed_data else chunks
             if not keyword_chunks:
                 raise ValueError("Keyword mode requires chunked document text.")
 
             pdf_bytes_for_keyword = original_pdf_bytes_for_annotation or uploaded_file_data
-            keyword_result = keyword_mode_service.run(
+            keyword_result_local = keyword_mode_service.run(
                 filename=filename,
-                keywords=detected_keywords,
+                keywords=keywords_to_use,
                 chunks=keyword_chunks,
                 original_pdf_bytes=pdf_bytes_for_keyword,
             )
 
-            keyword_groups_data: List[Dict[str, Any]] = []
+            keyword_groups_data_local: List[Dict[str, Any]] = []
             variant_to_group_key: Dict[str, str] = {}
             if keyword_groups:
                 for idx, group in enumerate(keyword_groups, start=1):
@@ -454,7 +463,7 @@ def process_file_wrapper(args):
                         continue
                     group_label = " / ".join(sanitized_variants)
                     group_key = f"group_{idx}_{slugify_keyword_label(group_label)}"
-                    keyword_groups_data.append({
+                    keyword_groups_data_local.append({
                         "key": group_key,
                         "label": group_label,
                         "variants": sanitized_variants,
@@ -462,15 +471,15 @@ def process_file_wrapper(args):
                     for variant in sanitized_variants:
                         variant_to_group_key[variant.lower()] = group_key
 
-            raw_keyword_sections = keyword_result.get("keyword_mode_sections", {}) or {}
-            original_verifications = keyword_result.get("verification_results", {}) or {}
-            original_locations = keyword_result.get("phrase_locations", {}) or {}
+            raw_keyword_sections = keyword_result_local.get("keyword_mode_sections", {}) or {}
+            original_verifications = keyword_result_local.get("verification_results", {}) or {}
+            original_locations = keyword_result_local.get("phrase_locations", {}) or {}
 
             aggregated_sections: Dict[str, Dict[str, Any]] = {}
             occurrence_ids_by_section: Dict[str, Set[str]] = {}
 
-            if keyword_groups_data:
-                for meta in keyword_groups_data:
+            if keyword_groups_data_local:
+                for meta in keyword_groups_data_local:
                     aggregated_sections[meta["key"]] = {
                         "keyword": meta["label"],
                         "variant_keywords": meta["variants"],
@@ -524,7 +533,7 @@ def process_file_wrapper(args):
 
             aggregated_total_occurrences = sum(len(section.get("occurrences", [])) for section in effective_keyword_sections.values())
 
-            keyword_analysis = run_async(
+            keyword_analysis_local = run_async(
                 analyzer.analyze_keyword_occurrences(
                     filename=filename,
                     main_prompt=user_prompt,
@@ -539,13 +548,13 @@ def process_file_wrapper(args):
             phrase_locations_by_phrase: Dict[str, Any] = {}
             sanitized_keyword_sections: Dict[str, Dict[str, Any]] = {}
 
-            aggregated_analysis = {
+            aggregated_analysis_local = {
                 "title": f"Keyword Analysis of {filename}",
                 "analysis_sections": {},
             }
 
-            for entry in keyword_analysis.get("keywords", []):
-                section_key = entry.get("section_key") or f"section_keyword_{len(aggregated_analysis['analysis_sections']) + 1}"
+            for entry in keyword_analysis_local.get("keywords", []):
+                section_key = entry.get("section_key") or f"section_keyword_{len(aggregated_analysis_local['analysis_sections']) + 1}"
                 keyword_label = entry.get("keyword") or "Keyword"
                 analysis_summary = entry.get("analysis_summary") or f"No analysis available for '{keyword_label}'."
                 phrase_counts: Dict[str, int] = {}
@@ -605,7 +614,7 @@ def process_file_wrapper(args):
                 if variant_keywords:
                     context_message += f" Variants: {', '.join(variant_keywords)}."
 
-                aggregated_analysis["analysis_sections"][section_key] = {
+                aggregated_analysis_local["analysis_sections"][section_key] = {
                     "Analysis": analysis_summary,
                     "Supporting_Phrases": supporting_phrases,
                     "Context": context_message,
@@ -620,10 +629,10 @@ def process_file_wrapper(args):
                     "variant_keywords": variant_keywords,
                 }
 
-            aggregated_ai_analysis_json_str = json.dumps(aggregated_analysis, indent=2)
+            aggregated_ai_analysis_json_str_local = json.dumps(aggregated_analysis_local, indent=2)
 
-            ordered_sections = [entry.get("section_key") or f"section_keyword_{idx + 1}" for idx, entry in enumerate(keyword_analysis.get("keywords", []))]
-            sub_prompt_results = []
+            ordered_sections = [entry.get("section_key") or f"section_keyword_{idx + 1}" for idx, entry in enumerate(keyword_analysis_local.get("keywords", []))]
+            sub_prompt_results_local: List[Dict[str, Any]] = []
             for idx, order_key in enumerate(ordered_sections):
                 section_details = sanitized_keyword_sections.get(order_key)
                 if not section_details:
@@ -636,7 +645,7 @@ def process_file_wrapper(args):
                     "total_occurrences": section_details.get("total_occurrences", 0),
                     "variant_keywords": section_details.get("variant_keywords", []),
                 }
-                sub_prompt_results.append(
+                sub_prompt_results_local.append(
                     {
                         "title": f"Keyword Group: {keyword_label}",
                         "sub_prompt": f"Occurrences of '{keyword_label}'",
@@ -644,42 +653,67 @@ def process_file_wrapper(args):
                     }
                 )
 
-            keyword_payload = {
-                "filename": filename,
-                "annotated_pdf": keyword_result.get("annotated_pdf"),
+            keyword_context_local = {
+                "aggregated_analysis": aggregated_analysis_local,
+                "analysis_json": aggregated_ai_analysis_json_str_local,
                 "verification_results": verification_results_by_phrase,
                 "phrase_locations": phrase_locations_by_phrase,
-                "ai_analysis": aggregated_ai_analysis_json_str,
-                "sub_prompt_results": sub_prompt_results,
-                "keyword_mode": True,
                 "keyword_mode_sections": sanitized_keyword_sections,
-                "keyword_analysis": keyword_analysis,
-                "keywords": [meta["label"] for meta in keyword_groups_data] if keyword_groups_data else keyword_result.get("keywords", detected_keywords),
-                "keyword_groups": keyword_groups,
-                "keyword_group_metadata": keyword_groups_data,
+                "keyword_analysis": keyword_analysis_local,
+                "keyword_groups_data": keyword_groups_data_local,
+                "keywords_display": [meta["label"] for meta in keyword_groups_data_local] if keyword_groups_data_local else keyword_result_local.get("keywords", list(keywords_to_use)),
                 "total_occurrences": aggregated_total_occurrences,
-                "keyword_reasoning": keyword_reasoning,
-                "user_request_context": user_request_context,
-                "raw_keyword_occurrences": raw_keyword_sections,
+                "sub_prompt_results": sub_prompt_results_local,
+                "raw_keyword_sections": raw_keyword_sections,
             }
+            return keyword_result_local, keyword_context_local
 
-            memory_after_keyword = get_memory_usage()
-            memory_used_keyword = memory_after_keyword['used'] - memory_before['used']
-            logger.debug(
-                f"Keyword mode memory usage: {format_bytes(memory_after_keyword['used'])} used, "
-                f"{memory_after_keyword['percent']}% of total (delta {format_bytes(memory_used_keyword)})"
+        should_force_keyword_only = bool(keyword_mode_flag and detected_keywords and not rag_enabled_sub_prompts)
+
+        if detected_keywords:
+            logger.info(
+                "Keyword mode requested for %s with keywords: %s",
+                filename,
+                detected_keywords,
             )
+            keyword_result_payload, keyword_context = run_keyword_sidecar(detected_keywords)
 
-            if memory_after_keyword['percent'] > 75:
-                logger.warning(
-                    f"High memory usage after keyword mode processing {filename}: {memory_after_keyword['percent']}%"
-                )
-                cleanup_result = cleanup_memory(force=True)
-                logger.info(
-                    f"Memory cleanup performed post keyword mode: {cleanup_result.get('freed_formatted', '0 B')} freed"
+            if should_force_keyword_only and keyword_context is not None and keyword_result_payload is not None:
+                memory_after_keyword = get_memory_usage()
+                memory_used_keyword = memory_after_keyword['used'] - memory_before['used']
+                logger.debug(
+                    f"Keyword mode memory usage: {format_bytes(memory_after_keyword['used'])} used, "
+                    f"{memory_after_keyword['percent']}% of total (delta {format_bytes(memory_used_keyword)})"
                 )
 
-            return keyword_payload
+                if memory_after_keyword['percent'] > 75:
+                    logger.warning(
+                        f"High memory usage after keyword mode processing {filename}: {memory_after_keyword['percent']}%"
+                    )
+                    cleanup_result = cleanup_memory(force=True)
+                    logger.info(
+                        f"Memory cleanup performed post keyword mode: {cleanup_result.get('freed_formatted', '0 B')} freed"
+                    )
+
+                keyword_response = {
+                    "filename": filename,
+                    "annotated_pdf": keyword_result_payload.get("annotated_pdf"),
+                    "verification_results": keyword_context["verification_results"],
+                    "phrase_locations": keyword_context["phrase_locations"],
+                    "ai_analysis": keyword_context["analysis_json"],
+                    "sub_prompt_results": keyword_context["sub_prompt_results"],
+                    "keyword_mode": True,
+                    "keyword_mode_sections": keyword_context["keyword_mode_sections"],
+                    "keyword_analysis": keyword_context["keyword_analysis"],
+                    "keywords": keyword_context["keywords_display"],
+                    "keyword_groups": keyword_groups,
+                    "keyword_group_metadata": keyword_context["keyword_groups_data"],
+                    "total_occurrences": keyword_context["total_occurrences"],
+                    "keyword_reasoning": keyword_reasoning,
+                    "user_request_context": user_request_context,
+                    "raw_keyword_occurrences": keyword_context["raw_keyword_sections"],
+                }
+                return keyword_response
 
         logger.info(f"Ask mode: Starting decomposition and RAG workflow for {filename}")
         logger.info(f"Decomposed prompt into {len(sub_prompts)} sub-prompts for {filename}")
@@ -832,8 +866,8 @@ def process_file_wrapper(args):
                     "Context": f"Error in sub-prompt: {result['sub_prompt']}"
                 }
 
-        aggregated_ai_analysis_json_str = json.dumps(aggregated_analysis, indent=2)
-        logger.info(f"Aggregated analysis results for {filename}")
+        verification_input_json = json.dumps(aggregated_analysis, indent=2)
+        logger.info(f"Aggregated analysis results for {filename} (pre-keyword merge)")
 
         # --- Step 4.5: Fact Extraction ---
         # Note: Fact extraction is now only performed on-demand when the user clicks "Generate Facts"
@@ -847,19 +881,59 @@ def process_file_wrapper(args):
         if preprocessed_data and 'processor' not in locals():
             processor = PDFProcessor(original_pdf_bytes_for_annotation)
 
-        # Log the aggregated analysis JSON structure for debugging
-        logger.info(f"Aggregated analysis JSON structure: {list(json.loads(aggregated_ai_analysis_json_str).keys())}")
+        logger.info(
+            "Aggregated analysis prepared %d section(s) before keyword merge for %s",
+            len(aggregated_analysis.get("analysis_sections", {})),
+            filename,
+        )
 
         # Verification uses the *original* processor instance with all chunks
         logger.info(f"Verifying phrases from aggregated analysis for {filename}.")
         try:
             verification_results, phrase_locations = processor.verify_and_locate_phrases(
-                aggregated_ai_analysis_json_str # Use aggregated result
+                verification_input_json
             )
             logger.info(f"Verification results: {len(verification_results)} phrases, {sum(1 for v in verification_results.values() if v)} verified")
         except Exception as verify_err:
             logger.error(f"Error during verification: {verify_err}", exc_info=True)
             verification_results, phrase_locations = {}, {}
+
+        if keyword_context:
+            keyword_sections = keyword_context.get("aggregated_analysis", {}).get("analysis_sections", {})
+            if keyword_sections:
+                aggregated_analysis["analysis_sections"].update(keyword_sections)
+                logger.info(
+                    "Merged %d keyword section(s) into analysis for %s",
+                    len(keyword_sections),
+                    filename,
+                )
+            keyword_sub_prompts = keyword_context.get("sub_prompt_results", [])
+            if keyword_sub_prompts:
+                all_sub_prompt_results.extend(keyword_sub_prompts)
+            keyword_verifications = keyword_context.get("verification_results", {})
+            for phrase_key, verification_payload in keyword_verifications.items():
+                if phrase_key in verification_results:
+                    logger.debug(
+                        "Overwriting existing verification entry for phrase '%s' with keyword mode data.",
+                        phrase_key,
+                    )
+                verification_results[phrase_key] = verification_payload
+            keyword_locations = keyword_context.get("phrase_locations", {})
+            for phrase_key, location_payload in keyword_locations.items():
+                if phrase_key in phrase_locations:
+                    logger.debug(
+                        "Overwriting existing phrase location for '%s' with keyword mode coordinates.",
+                        phrase_key,
+                    )
+                phrase_locations[phrase_key] = location_payload
+
+        aggregated_ai_analysis_json_str = json.dumps(aggregated_analysis, indent=2)
+        logger.info(
+            "Final analysis for %s contains %d section(s)%s",
+            filename,
+            len(aggregated_analysis.get("analysis_sections", {})),
+            " (includes keyword highlights)" if keyword_context else "",
+        )
 
         # Add annotations to the PDF
         logger.info(f"Adding annotations to PDF for {filename}.")
@@ -886,7 +960,7 @@ def process_file_wrapper(args):
             logger.info(f"Memory cleanup performed: {cleanup_result.get('freed_formatted', '0 B')} freed")
 
         # --- Step 6: Return the results ---
-        return {
+        result_payload = {
             "filename": filename,
             "annotated_pdf": annotated_pdf_base64,
             "verification_results": verification_results,
@@ -895,6 +969,22 @@ def process_file_wrapper(args):
             "sub_prompt_results": all_sub_prompt_results,
             "extracted_facts": extracted_facts
         }
+
+        if keyword_context:
+            result_payload.update({
+                "keyword_mode": False,
+                "keyword_mode_sections": keyword_context.get("keyword_mode_sections", {}),
+                "keyword_analysis": keyword_context.get("keyword_analysis"),
+                "keywords": keyword_context.get("keywords_display", []),
+                "keyword_groups": keyword_groups,
+                "keyword_group_metadata": keyword_context.get("keyword_groups_data", []),
+                "total_occurrences": keyword_context.get("total_occurrences", 0),
+                "keyword_reasoning": keyword_reasoning,
+                "user_request_context": user_request_context,
+                "raw_keyword_occurrences": keyword_context.get("raw_keyword_sections", {}),
+            })
+
+        return result_payload
 
     except Exception as e:
         logger.error(f"Error processing {filename}: {str(e)}", exc_info=True)
