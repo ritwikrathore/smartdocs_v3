@@ -6,12 +6,14 @@ import streamlit as st
 import base64
 import json
 import zipfile
+import re
 from io import BytesIO
 from docx import Document
-from docx.shared import Pt
+from docx.shared import Pt, Inches
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from datetime import datetime
 from typing import Dict, List, Any, Tuple
+import fitz
 from ..config import logger
 from .pdf_utils import restore_original_bytes_if_needed
 
@@ -113,95 +115,257 @@ def export_to_word(exportable_results_list: List[Dict[str, Any]]) -> bytes:
     # Add a page break after the title page
     doc.add_page_break()
 
+    method_priority = {
+        'exact': 5,
+        'exact_cleaned_search': 5,
+        'special_case_quotes_handling': 3,
+        'cross_page_fuzzy_match_part1': 2,
+        'cross_page_fuzzy_match_part2': 2,
+        'fuzzy': 2,
+        'fuzzy_chunk_fallback_individual': 1,
+        'fuzzy_chunk_fallback': 0
+    }
+
+    def pick_best_location(candidate_locs: List[Dict[str, Any]]) -> Dict[str, Any] | None:
+        if not candidate_locs:
+            return None
+
+        def loc_key(loc: Dict[str, Any]) -> Tuple[int, float]:
+            method = loc.get('method', '')
+            score_val = loc.get('match_score', 0) or 0
+            try:
+                score_val = float(score_val)
+            except Exception:
+                score_val = 0.0
+            return (method_priority.get(method, -1), score_val)
+
+        return max(candidate_locs, key=loc_key)
+
+    def normalize_candidate_locations(raw_locations: Any) -> List[Dict[str, Any]]:
+        if isinstance(raw_locations, list):
+            return [loc for loc in raw_locations if isinstance(loc, dict)]
+        if isinstance(raw_locations, dict):
+            if 'best_match' in raw_locations and isinstance(raw_locations['best_match'], dict):
+                return [raw_locations['best_match']]
+            return [raw_locations]
+        return []
+
+    def extract_clip_image(pdf_document: fitz.Document | None, location: Dict[str, Any]) -> bytes | None:
+        if pdf_document is None or not isinstance(location, dict):
+            return None
+
+        page_index = location.get("page_num")
+        rect_coords = location.get("rect")
+
+        try:
+            page_index = int(page_index)
+        except Exception:
+            return None
+
+        if not isinstance(rect_coords, (list, tuple)) or len(rect_coords) != 4:
+            return None
+
+        try:
+            page = pdf_document[page_index]
+        except Exception as e:
+            logger.error(f"Failed to access page {page_index} for citation snapshot: {e}")
+            return None
+
+        clip_rect = fitz.Rect(rect_coords)
+        if clip_rect.is_empty:
+            return None
+
+        # Pad the clip slightly so the excerpt has some context.
+        try:
+            page_rect = page.rect
+            padding = 6.0
+            clip_rect.x0 = max(page_rect.x0, clip_rect.x0 - padding)
+            clip_rect.y0 = max(page_rect.y0, clip_rect.y0 - padding)
+            clip_rect.x1 = min(page_rect.x1, clip_rect.x1 + padding)
+            clip_rect.y1 = min(page_rect.y1, clip_rect.y1 + padding)
+        except Exception:
+            pass
+
+        try:
+            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), clip=clip_rect, alpha=False)
+            return pix.tobytes("png")
+        except Exception as e:
+            logger.error(f"Failed to render citation snapshot: {e}")
+            return None
+
+    def add_markdown_runs(paragraph, text: str) -> None:
+        """Render a limited subset of Markdown (bold/italic) into Word runs."""
+        if not text:
+            return
+
+        lines = text.split('\n')
+        for line_idx, line in enumerate(lines):
+            parts = re.split(r'(\*\*[^*]+\*\*|\*[^*]+\*)', line)
+            for part in parts:
+                if not part:
+                    continue
+                if part.startswith('**') and part.endswith('**') and len(part) > 4:
+                    run = paragraph.add_run(part[2:-2])
+                    run.bold = True
+                elif part.startswith('*') and part.endswith('*') and len(part) > 2:
+                    run = paragraph.add_run(part[1:-1])
+                    run.italic = True
+                else:
+                    paragraph.add_run(part)
+            if line_idx < len(lines) - 1:
+                paragraph.add_run().add_break()
+
     # Process each file's results
-    for file_result in exportable_results_list:
+    total_files = len(exportable_results_list)
+    for file_index, file_result in enumerate(exportable_results_list):
         filename = file_result.get("filename", "Unknown File")
         analysis = file_result.get("analysis", {})
+        phrase_details_map = file_result.get("phrase_details", {}) or {}
+        phrase_locations_map = file_result.get("phrase_locations", {}) or {}
+        annotated_pdf_b64 = file_result.get("annotated_pdf")
+        annotated_pdf_doc = None
 
-        # Add file heading
-        doc.add_heading(f"Document: {filename}", 1)
+        if annotated_pdf_b64:
+            try:
+                annotated_pdf_doc = fitz.open(stream=base64.b64decode(annotated_pdf_b64), filetype="pdf")
+            except Exception as pdf_err:
+                logger.error(f"Unable to open annotated PDF for {filename}: {pdf_err}")
+                annotated_pdf_doc = None
 
-        # Process each analysis section
-        for section_key, section_data in analysis.get("analysis_sections", {}).items():
-            # Add section heading
-            section_name = section_key.replace("_", " ").title()
-            doc.add_heading(section_name, 2)
+        try:
+            # Add file heading
+            doc.add_heading(f"Document: {filename}", 1)
 
-            # Add analysis text
-            if section_data.get("Analysis"):
-                p = doc.add_paragraph()
-                p.add_run("Analysis: ").bold = True
-                p.add_run(section_data.get("Analysis"))
+            analysis_sections = list(analysis.get("analysis_sections", {}).items())
+            total_sections = len(analysis_sections)
 
-            # Add context if available
-            if section_data.get("Context"):
-                p = doc.add_paragraph()
-                p.add_run("Context: ").bold = True
-                p.add_run(section_data.get("Context"))
+            if total_sections:
+                doc.add_page_break()
 
-            # Add supporting phrases
-            supporting_phrases = section_data.get("Supporting_Phrases", [])
-            if supporting_phrases and supporting_phrases != ["No relevant phrase found."]:
-                doc.add_heading("Supporting Citations", 3)
+            # Process each analysis section
+            for section_idx, (section_key, section_data) in enumerate(analysis_sections):
+                if section_idx > 0:
+                    doc.add_page_break()
+                # Add section heading
+                section_name = section_key.replace("_", " ").title()
+                doc.add_heading(section_name, 2)
 
-                for phrase in supporting_phrases:
-                    # Get verification info from the file_result data
-                    data_rows = []
-                    try:
-                        file_data = file_result.get("data", [])
-                        if isinstance(file_data, list):
-                            data_rows = [row for row in file_data
-                                        if isinstance(row, dict) and row.get("Supporting Phrase") == phrase]
-                    except Exception as e:
-                        logger.error(f"Error getting data rows for phrase '{phrase}': {e}")
+                # Add analysis text
+                if section_data.get("Analysis"):
+                    p = doc.add_paragraph()
+                    label_run = p.add_run("Analysis: ")
+                    label_run.bold = True
+                    add_markdown_runs(p, section_data.get("Analysis"))
 
-                    if data_rows:
-                        try:
-                            data_row = data_rows[0]
-                            # Check if Verified is "Yes" or True
-                            verified_value = data_row.get("Verified")
-                            if isinstance(verified_value, str):
-                                is_verified = verified_value.lower() == "yes"
-                            elif isinstance(verified_value, bool):
-                                is_verified = verified_value
-                            else:
-                                is_verified = False
+                # Add context if available
+                if section_data.get("Context"):
+                    p = doc.add_paragraph()
+                    label_run = p.add_run("Context: ")
+                    label_run.bold = True
+                    add_markdown_runs(p, section_data.get("Context"))
 
-                            # Get page number info
-                            page_num_info = data_row.get("Page", "Unknown")
+                # Add supporting phrases
+                supporting_phrases = section_data.get("Supporting_Phrases", [])
+                if supporting_phrases and supporting_phrases != ["No relevant phrase found."]:
+                    doc.add_heading("Supporting Citations", 3)
 
-                            # Get score info
-                            score_info = data_row.get("Match Score", "N/A")
-                        except Exception as e:
-                            logger.error(f"Error extracting verification info from data row: {e}")
-                            is_verified = False
-                            page_num_info = "Unknown"
-                            score_info = "N/A"
-                    else:
+                    for phrase in supporting_phrases:
+                        # Base verification info from flattened rows
                         is_verified = False
                         page_num_info = "Unknown"
                         score_info = "N/A"
 
-                    # Add the phrase with verification status
-                    p = doc.add_paragraph()
-                    if is_verified:
-                        p.add_run("✓ ").bold = True
-                        p.add_run(phrase)
-                        details_run = p.add_run(f" (Pg: {page_num_info}, Score: {score_info})")
-                        details_run.italic = True
-                        details_run.font.size = Pt(9)
-                    else:
-                        p.add_run("❓ ").bold = True
-                        p.add_run(phrase)
-                        details_run = p.add_run(" (Not verified in document)")
-                        details_run.italic = True
-                        details_run.font.size = Pt(9)
+                        try:
+                            file_data = file_result.get("data", [])
+                            if isinstance(file_data, list):
+                                data_rows = [row for row in file_data if isinstance(row, dict) and row.get("Supporting Phrase") == phrase]
+                            else:
+                                data_rows = []
+                        except Exception as e:
+                            logger.error(f"Error getting data rows for phrase '{phrase}': {e}")
+                            data_rows = []
 
-            # Add a separator after each section
-            doc.add_paragraph("---")
+                        if data_rows:
+                            try:
+                                data_row = data_rows[0]
+                                verified_value = data_row.get("Verified")
+                                if isinstance(verified_value, str):
+                                    is_verified = verified_value.lower() == "yes"
+                                elif isinstance(verified_value, bool):
+                                    is_verified = verified_value
 
-        # Add a page break after each file
-        doc.add_page_break()
+                                page_num_info = data_row.get("Page", "Unknown")
+                                score_info = data_row.get("Match Score", "N/A")
+                            except Exception as e:
+                                logger.error(f"Error extracting verification info from data row: {e}")
+
+                        phrase_info = phrase_details_map.get(phrase, {}) if isinstance(phrase_details_map, dict) else {}
+                        candidate_locations = phrase_info.get("candidate_locations") if isinstance(phrase_info, dict) else None
+                        if not candidate_locations:
+                            candidate_locations = normalize_candidate_locations(phrase_locations_map.get(phrase))
+
+                        best_location = phrase_info.get("best_location") if isinstance(phrase_info, dict) else None
+                        if not best_location:
+                            best_location = pick_best_location(candidate_locations or [])
+
+                        if isinstance(phrase_info, dict) and "verified" in phrase_info:
+                            is_verified = bool(phrase_info.get("verified"))
+
+                        if best_location:
+                            page_val = best_location.get("page_num")
+                            if isinstance(page_val, int):
+                                page_num_info = f"Page {page_val + 1}"
+                            elif page_val is not None:
+                                page_num_info = f"Page {page_val}"
+
+                            match_val = best_location.get("match_score")
+                            if match_val:
+                                try:
+                                    score_info = f"{float(match_val):.1f}%"
+                                except Exception:
+                                    score_info = str(match_val)
+
+                        # Add the phrase with verification status
+                        p = doc.add_paragraph()
+                        if is_verified:
+                            p.add_run("✓ ").bold = True
+                            p.add_run(phrase)
+                            details_run = p.add_run(f" (Pg: {page_num_info}, Score: {score_info})")
+                            details_run.italic = True
+                            details_run.font.size = Pt(9)
+                        else:
+                            p.add_run("❓ ").bold = True
+                            p.add_run(phrase)
+                            details_run = p.add_run(" (Not verified in document)")
+                            details_run.italic = True
+                            details_run.font.size = Pt(9)
+
+                        # Attach a citation snapshot when possible.
+                        snapshot_bytes = extract_clip_image(annotated_pdf_doc, best_location) if best_location else None
+                        if snapshot_bytes:
+                            try:
+                                img_stream = BytesIO(snapshot_bytes)
+                                img_paragraph = doc.add_paragraph()
+                                img_run = img_paragraph.add_run()
+                                img_run.add_picture(img_stream, width=Inches(3.0))
+                                caption = doc.add_paragraph("Excerpt from annotated PDF")
+                                try:
+                                    caption.style = "Caption"
+                                except KeyError:
+                                    pass
+                            except Exception as img_err:
+                                logger.error(f"Error attaching citation snapshot for phrase '{phrase}': {img_err}")
+
+        finally:
+            if annotated_pdf_doc:
+                try:
+                    annotated_pdf_doc.close()
+                except Exception:
+                    pass
+
+        # Ensure separation between files when more remain
+        if file_index < total_files - 1:
+            doc.add_page_break()
 
     # Add Follow-up Q&A section if any exist
     followup_qa = st.session_state.get("followup_qa", [])

@@ -26,7 +26,7 @@ Trigger Keyword Mode when ALL of the following are true:
 
 Do NOT use Keyword Mode when the prompt requires interpretation, synthesis, summarization, or reasoning beyond literal keyword matches.
 
-If you choose Keyword Mode you MUST also emit the explicit keywords that should be searched.
+If you choose Keyword Mode you MUST also emit the explicit keywords that should be searched and group related synonyms together.
 
 Return your answer as a single JSON object with the keys:
 - "keyword_mode": boolean
@@ -38,23 +38,24 @@ Return your answer as a single JSON object with the keys:
 Break down the prompt into a list of self-contained, individual questions or tasks. For each task, provide:
 1. A concise, descriptive title (max 5-6 words)
 2. The full sub-prompt text
-3. Optimal RAG (Retrieval-Augmented Generation) parameters for document retrieval
+3. Retrieval guidance inside a `rag_params` object
+4. Optional `keywords` array when the retrieval mode requires literal matching
 
-RAG Parameters Guidelines:
-- For keyword-based queries (MT599 Swift, specific codes, exact terms): Use higher BM25 weight (0.7-0.8) for precise keyword matching
-- For general legal/financial queries: Use balanced weights (BM25: 0.5, semantic: 0.5)
-- For conceptual/interpretive queries: Use higher semantic weight (0.6-0.7) for meaning-based retrieval
-- For technical terminology queries: Use slightly higher BM25 weight (0.6) for precise terms
-- BM25 weight + semantic weight should always equal 1.0
-- Provide brief reasoning for your weight selection
+## Retrieval Mode & RAG Parameter Rules
 
-Your entire response MUST be a single JSON object with the keys described earlier. Each item in the "decomposition" list must have:
-- "title": string (the concise title)
-- "sub_prompt": string (the full sub-prompt text)
-- "rag_params": object with:
-  - "bm25_weight": number (0.0-1.0)
-  - "semantic_weight": number (0.0-1.0)
-  - "reasoning": string (brief explanation)
+Each `rag_params` MUST include:
+- "retrieval_mode": one of ["hybrid", "semantic", "bm25_dominant", "keyword"]
+- "bm25_weight": number (0.0-1.0)
+- "semantic_weight": number (0.0-1.0)
+- "reasoning": string explaining why you selected these parameters
+
+Use these heuristics:
+- "hybrid": Balanced semantic and keyword retrieval for broad questions (bm25 ≈ 0.5, semantic ≈ 0.5)
+- "semantic": Meaning-focused interpretation or analysis (bm25 ≈ 0.3-0.4, semantic ≈ 0.6-0.7)
+- "bm25_dominant": Precise terminology or numeric lookups where keywords still matter (bm25 ≈ 0.6-0.7, semantic ≈ 0.3-0.4)
+- "keyword": Deterministic keyword-only lookups. Force bm25_weight = 1.0, semantic_weight = 0.0, and include an explicit `keywords` array on the sub-prompt containing the exact strings to search.
+
+Always ensure bm25_weight + semantic_weight = 1.0 (allowing minor rounding). If you choose "keyword" retrieval there should be no semantic weight.
 
 Do not include any explanations, introductory text, or markdown formatting outside the JSON structure.
 
@@ -65,48 +66,52 @@ What is the loan amount and currency?"
 
 Example JSON Output:
 {
-  "keyword_mode": false,
-  "keyword_reasoning": "Prompt requests broader analysis, not literal matches",
-  "keywords": [],
-  "user_request_context": "",
-  "decomposition": [
-    {
-      "title": "Lawful Loan Currency",
-      "sub_prompt": "What is the defined / lawful loan currency?",
-      "rag_params": {
-        "bm25_weight": 0.6,
-        "semantic_weight": 0.4,
-        "reasoning": "Legal terminology query benefits from keyword precision"
-      }
-    },
-    {
-      "title": "Availability Period Duration",
-      "sub_prompt": "What is the duration of the availability period?",
-      "rag_params": {
-        "bm25_weight": 0.5,
-        "semantic_weight": 0.5,
-        "reasoning": "Balanced approach for standard financial term"
-      }
-    },
-    {
-      "title": "Loan Amount",
-      "sub_prompt": "What is the loan amount?",
-      "rag_params": {
-        "bm25_weight": 0.6,
-        "semantic_weight": 0.4,
-        "reasoning": "Specific numerical data requires keyword matching"
-      }
-    },
-    {
-      "title": "Loan Currency",
-      "sub_prompt": "What is the loan currency?",
-      "rag_params": {
-        "bm25_weight": 0.6,
-        "semantic_weight": 0.4,
-        "reasoning": "Currency codes are exact terms requiring keyword search"
-      }
-    }
-  ]
+    "keyword_mode": false,
+    "keyword_reasoning": "Prompt requests broader analysis, not literal matches",
+    "keywords": [],
+    "user_request_context": "",
+    "decomposition": [
+        {
+            "title": "Lawful Loan Currency",
+            "sub_prompt": "What is the defined / lawful loan currency?",
+            "rag_params": {
+                "retrieval_mode": "semantic",
+                "bm25_weight": 0.4,
+                "semantic_weight": 0.6,
+                "reasoning": "Interpretive legal language benefits from meaning-driven retrieval"
+            }
+        },
+        {
+            "title": "Availability Period Duration",
+            "sub_prompt": "What is the duration of the availability period?",
+            "rag_params": {
+                "retrieval_mode": "hybrid",
+                "bm25_weight": 0.5,
+                "semantic_weight": 0.5,
+                "reasoning": "Standard financial term with both keyword and semantic signals"
+            }
+        },
+        {
+            "title": "Loan Amount",
+            "sub_prompt": "What is the loan amount?",
+            "rag_params": {
+                "retrieval_mode": "bm25_dominant",
+                "bm25_weight": 0.6,
+                "semantic_weight": 0.4,
+                "reasoning": "Numeric lookup favours precise keyword retrieval"
+            }
+        },
+        {
+            "title": "Loan Currency",
+            "sub_prompt": "What is the loan currency?",
+            "rag_params": {
+                "retrieval_mode": "bm25_dominant",
+                "bm25_weight": 0.6,
+                "semantic_weight": 0.4,
+                "reasoning": "Currency codes are exact terms suited to keyword matching"
+            }
+        }
+    ]
 }
 
 Example Input Prompt:
@@ -114,30 +119,32 @@ Example Input Prompt:
 
 Example JSON Output:
 {
-  "keyword_mode": false,
-  "keyword_reasoning": "Requires interpretive legal analysis",
-  "keywords": [],
-  "user_request_context": "",
-  "decomposition": [
-    {
-      "title": "Termination Clause Analysis",
-      "sub_prompt": "Analyze the termination clause in the loan agreement.",
-      "rag_params": {
-        "bm25_weight": 0.4,
-        "semantic_weight": 0.6,
-        "reasoning": "Conceptual legal analysis benefits from semantic understanding"
-      }
-    },
-    {
-      "title": "Liability Limitations Analysis",
-      "sub_prompt": "Analyze the liability limitations in the loan agreement.",
-      "rag_params": {
-        "bm25_weight": 0.4,
-        "semantic_weight": 0.6,
-        "reasoning": "Interpretive legal query requires semantic retrieval"
-      }
-    }
-  ]
+    "keyword_mode": false,
+    "keyword_reasoning": "Requires interpretive legal analysis",
+    "keywords": [],
+    "user_request_context": "",
+    "decomposition": [
+        {
+            "title": "Termination Clause Analysis",
+            "sub_prompt": "Analyze the termination clause in the loan agreement.",
+            "rag_params": {
+                "retrieval_mode": "semantic",
+                "bm25_weight": 0.3,
+                "semantic_weight": 0.7,
+                "reasoning": "Conceptual legal analysis benefits from semantic understanding"
+            }
+        },
+        {
+            "title": "Liability Limitations Analysis",
+            "sub_prompt": "Analyze the liability limitations in the loan agreement.",
+            "rag_params": {
+                "retrieval_mode": "semantic",
+                "bm25_weight": 0.3,
+                "semantic_weight": 0.7,
+                "reasoning": "Interpretive legal query requires semantic retrieval"
+            }
+        }
+    ]
 }
 
 Example Input Prompt:
@@ -145,30 +152,34 @@ Example Input Prompt:
 
 Example JSON Output:
 {
-  "keyword_mode": true,
-  "keyword_reasoning": "Prompt is focused on specific SWIFT terminology",
-  "keywords": ["MT599", "Field 79"],
-  "user_request_context": "",
-  "decomposition": [
-    {
-      "title": "MT599 Swift Format",
-      "sub_prompt": "What is the MT599 Swift message format?",
-      "rag_params": {
-        "bm25_weight": 0.8,
-        "semantic_weight": 0.2,
-        "reasoning": "MT599 Swift is highly specific terminology requiring exact keyword matching"
-      }
-    },
-    {
-      "title": "Field 79 Content",
-      "sub_prompt": "What is the content of field 79?",
-      "rag_params": {
-        "bm25_weight": 0.75,
-        "semantic_weight": 0.25,
-        "reasoning": "Specific field number requires precise keyword search"
-      }
-    }
-  ]
+    "keyword_mode": true,
+    "keyword_reasoning": "Prompt is focused on specific SWIFT terminology",
+    "keywords": ["MT599", ["Field 79", "Field 79a"]],
+    "user_request_context": "",
+    "decomposition": [
+        {
+            "title": "MT599 Swift Format",
+            "sub_prompt": "What is the MT599 Swift message format?",
+            "rag_params": {
+                "retrieval_mode": "keyword",
+                "bm25_weight": 1.0,
+                "semantic_weight": 0.0,
+                "reasoning": "MT599 is an exact form identifier best served by keyword search"
+            },
+            "keywords": ["MT599", "MT 599"]
+        },
+        {
+            "title": "Field 79 Content",
+            "sub_prompt": "What is the content of field 79?",
+            "rag_params": {
+                "retrieval_mode": "keyword",
+                "bm25_weight": 1.0,
+                "semantic_weight": 0.0,
+                "reasoning": "Field numbers require deterministic keyword matching"
+            },
+            "keywords": ["Field 79", "79:"]
+        }
+    ]
 }
 
 Example Input Prompt:
@@ -176,30 +187,32 @@ Example Input Prompt:
 
 Example JSON Output:
 {
-  "keyword_mode": false,
-  "keyword_reasoning": "Requires numerical comparison and interpretation",
-  "keywords": [],
-  "user_request_context": "",
-  "decomposition": [
-    {
-      "title": "Loan Interest Rates",
-      "sub_prompt": "What are the interest rates for this loan?",
-      "rag_params": {
-        "bm25_weight": 0.6,
-        "semantic_weight": 0.4,
-        "reasoning": "Numerical financial data requires keyword precision"
-      }
-    },
-    {
-      "title": "Loan Fees",
-      "sub_prompt": "What are the fees for this loan?",
-      "rag_params": {
-        "bm25_weight": 0.6,
-        "semantic_weight": 0.4,
-        "reasoning": "Specific fee information benefits from keyword matching"
-      }
-    }
-  ]
+    "keyword_mode": false,
+    "keyword_reasoning": "Requires numerical comparison and interpretation",
+    "keywords": [],
+    "user_request_context": "",
+    "decomposition": [
+        {
+            "title": "Loan Interest Rates",
+            "sub_prompt": "What are the interest rates for this loan?",
+            "rag_params": {
+                "retrieval_mode": "bm25_dominant",
+                "bm25_weight": 0.6,
+                "semantic_weight": 0.4,
+                "reasoning": "Numerical financial data requires keyword precision"
+            }
+        },
+        {
+            "title": "Loan Fees",
+            "sub_prompt": "What are the fees for this loan?",
+            "rag_params": {
+                "retrieval_mode": "bm25_dominant",
+                "bm25_weight": 0.6,
+                "semantic_weight": 0.4,
+                "reasoning": "Specific fee information benefits from keyword matching"
+            }
+        }
+    ]
 }
 """
 
@@ -224,6 +237,7 @@ Example JSON Output:
             "title": "Overall Analysis",
             "sub_prompt": user_prompt,
             "rag_params": {
+                "retrieval_mode": "hybrid",
                 "bm25_weight": 0.5,
                 "semantic_weight": 0.5,
                 "reasoning": "Default balanced weights due to decomposition failure"
@@ -298,6 +312,47 @@ Example JSON Output:
             seen_keywords.add(lowered_term)
             normalized_keywords.append(term)
 
+    def _normalize_retrieval_mode(value: Any) -> str:
+        if isinstance(value, str):
+            mode = value.strip().lower()
+        else:
+            mode = "hybrid"
+
+        if mode in {"keyword", "keyword_only", "keyword-mode", "exact", "bm25_only"}:
+            return "keyword"
+        if mode in {"semantic", "semantic_only", "semantic_dominant", "semantic-heavy"}:
+            return "semantic"
+        if mode in {"bm25", "bm25_dominant", "lexical", "bm25-heavy"}:
+            return "bm25_dominant"
+        return "hybrid"
+
+    def _collect_keywords_from_value(value: Any) -> List[str]:
+        collected: List[str] = []
+
+        def _handle(candidate: Any) -> None:
+            if isinstance(candidate, str):
+                collected.extend(_split_synonyms_if_needed(candidate))
+            elif isinstance(candidate, (list, tuple, set)):
+                for item in candidate:
+                    _handle(item)
+            elif isinstance(candidate, dict):
+                collected.extend(_extract_terms_from_dict(candidate))
+
+        _handle(value)
+
+        unique_terms: List[str] = []
+        seen_terms: Set[str] = set()
+        for term in collected:
+            cleaned = _clean_keyword_text(term)
+            if not cleaned:
+                continue
+            lowered = cleaned.lower()
+            if lowered in seen_terms:
+                continue
+            seen_terms.add(lowered)
+            unique_terms.append(cleaned)
+        return unique_terms
+
     try:
         response_content = await analyzer._get_completion(messages, model_name=DECOMPOSITION_MODEL_NAME)
 
@@ -337,22 +392,32 @@ Example JSON Output:
                             logger.warning("Skipping decomposition item with empty title or sub_prompt")
                             continue
 
-                        if "rag_params" not in item or not isinstance(item["rag_params"], dict):
+                        rag_params = item.get("rag_params")
+                        if not isinstance(rag_params, dict):
                             logger.warning("Missing or invalid rag_params for '%s', using defaults", item["title"])
-                            item["rag_params"] = {
+                            rag_params = {
+                                "retrieval_mode": "hybrid",
                                 "bm25_weight": 0.5,
                                 "semantic_weight": 0.5,
                                 "reasoning": "Default balanced weights (rag_params missing from LLM response)"
                             }
+                            item["rag_params"] = rag_params
+
+                        retrieval_mode_value = _normalize_retrieval_mode(rag_params.get("retrieval_mode"))
+                        bm25_weight = rag_params.get("bm25_weight", 0.5)
+                        semantic_weight = rag_params.get("semantic_weight", 0.5)
+
+                        try:
+                            bm25_weight = float(bm25_weight)
+                            semantic_weight = float(semantic_weight)
+                        except (ValueError, TypeError) as err:
+                            logger.warning("Invalid RAG weight types for '%s': %s. Using defaults.", item["title"], err)
+                            bm25_weight = 1.0 if retrieval_mode_value == "keyword" else 0.5
+                            semantic_weight = 0.0 if retrieval_mode_value == "keyword" else 0.5
                         else:
-                            rag_params = item["rag_params"]
-                            bm25_weight = rag_params.get("bm25_weight", 0.5)
-                            semantic_weight = rag_params.get("semantic_weight", 0.5)
-
-                            try:
-                                bm25_weight = float(bm25_weight)
-                                semantic_weight = float(semantic_weight)
-
+                            if retrieval_mode_value == "keyword":
+                                bm25_weight, semantic_weight = 1.0, 0.0
+                            else:
                                 if not (0.0 <= bm25_weight <= 1.0) or not (0.0 <= semantic_weight <= 1.0):
                                     logger.warning(
                                         "RAG weights out of range for '%s': bm25=%s, semantic=%s. Using defaults.",
@@ -375,27 +440,50 @@ Example JSON Output:
                                     else:
                                         bm25_weight, semantic_weight = 0.5, 0.5
 
-                                item["rag_params"]["bm25_weight"] = bm25_weight
-                                item["rag_params"]["semantic_weight"] = semantic_weight
+                        rag_params["bm25_weight"] = bm25_weight
+                        rag_params["semantic_weight"] = semantic_weight
+                        rag_params["retrieval_mode"] = retrieval_mode_value
 
-                                if "reasoning" not in rag_params or not isinstance(rag_params.get("reasoning"), str):
-                                    item["rag_params"]["reasoning"] = "No reasoning provided"
+                        if "reasoning" not in rag_params or not isinstance(rag_params.get("reasoning"), str):
+                            rag_params["reasoning"] = "No reasoning provided"
 
-                                logger.info(
-                                    "RAG params for '%s': BM25=%.2f, Semantic=%.2f, Reasoning: %s",
-                                    item["title"],
-                                    bm25_weight,
-                                    semantic_weight,
-                                    rag_params.get("reasoning", "N/A"),
-                                )
+                        logger.info(
+                            "RAG params for '%s': mode=%s, BM25=%.2f, Semantic=%.2f, Reasoning: %s",
+                            item["title"],
+                            retrieval_mode_value,
+                            bm25_weight,
+                            semantic_weight,
+                            rag_params.get("reasoning", "N/A"),
+                        )
 
-                            except (ValueError, TypeError) as err:
-                                logger.warning("Invalid RAG weight types for '%s': %s. Using defaults.", item["title"], err)
-                                item["rag_params"] = {
-                                    "bm25_weight": 0.5,
-                                    "semantic_weight": 0.5,
-                                    "reasoning": "Default balanced weights (invalid weight values from LLM)"
-                                }
+                        keyword_candidates: List[str] = []
+                        for key in ("keywords", "keyword_terms", "keyword_list", "keyword_synonyms"):
+                            if key in item:
+                                keyword_candidates.extend(_collect_keywords_from_value(item.get(key)))
+
+                        if isinstance(rag_params.get("keywords"), (list, tuple, set, dict, str)):
+                            keyword_candidates.extend(_collect_keywords_from_value(rag_params.get("keywords")))
+                            rag_params.pop("keywords", None)
+
+                        deduped_keywords: List[str] = []
+                        seen_keyword_terms_local: Set[str] = set()
+                        for candidate in keyword_candidates:
+                            cleaned_candidate = _clean_keyword_text(candidate)
+                            if not cleaned_candidate:
+                                continue
+                            lowered_candidate = cleaned_candidate.lower()
+                            if lowered_candidate in seen_keyword_terms_local:
+                                continue
+                            seen_keyword_terms_local.add(lowered_candidate)
+                            deduped_keywords.append(cleaned_candidate)
+
+                        item["keywords"] = deduped_keywords
+
+                        if retrieval_mode_value == "keyword" and not deduped_keywords:
+                            logger.warning(
+                                "retrieval_mode 'keyword' selected for '%s' but no keywords were extracted.",
+                                item["title"],
+                            )
 
                         valid_items.append(item)
 

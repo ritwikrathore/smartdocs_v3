@@ -156,8 +156,9 @@ def display_analysis_results(results: List[Dict[str, Any]]):
                         # Display analysis sections
                         analysis_sections = ai_analysis.get("analysis_sections", {})
                         citation_counter = 0  # For numbering citations within a tab
-                        is_keyword_mode_result = bool(result.get("keyword_mode"))
                         keyword_mode_sections = result.get("keyword_mode_sections", {}) or {}
+                        has_keyword_sections = isinstance(keyword_mode_sections, dict) and bool(keyword_mode_sections)
+                        is_keyword_mode_result = bool(result.get("keyword_mode")) or has_keyword_sections
 
                         for section_key, section_data in analysis_sections.items():
                             # Extract the actual title from the section key (removing "section_n_" prefix)
@@ -171,7 +172,7 @@ def display_analysis_results(results: List[Dict[str, Any]]):
                             # Format section name for display
                             display_section_name = section_title.replace("_", " ").title()
                             keyword_section_details = None
-                            if is_keyword_mode_result and isinstance(keyword_mode_sections, dict):
+                            if has_keyword_sections:
                                 keyword_section_details = keyword_mode_sections.get(section_key)
                                 if isinstance(keyword_section_details, dict):
                                     keyword_label = keyword_section_details.get("keyword")

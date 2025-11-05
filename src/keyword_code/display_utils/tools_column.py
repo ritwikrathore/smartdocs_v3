@@ -126,6 +126,7 @@ def display_tools_column(results_with_real_analysis: List, tools_col):
 
                     # Prepare a list of flattened data for this file
                     file_data = []
+                    phrase_details: Dict[str, Any] = {}
 
                     for section_key, section_data in ai_analysis.get("analysis_sections", {}).items():
                         section_name = section_key.replace("_", " ").title()
@@ -181,12 +182,36 @@ def display_tools_column(results_with_real_analysis: List, tools_col):
                                         return (method_priority.get(method, -1), score_val)
 
                                     best_location = max(candidate_locs, key=loc_key)
+                                    phrase_details.setdefault(phrase, {})["candidate_locations"] = candidate_locs
+                                else:
+                                    phrase_details.setdefault(phrase, {})["candidate_locations"] = []
 
                                 # Calculate page number
                                 if isinstance(best_location, dict) and "page_num" in best_location:
                                     page_num = best_location.get("page_num", -1) + 1
                                 else:
                                     page_num = "Unknown"
+
+                                # Determine match score display value
+                                match_score_value = None
+                                if isinstance(best_location, dict):
+                                    match_score_value = best_location.get("match_score")
+                                if match_score_value is None:
+                                    match_score_value = score
+
+                                if match_score_value:
+                                    try:
+                                        match_score_display = f"{float(match_score_value):.1f}%"
+                                    except Exception:
+                                        match_score_display = str(match_score_value)
+                                else:
+                                    match_score_display = "N/A"
+
+                                phrase_details.setdefault(phrase, {}).update({
+                                    "verified": is_verified,
+                                    "best_location": best_location,
+                                    "match_score": match_score_value,
+                                })
 
                                 file_data.append({
                                     "Filename": filename,
@@ -196,14 +221,17 @@ def display_tools_column(results_with_real_analysis: List, tools_col):
                                     "Supporting Phrase": phrase,
                                     "Verified": "Yes" if is_verified else "No",
                                     "Page": page_num,
-                                    "Match Score": f"{score:.1f}%" if score else "N/A"
+                                    "Match Score": match_score_display
                                 })
 
                     # Add this file's data to the exportable results
                     exportable_results_list.append({
                         "filename": filename,
                         "data": file_data,
-                        "analysis": ai_analysis
+                        "analysis": ai_analysis,
+                        "phrase_details": phrase_details,
+                        "phrase_locations": phrase_locations,
+                        "annotated_pdf": result.get("annotated_pdf")
                     })
 
                 # Excel Export

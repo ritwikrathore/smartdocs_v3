@@ -456,7 +456,11 @@ def process_rag_requests(results: list[dict[str, any]]) -> tuple[list[dict[str, 
                     requests_processed = True
                     try:
                         result_meta = request_data.get("result", {}) or {}
-                        if isinstance(result_meta, dict) and result_meta.get("keyword_mode"):
+                        keyword_sections_meta = result_meta.get("keyword_mode_sections") if isinstance(result_meta, dict) else {}
+                        is_keyword_result = isinstance(result_meta, dict) and bool(result_meta.get("keyword_mode"))
+                        section_is_keyword = isinstance(keyword_sections_meta, dict) and section_key in keyword_sections_meta
+
+                        if is_keyword_result or section_is_keyword:
                             st.session_state.rag_retry_requests[section_key]["status"] = "skipped_keyword_mode"
                             logger.info(
                                 "Skipping RAG retry for section %s because keyword mode does not support retrials",
