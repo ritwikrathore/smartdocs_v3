@@ -276,7 +276,7 @@ class DatabricksRerankerModel:
             return np.zeros(len(sentence_pairs))
 
 
-@st.cache_resource
+@st.cache_resource(show_spinner="Sharpening our clue detectors 🕵️‍♀️...")
 def load_databricks_reranker_model() -> Optional[object]:
     """
     Loads and caches the Databricks reranker model with timeout and fallback support.

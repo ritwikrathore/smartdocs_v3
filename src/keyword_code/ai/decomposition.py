@@ -354,213 +354,199 @@ Example JSON Output:
         return unique_terms
 
     try:
-        response_content = await analyzer._get_completion(messages, model_name=DECOMPOSITION_MODEL_NAME)
-
         try:
-            cleaned_response = response_content.strip()
-            match = re.search(r"```json\s*(\{.*?\})\s*```", cleaned_response, re.DOTALL)
-            if match:
-                json_str = match.group(1)
-            elif cleaned_response.startswith("{") and cleaned_response.endswith("}"):
-                json_str = cleaned_response
-            else:
-                first_brace = cleaned_response.find("{")
-                last_brace = cleaned_response.rfind("}")
-                if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
-                    json_str = cleaned_response[first_brace:last_brace + 1]
-                    logger.warning("Used basic brace finding for JSON extraction in decomposition.")
-                else:
-                    raise json.JSONDecodeError("Could not find JSON structure.", cleaned_response, 0)
-
-            parsed_json = json.loads(json_str)
-
-            if isinstance(parsed_json, dict) and "decomposition" in parsed_json:
-                decomposition_list = parsed_json["decomposition"]
-                if isinstance(decomposition_list, list):
-                    valid_items: List[Dict[str, Any]] = []
-
-                    for item in decomposition_list:
-                        if not isinstance(item, dict) or "title" not in item or "sub_prompt" not in item:
-                            logger.warning("Skipping invalid decomposition item (missing title or sub_prompt): %s", item)
-                            continue
-
-                        if not isinstance(item["title"], str) or not isinstance(item["sub_prompt"], str):
-                            logger.warning("Skipping invalid decomposition item (non-string title or sub_prompt): %s", item)
-                            continue
-
-                        if not item["title"].strip() or not item["sub_prompt"].strip():
-                            logger.warning("Skipping decomposition item with empty title or sub_prompt")
-                            continue
-
-                        rag_params = item.get("rag_params")
-                        if not isinstance(rag_params, dict):
-                            logger.warning("Missing or invalid rag_params for '%s', using defaults", item["title"])
-                            rag_params = {
-                                "retrieval_mode": "hybrid",
-                                "bm25_weight": 0.5,
-                                "semantic_weight": 0.5,
-                                "reasoning": "Default balanced weights (rag_params missing from LLM response)"
-                            }
-                            item["rag_params"] = rag_params
-
-                        retrieval_mode_value = _normalize_retrieval_mode(rag_params.get("retrieval_mode"))
-                        bm25_weight = rag_params.get("bm25_weight", 0.5)
-                        semantic_weight = rag_params.get("semantic_weight", 0.5)
-
-                        try:
-                            bm25_weight = float(bm25_weight)
-                            semantic_weight = float(semantic_weight)
-                        except (ValueError, TypeError) as err:
-                            logger.warning("Invalid RAG weight types for '%s': %s. Using defaults.", item["title"], err)
-                            bm25_weight = 1.0 if retrieval_mode_value == "keyword" else 0.5
-                            semantic_weight = 0.0 if retrieval_mode_value == "keyword" else 0.5
-                        else:
-                            if retrieval_mode_value == "keyword":
-                                bm25_weight, semantic_weight = 1.0, 0.0
-                            else:
-                                if not (0.0 <= bm25_weight <= 1.0) or not (0.0 <= semantic_weight <= 1.0):
-                                    logger.warning(
-                                        "RAG weights out of range for '%s': bm25=%s, semantic=%s. Using defaults.",
-                                        item["title"],
-                                        bm25_weight,
-                                        semantic_weight,
-                                    )
-                                    bm25_weight, semantic_weight = 0.5, 0.5
-
-                                weight_sum = bm25_weight + semantic_weight
-                                if abs(weight_sum - 1.0) > 0.01:
-                                    logger.warning(
-                                        "RAG weights don't sum to 1.0 for '%s' (sum=%.3f). Normalizing.",
-                                        item["title"],
-                                        weight_sum,
-                                    )
-                                    if weight_sum > 0:
-                                        bm25_weight = bm25_weight / weight_sum
-                                        semantic_weight = semantic_weight / weight_sum
-                                    else:
-                                        bm25_weight, semantic_weight = 0.5, 0.5
-
-                        rag_params["bm25_weight"] = bm25_weight
-                        rag_params["semantic_weight"] = semantic_weight
-                        rag_params["retrieval_mode"] = retrieval_mode_value
-
-                        if "reasoning" not in rag_params or not isinstance(rag_params.get("reasoning"), str):
-                            rag_params["reasoning"] = "No reasoning provided"
-
-                        logger.info(
-                            "RAG params for '%s': mode=%s, BM25=%.2f, Semantic=%.2f, Reasoning: %s",
-                            item["title"],
-                            retrieval_mode_value,
-                            bm25_weight,
-                            semantic_weight,
-                            rag_params.get("reasoning", "N/A"),
-                        )
-
-                        keyword_candidates: List[str] = []
-                        for key in ("keywords", "keyword_terms", "keyword_list", "keyword_synonyms"):
-                            if key in item:
-                                keyword_candidates.extend(_collect_keywords_from_value(item.get(key)))
-
-                        if isinstance(rag_params.get("keywords"), (list, tuple, set, dict, str)):
-                            keyword_candidates.extend(_collect_keywords_from_value(rag_params.get("keywords")))
-                            rag_params.pop("keywords", None)
-
-                        deduped_keywords: List[str] = []
-                        seen_keyword_terms_local: Set[str] = set()
-                        for candidate in keyword_candidates:
-                            cleaned_candidate = _clean_keyword_text(candidate)
-                            if not cleaned_candidate:
-                                continue
-                            lowered_candidate = cleaned_candidate.lower()
-                            if lowered_candidate in seen_keyword_terms_local:
-                                continue
-                            seen_keyword_terms_local.add(lowered_candidate)
-                            deduped_keywords.append(cleaned_candidate)
-
-                        item["keywords"] = deduped_keywords
-
-                        if retrieval_mode_value == "keyword" and not deduped_keywords:
-                            logger.warning(
-                                "retrieval_mode 'keyword' selected for '%s' but no keywords were extracted.",
-                                item["title"],
-                            )
-
-                        valid_items.append(item)
-
-                    if not valid_items:
-                        logger.warning("Decomposition resulted in an empty list after filtering. Falling back.")
-                        return fallback_result
-
-                    keyword_mode_value = bool(parsed_json.get("keyword_mode", False))
-                    raw_keywords = parsed_json.get("keywords", [])
-                    keyword_reasoning = parsed_json.get("keyword_reasoning")
-                    user_request_context = parsed_json.get("user_request_context", "")
-
-                    if not isinstance(user_request_context, str):
-                        user_request_context = ""
-                    else:
-                        user_request_context = user_request_context.strip()
-
-                    keyword_groups: List[List[str]] = []
-                    normalized_keywords: List[str] = []
-                    seen_keywords: Set[str] = set()
-
-                    if isinstance(raw_keywords, list):
-                        for entry in raw_keywords:
-                            group_terms: List[str] = []
-                            if isinstance(entry, str):
-                                group_terms.extend(_split_synonyms_if_needed(entry))
-                            elif isinstance(entry, list):
-                                local_seen: Set[str] = set()
-                                for candidate in entry:
-                                    for term in _split_synonyms_if_needed(candidate):
-                                        lowered = term.lower()
-                                        if lowered in local_seen:
-                                            continue
-                                        local_seen.add(lowered)
-                                        group_terms.append(term)
-                            elif isinstance(entry, dict):
-                                group_terms.extend(_extract_terms_from_dict(entry))
-
-                            if group_terms:
-                                _add_keyword_group(group_terms, keyword_groups, normalized_keywords, seen_keywords)
-                    elif isinstance(raw_keywords, str):
-                        _add_keyword_group(_split_synonyms_if_needed(raw_keywords), keyword_groups, normalized_keywords, seen_keywords)
-
-                    if keyword_mode_value and not normalized_keywords:
-                        logger.warning("keyword_mode was true but no valid keywords were returned. Forcing keyword_mode to false.")
-                        keyword_mode_value = False
-
-                    result_payload = {
-                        "keyword_mode": keyword_mode_value,
-                        "keyword_reasoning": keyword_reasoning or "LLM did not supply keyword reasoning.",
-                        "keywords": normalized_keywords,
-                        "keyword_groups": keyword_groups,
-                        "user_request_context": user_request_context,
-                        "decomposition": valid_items,
-                    }
-
-                    logger.info(
-                        "Successfully decomposed prompt into %d sub-prompts (keyword_mode=%s, keywords=%s, user_context_present=%s)",
-                        len(valid_items),
-                        keyword_mode_value,
-                        normalized_keywords,
-                        bool(user_request_context),
-                    )
-                    if keyword_groups:
-                        logger.debug("Keyword groups extracted: %s", keyword_groups)
-                    return result_payload
-
-                logger.warning("Decomposition JSON found, but 'decomposition' key is not a list. Falling back.")
-                return fallback_result
-
-            logger.warning("Decomposition JSON parsed, but missing 'decomposition' key or wrong structure. Falling back.")
-            return fallback_result
-
+            parsed_json = await analyzer._get_json_with_retries(
+                messages=messages,
+                model_name=DECOMPOSITION_MODEL_NAME,
+                context="ask mode prompt decomposition",
+            )
         except json.JSONDecodeError as json_err:
-            logger.error("Failed to parse decomposition response as JSON: %s. Raw response: %s", json_err, response_content)
+            logger.error("Failed to parse decomposition response as JSON after retries: %s", json_err)
             logger.warning("Falling back to using the original prompt due to JSON parsing error.")
             return fallback_result
+
+        if isinstance(parsed_json, dict) and "decomposition" in parsed_json:
+            decomposition_list = parsed_json["decomposition"]
+            if isinstance(decomposition_list, list):
+                valid_items: List[Dict[str, Any]] = []
+
+                for item in decomposition_list:
+                    if not isinstance(item, dict) or "title" not in item or "sub_prompt" not in item:
+                        logger.warning("Skipping invalid decomposition item (missing title or sub_prompt): %s", item)
+                        continue
+
+                    if not isinstance(item["title"], str) or not isinstance(item["sub_prompt"], str):
+                        logger.warning("Skipping invalid decomposition item (non-string title or sub_prompt): %s", item)
+                        continue
+
+                    if not item["title"].strip() or not item["sub_prompt"].strip():
+                        logger.warning("Skipping decomposition item with empty title or sub_prompt")
+                        continue
+
+                    rag_params = item.get("rag_params")
+                    if not isinstance(rag_params, dict):
+                        logger.warning("Missing or invalid rag_params for '%s', using defaults", item["title"])
+                        rag_params = {
+                            "retrieval_mode": "hybrid",
+                            "bm25_weight": 0.5,
+                            "semantic_weight": 0.5,
+                            "reasoning": "Default balanced weights (rag_params missing from LLM response)"
+                        }
+                        item["rag_params"] = rag_params
+
+                    retrieval_mode_value = _normalize_retrieval_mode(rag_params.get("retrieval_mode"))
+                    bm25_weight = rag_params.get("bm25_weight", 0.5)
+                    semantic_weight = rag_params.get("semantic_weight", 0.5)
+
+                    try:
+                        bm25_weight = float(bm25_weight)
+                        semantic_weight = float(semantic_weight)
+                    except (ValueError, TypeError) as err:
+                        logger.warning("Invalid RAG weight types for '%s': %s. Using defaults.", item["title"], err)
+                        bm25_weight = 1.0 if retrieval_mode_value == "keyword" else 0.5
+                        semantic_weight = 0.0 if retrieval_mode_value == "keyword" else 0.5
+                    else:
+                        if retrieval_mode_value == "keyword":
+                            bm25_weight, semantic_weight = 1.0, 0.0
+                        else:
+                            if not (0.0 <= bm25_weight <= 1.0) or not (0.0 <= semantic_weight <= 1.0):
+                                logger.warning(
+                                    "RAG weights out of range for '%s': bm25=%s, semantic=%s. Using defaults.",
+                                    item["title"],
+                                    bm25_weight,
+                                    semantic_weight,
+                                )
+                                bm25_weight, semantic_weight = 0.5, 0.5
+
+                            weight_sum = bm25_weight + semantic_weight
+                            if abs(weight_sum - 1.0) > 0.01:
+                                logger.warning(
+                                    "RAG weights don't sum to 1.0 for '%s' (sum=%.3f). Normalizing.",
+                                    item["title"],
+                                    weight_sum,
+                                )
+                                if weight_sum > 0:
+                                    bm25_weight = bm25_weight / weight_sum
+                                    semantic_weight = semantic_weight / weight_sum
+                                else:
+                                    bm25_weight, semantic_weight = 0.5, 0.5
+
+                    rag_params["bm25_weight"] = bm25_weight
+                    rag_params["semantic_weight"] = semantic_weight
+                    rag_params["retrieval_mode"] = retrieval_mode_value
+
+                    if "reasoning" not in rag_params or not isinstance(rag_params.get("reasoning"), str):
+                        rag_params["reasoning"] = "No reasoning provided"
+
+                    logger.info(
+                        "RAG params for '%s': mode=%s, BM25=%.2f, Semantic=%.2f, Reasoning: %s",
+                        item["title"],
+                        retrieval_mode_value,
+                        bm25_weight,
+                        semantic_weight,
+                        rag_params.get("reasoning", "N/A"),
+                    )
+
+                    keyword_candidates: List[str] = []
+                    for key in ("keywords", "keyword_terms", "keyword_list", "keyword_synonyms"):
+                        if key in item:
+                            keyword_candidates.extend(_collect_keywords_from_value(item.get(key)))
+
+                    if isinstance(rag_params.get("keywords"), (list, tuple, set, dict, str)):
+                        keyword_candidates.extend(_collect_keywords_from_value(rag_params.get("keywords")))
+                        rag_params.pop("keywords", None)
+
+                    deduped_keywords: List[str] = []
+                    seen_keyword_terms_local: Set[str] = set()
+                    for candidate in keyword_candidates:
+                        cleaned_candidate = _clean_keyword_text(candidate)
+                        if not cleaned_candidate:
+                            continue
+                        lowered_candidate = cleaned_candidate.lower()
+                        if lowered_candidate in seen_keyword_terms_local:
+                            continue
+                        seen_keyword_terms_local.add(lowered_candidate)
+                        deduped_keywords.append(cleaned_candidate)
+
+                    item["keywords"] = deduped_keywords
+
+                    if retrieval_mode_value == "keyword" and not deduped_keywords:
+                        logger.warning(
+                            "retrieval_mode 'keyword' selected for '%s' but no keywords were extracted.",
+                            item["title"],
+                        )
+
+                    valid_items.append(item)
+
+                if not valid_items:
+                    logger.warning("Decomposition resulted in an empty list after filtering. Falling back.")
+                    return fallback_result
+
+                keyword_mode_value = bool(parsed_json.get("keyword_mode", False))
+                raw_keywords = parsed_json.get("keywords", [])
+                keyword_reasoning = parsed_json.get("keyword_reasoning")
+                user_request_context = parsed_json.get("user_request_context", "")
+
+                if not isinstance(user_request_context, str):
+                    user_request_context = ""
+                else:
+                    user_request_context = user_request_context.strip()
+
+                keyword_groups: List[List[str]] = []
+                normalized_keywords: List[str] = []
+                seen_keywords: Set[str] = set()
+
+                if isinstance(raw_keywords, list):
+                    for entry in raw_keywords:
+                        group_terms: List[str] = []
+                        if isinstance(entry, str):
+                            group_terms.extend(_split_synonyms_if_needed(entry))
+                        elif isinstance(entry, list):
+                            local_seen: Set[str] = set()
+                            for candidate in entry:
+                                for term in _split_synonyms_if_needed(candidate):
+                                    lowered = term.lower()
+                                    if lowered in local_seen:
+                                        continue
+                                    local_seen.add(lowered)
+                                    group_terms.append(term)
+                        elif isinstance(entry, dict):
+                            group_terms.extend(_extract_terms_from_dict(entry))
+
+                        if group_terms:
+                            _add_keyword_group(group_terms, keyword_groups, normalized_keywords, seen_keywords)
+                elif isinstance(raw_keywords, str):
+                    _add_keyword_group(_split_synonyms_if_needed(raw_keywords), keyword_groups, normalized_keywords, seen_keywords)
+
+                if keyword_mode_value and not normalized_keywords:
+                    logger.warning("keyword_mode was true but no valid keywords were returned. Forcing keyword_mode to false.")
+                    keyword_mode_value = False
+
+                result_payload = {
+                    "keyword_mode": keyword_mode_value,
+                    "keyword_reasoning": keyword_reasoning or "LLM did not supply keyword reasoning.",
+                    "keywords": normalized_keywords,
+                    "keyword_groups": keyword_groups,
+                    "user_request_context": user_request_context,
+                    "decomposition": valid_items,
+                }
+
+                logger.info(
+                    "Successfully decomposed prompt into %d sub-prompts (keyword_mode=%s, keywords=%s, user_context_present=%s)",
+                    len(valid_items),
+                    keyword_mode_value,
+                    normalized_keywords,
+                    bool(user_request_context),
+                )
+                if keyword_groups:
+                    logger.debug("Keyword groups extracted: %s", keyword_groups)
+                return result_payload
+
+            logger.warning("Decomposition JSON found, but 'decomposition' key is not a list. Falling back.")
+            return fallback_result
+
+        logger.warning("Decomposition JSON parsed, but missing 'decomposition' key or wrong structure. Falling back.")
+        return fallback_result
 
     except TimeoutError:
         logger.error("Prompt decomposition request timed out. Falling back to original prompt.")
@@ -725,62 +711,61 @@ Output:
     )]
 
     try:
-        response_content = await analyzer._get_completion(messages, model_name=DECOMPOSITION_MODEL_NAME)
-
-        if not response_content:
-            logger.warning("Empty response from Review Mode decomposition LLM. Falling back.")
-            return fallback_result
-
-        logger.debug(f"[REVIEW MODE] Raw decomposition response: {response_content[:500]}...")
-
-        # Clean up response (remove markdown code blocks if present)
-        cleaned_response = response_content.strip()
-        if cleaned_response.startswith("```json"):
-            cleaned_response = cleaned_response[7:]
-        if cleaned_response.startswith("```"):
-            cleaned_response = cleaned_response[3:]
-        if cleaned_response.endswith("```"):
-            cleaned_response = cleaned_response[:-3]
-        cleaned_response = cleaned_response.strip()
-
         try:
-            parsed = json.loads(cleaned_response)
-
-            # Validate structure
-            if not isinstance(parsed, dict) or "sub_prompts" not in parsed:
-                logger.error(f"Invalid Review Mode decomposition structure. Expected dict with 'sub_prompts' key. Got: {type(parsed)}")
-                return fallback_result
-
-            sub_prompts_data = parsed["sub_prompts"]
-            if not isinstance(sub_prompts_data, list) or len(sub_prompts_data) == 0:
-                logger.warning("Review Mode decomposition returned empty or invalid sub_prompts list. Falling back.")
-                return fallback_result
-
-            # Parse into Pydantic models
-            result = []
-            for item in sub_prompts_data:
-                try:
-                    sub_prompt = ReviewModeSubPrompt(**item)
-                    result.append(sub_prompt)
-                    logger.info(f"[REVIEW MODE] Parsed sub-prompt: '{sub_prompt.title}' (validation_type={sub_prompt.validation_type})")
-                except Exception as e:
-                    logger.warning(f"Failed to parse Review Mode sub-prompt: {e}. Item: {item}")
-                    continue
-
-            if not result:
-                logger.warning("No valid Review Mode sub-prompts parsed. Falling back.")
-                return fallback_result
-
-            logger.info(f"[REVIEW MODE] Successfully decomposed into {len(result)} sub-prompts")
-            return result
-
+            parsed, raw_response = await analyzer._get_json_with_retries(
+                messages=messages,
+                model_name=DECOMPOSITION_MODEL_NAME,
+                context="review mode prompt decomposition",
+                return_raw=True,
+            )
         except json.JSONDecodeError as json_err:
-            logger.error(f"Failed to parse Review Mode decomposition response as JSON: {json_err}. Raw response: {response_content}")
+            logger.error("Failed to parse Review Mode decomposition response as JSON after retries: %s", json_err)
             logger.warning("Falling back to using the original prompt due to JSON parsing error.")
             return fallback_result
 
+        if not raw_response:
+            logger.warning("Empty response from Review Mode decomposition LLM. Falling back.")
+            return fallback_result
+
+        logger.debug(f"[REVIEW MODE] Raw decomposition response: {raw_response[:500]}...")
+
+        # Validate structure
+        if not isinstance(parsed, dict) or "sub_prompts" not in parsed:
+            logger.error(
+                "Invalid Review Mode decomposition structure. Expected dict with 'sub_prompts' key. Got: %s",
+                type(parsed),
+            )
+            return fallback_result
+
+        sub_prompts_data = parsed["sub_prompts"]
+        if not isinstance(sub_prompts_data, list) or len(sub_prompts_data) == 0:
+            logger.warning("Review Mode decomposition returned empty or invalid sub_prompts list. Falling back.")
+            return fallback_result
+
+        # Parse into Pydantic models
+        result = []
+        for item in sub_prompts_data:
+            try:
+                sub_prompt = ReviewModeSubPrompt(**item)
+                result.append(sub_prompt)
+                logger.info(
+                    "[REVIEW MODE] Parsed sub-prompt: '%s' (validation_type=%s)",
+                    sub_prompt.title,
+                    sub_prompt.validation_type,
+                )
+            except Exception as e:
+                logger.warning(f"Failed to parse Review Mode sub-prompt: {e}. Item: {item}")
+                continue
+
+        if not result:
+            logger.warning("No valid Review Mode sub-prompts parsed. Falling back.")
+            return fallback_result
+
+        logger.info(f"[REVIEW MODE] Successfully decomposed into {len(result)} sub-prompts")
+        return result
+
     except TimeoutError:
-        logger.error(f"Review Mode decomposition request timed out. Falling back to original prompt.")
+        logger.error("Review Mode decomposition request timed out. Falling back to original prompt.")
         return fallback_result
     except Exception as e:
         logger.error(f"Error during Review Mode decomposition LLM call: {str(e)}", exc_info=True)
@@ -892,43 +877,37 @@ Please generate a regex pattern that will accurately identify violations of this
     ]
 
     try:
-        response_content = await analyzer._get_completion(messages, model_name=DECOMPOSITION_MODEL_NAME)
+        try:
+            parsed, raw_response = await analyzer._get_json_with_retries(
+                messages=messages,
+                model_name=DECOMPOSITION_MODEL_NAME,
+                context=f"regex generation for {sub_prompt.title}",
+                return_raw=True,
+            )
+        except json.JSONDecodeError as json_err:
+            logger.error(f"Failed to parse regex generation response as JSON after retries: {json_err}")
+            return None
 
-        if not response_content:
+        if not raw_response:
             logger.warning(f"Empty response from regex generation for '{sub_prompt.title}'")
             return None
 
-        logger.debug(f"[REGEX GENERATION] Raw response: {response_content[:500]}...")
-
-        # Clean up response
-        cleaned_response = response_content.strip()
-        if cleaned_response.startswith("```json"):
-            cleaned_response = cleaned_response[7:]
-        if cleaned_response.startswith("```"):
-            cleaned_response = cleaned_response[3:]
-        if cleaned_response.endswith("```"):
-            cleaned_response = cleaned_response[:-3]
-        cleaned_response = cleaned_response.strip()
+        logger.debug(f"[REGEX GENERATION] Raw response: {raw_response[:500]}...")
 
         try:
-            parsed = json.loads(cleaned_response)
             result = RegexGenerationResult(**parsed)
-
-            # Validate the regex pattern by attempting to compile it
-            try:
-                re.compile(result.regex_pattern)
-                logger.info(f"[REGEX GENERATION] Successfully generated and validated regex for '{sub_prompt.title}'")
-                logger.debug(f"[REGEX GENERATION] Pattern: {result.regex_pattern}")
-                return result
-            except re.error as regex_err:
-                logger.error(f"Generated regex pattern is invalid: {regex_err}. Pattern: {result.regex_pattern}")
-                return None
-
-        except json.JSONDecodeError as json_err:
-            logger.error(f"Failed to parse regex generation response as JSON: {json_err}. Raw response: {response_content}")
-            return None
         except Exception as parse_err:
             logger.error(f"Failed to parse regex generation result: {parse_err}")
+            return None
+
+        # Validate the regex pattern by attempting to compile it
+        try:
+            re.compile(result.regex_pattern)
+            logger.info(f"[REGEX GENERATION] Successfully generated and validated regex for '{sub_prompt.title}'")
+            logger.debug(f"[REGEX GENERATION] Pattern: {result.regex_pattern}")
+            return result
+        except re.error as regex_err:
+            logger.error(f"Generated regex pattern is invalid: {regex_err}. Pattern: {result.regex_pattern}")
             return None
 
     except Exception as e:

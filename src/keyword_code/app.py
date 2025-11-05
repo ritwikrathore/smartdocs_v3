@@ -52,7 +52,6 @@ from .utils.ui_helpers import (
     apply_ui_styling, render_branding, initialize_session_state,
     display_welcome_features, clear_session_for_new_query, clear_incompatible_embeddings
 )
-from .display_utils import display_analysis_results, display_pdf_viewer, update_pdf_view
 from .utils.file_manager import (
     create_temp_file, create_temp_dir, remove_temp_file, remove_temp_dir,
     cleanup_session_files, cleanup_all_temp_files, create_session_temp_file,
@@ -65,7 +64,6 @@ from .utils.interaction_logger import (
     setup_interaction_logging, disable_interaction_logging, INTERACTION_LOGGING_ENABLED,
     log_rag_parameters
 )
-from .utils.spacy_utils import ensure_spacy_model
 from .models.embedding import load_embedding_model, load_reranker_model
 from .processors.pdf_processor import PDFProcessor
 from .processors.word_processor import WordProcessor
@@ -73,6 +71,36 @@ from .rag.retrieval import retrieve_relevant_chunks, retrieve_relevant_chunks_fo
 from .ai.analyzer import DocumentAnalyzer
 from .ai.chat import generate_chat_response
 from .services.keyword_mode_service import KeywordModeService
+
+
+def get_embedding_model():
+    """Lazily load and return the shared embedding model."""
+    return load_embedding_model()
+
+
+@st.cache_resource(show_spinner="Calibrating the reranker ⚙️…")
+def get_reranker_model():
+    """Load the reranker model on demand and cache the instance."""
+    return load_reranker_model()
+
+
+@st.cache_resource(show_spinner="Preparing keyword highlighter ✨…")
+def get_keyword_mode_service():
+    """Return a cached KeywordModeService instance."""
+    return KeywordModeService()
+
+
+_interaction_logging_initialized = False
+
+
+def ensure_interaction_logging():
+    """Enable detailed interaction logging once, when first needed."""
+    global _interaction_logging_initialized
+    if _interaction_logging_initialized:
+        return
+    if ENABLE_INTERACTION_LOGGING:
+        enable_interaction_logging()
+        _interaction_logging_initialized = True
 
 # --- OpenAI client for Databricks API ---
 # The OpenAI client is configured in the Databricks LLM client
@@ -93,34 +121,10 @@ except Exception as e:
 
 # --- End Custom CSS Styling ---
 
-# Load the embedding model using the cached function
-embedding_model = load_embedding_model()
-
-# Load the reranker model (shared)
-# Note: This will attempt to load the Databricks reranker API first (with 60s timeout).
-# If the API is unavailable (403 error, timeout, etc.), it will automatically fall back
-# to an LLM-based reranker that provides the same functionality.
-# See docs/RERANKER_FALLBACK.md for details.
-reranker_model = load_reranker_model()
-
-# Initialize keyword mode service (stateless helper)
-keyword_mode_service = KeywordModeService()
-
 
 def slugify_keyword_label(text: str) -> str:
     slug = re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
     return slug or "keyword"
-
-# Check for incompatible embeddings in session state after model loading
-# This needs to be called within the Streamlit context, so we'll do it in display_page()
-
-# Initialize spaCy model at startup to ensure it's available locally
-# This will download the model if needed and store it in the local models directory
-spacy_model = ensure_spacy_model("en_core_web_sm")
-if spacy_model:
-    logger.info("spaCy model 'en_core_web_sm' initialized successfully at application startup")
-else:
-    logger.error("Failed to initialize spaCy model 'en_core_web_sm' at application startup")
 
 # --- Function to enable interaction logging ---
 def enable_interaction_logging():
@@ -131,27 +135,22 @@ def enable_interaction_logging():
     This function is called automatically at startup if ENABLE_INTERACTION_LOGGING is True.
     """
     try:
-        # Create logs directory if it doesn't exist
-        logs_dir = os.path.join(os.getcwd(), "logs")
-        os.makedirs(logs_dir, exist_ok=True)
+        project_root = Path(__file__).resolve().parents[2]
+        logs_dir = project_root / "logs"
+        logs_dir.mkdir(exist_ok=True)
 
         # Create a timestamped log file
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_file_path = os.path.join(logs_dir, f"rag_interactions_{timestamp}.log")
+        log_file_path = logs_dir / f"rag_interactions_{timestamp}.log"
 
         # Set up interaction logging
-        setup_interaction_logging(log_file_path)
+        setup_interaction_logging(str(log_file_path))
 
         logger.info(f"Interaction logging enabled. Log file: {log_file_path}")
-        return log_file_path
+        return str(log_file_path)
     except Exception as e:
         logger.error(f"Failed to enable interaction logging: {e}")
         return None
-
-# Enable interaction logging at startup if configured
-if ENABLE_INTERACTION_LOGGING:
-    enable_interaction_logging()
-
 
 # Function to preprocess files when uploaded
 def preprocess_file(file_data: bytes, filename: str, use_advanced_extraction: bool = False):
@@ -167,6 +166,7 @@ def preprocess_file(file_data: bytes, filename: str, use_advanced_extraction: bo
     Returns:
         dict: Dictionary with preprocessing status and message
     """
+    embedding_model = get_embedding_model()
     if embedding_model is None:
         logger.error(f"Skipping preprocessing for {filename}: Embedding model not loaded.")
         return {"status": "error", "message": "Embedding model not loaded"}
@@ -310,6 +310,10 @@ def process_file_wrapper(args):
         ) = args
         mode = 'ask'
 
+    ensure_interaction_logging()
+    embedding_model = get_embedding_model()
+    reranker_model = get_reranker_model()
+
     logger.info(f"Processing {filename} in '{mode}' mode")
 
     if mode == 'keyword':
@@ -415,6 +419,7 @@ def process_file_wrapper(args):
                 detected_keywords,
             )
 
+            keyword_mode_service = get_keyword_mode_service()
             keyword_chunks = preprocessed_data["chunks"] if preprocessed_data else chunks
             if not keyword_chunks:
                 raise ValueError("Keyword mode requires chunked document text.")
@@ -915,6 +920,8 @@ def display_page():
     # Initialize session state variables
     initialize_session_state()
 
+    embedding_model = get_embedding_model()
+
     # Check for incompatible embeddings and clear them automatically
     if embedding_model is not None:
         clear_incompatible_embeddings(embedding_model)
@@ -1007,6 +1014,9 @@ def display_page():
 
         # Display Successful Analysis
         if success_results:
+            # Import lazily to avoid heavy initialization when the page isn't used
+            from .display_utils.analysis_display import display_analysis_results
+
             # Call the display function from the display module
             display_analysis_results(success_results)
         elif not errors:
@@ -1333,6 +1343,9 @@ def display_page():
                         if first_success and first_success.get("annotated_pdf"):
                             try:
                                 pdf_bytes = base64.b64decode(first_success["annotated_pdf"])
+                                # Import here to avoid triggering heavy imports until needed
+                                from .display_utils.pdf_utils import update_pdf_view
+
                                 # Use the update_pdf_view function from the display module
                                 update_pdf_view(
                                     pdf_bytes=pdf_bytes,
@@ -1369,7 +1382,8 @@ atexit.register(cleanup_all_temp_files)
 # --- Main Execution Guard ---
 if __name__ == "__main__":
     # Check model again before displaying page, though initial check should handle most cases
-    if embedding_model is not None:
+    model = get_embedding_model()
+    if model is not None:
         display_page()
     else:
         # If the model failed, display_page() will show an error,

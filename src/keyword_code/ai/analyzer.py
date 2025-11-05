@@ -5,8 +5,8 @@ Document analyzer functionality.
 import json
 import re
 import threading
-from typing import Any, Dict, List, Optional, Tuple
-from ..config import logger, ANALYSIS_MODEL_NAME, USE_DATABRICKS_LLM
+from typing import Any, Callable, Dict, List, Optional, Tuple
+from ..config import logger, ANALYSIS_MODEL_NAME, USE_DATABRICKS_LLM, LLM_MAX_RETRIES
 
 # Import Databricks LLM client
 from .databricks_llm import get_databricks_llm
@@ -37,40 +37,137 @@ class DocumentAnalyzer:
             raise ValueError("No LLM client available - Databricks LLM client failed to initialize")
 
     async def _get_completion(
-        self, messages: List[Dict[str, str]], model_name: str
+        self,
+        messages: List[Dict[str, str]],
+        model_name: str,
+        *,
+        max_attempts: Optional[int] = None,
     ) -> str:
-        """Helper method to get completion from Databricks LLM."""
-        try:
-            # Ensure Databricks client is available
-            if not self.databricks_client:
-                raise ValueError("Databricks LLM client not initialized")
+        """Helper method to get completion from Databricks LLM with retry support."""
 
-            logger.info(f"Sending request to Databricks LLM model")
-            # Databricks client handles message formatting internally
-            response_content = await self.databricks_client.get_completion_async(messages, max_tokens=8192)
+        attempts = max_attempts or LLM_MAX_RETRIES
 
-            if not response_content:
-                raise ValueError("Failed to get response from Databricks LLM")
+        for attempt in range(1, attempts + 1):
+            try:
+                # Ensure Databricks client is available
+                if not self.databricks_client:
+                    raise ValueError("Databricks LLM client not initialized")
 
-            logger.info(f"Received response from Databricks LLM model")
+                logger.info("Sending request to Databricks LLM model")
+                # Databricks client handles message formatting internally
+                response_content = await self.databricks_client.get_completion_async(messages, max_tokens=8192)
 
-            # Log the LLM interaction
-            interaction_type = "analysis"
-            if model_name == "databricks-gpt-oss-120b":
-                if any("decompose" in msg.get("content", "").lower() for msg in messages if msg.get("role") == "system"):
-                    interaction_type = "decomposition"
-                elif any("chat" in msg.get("content", "").lower() for msg in messages if msg.get("role") == "system"):
-                    interaction_type = "chat"
+                if not response_content:
+                    raise ValueError("Failed to get response from Databricks LLM")
 
-            log_llm_interaction(messages, response_content, interaction_type)
+                logger.info("Received response from Databricks LLM model")
 
-            return response_content
+                # Log the LLM interaction
+                interaction_type = "analysis"
+                if model_name == "databricks-gpt-oss-120b":
+                    if any("decompose" in msg.get("content", "").lower() for msg in messages if msg.get("role") == "system"):
+                        interaction_type = "decomposition"
+                    elif any("chat" in msg.get("content", "").lower() for msg in messages if msg.get("role") == "system"):
+                        interaction_type = "chat"
 
-        except Exception as e:
-            logger.error(
-                f"Error getting completion from Databricks LLM: {str(e)}", exc_info=True
+                log_llm_interaction(messages, response_content, interaction_type)
+
+                return response_content
+
+            except Exception as e:
+                logger.error(
+                    "Error getting completion from Databricks LLM (attempt %d/%d): %s",
+                    attempt,
+                    attempts,
+                    e,
+                    exc_info=attempt == attempts,
+                )
+                if attempt == attempts:
+                    raise
+                logger.info(
+                    "Retrying Databricks LLM call (attempt %d/%d)",
+                    attempt + 1,
+                    attempts,
+                )
+
+    async def _get_json_with_retries(
+        self,
+        *,
+        messages: List[Dict[str, str]],
+        model_name: str,
+        context: str,
+        extractor: Optional[Callable[[str], Any]] = None,
+        max_attempts: Optional[int] = None,
+        return_raw: bool = False,
+    ) -> Any:
+        """Call the LLM and parse the response as JSON with retry logic."""
+
+        attempts = max_attempts or LLM_MAX_RETRIES
+        extractor = extractor or self._extract_json_from_response
+        last_error: Optional[Exception] = None
+
+        for attempt in range(1, attempts + 1):
+            try:
+                response_content = await self._get_completion(
+                    messages,
+                    model_name,
+                    max_attempts=1,
+                )
+            except Exception as err:
+                last_error = err
+                logger.error(
+                    "LLM call failed during %s (attempt %d/%d): %s",
+                    context,
+                    attempt,
+                    attempts,
+                    err,
+                    exc_info=attempt == attempts,
+                )
+                if attempt == attempts:
+                    raise
+                logger.info(
+                    "Retrying %s after call failure (attempt %d/%d)",
+                    context,
+                    attempt + 1,
+                    attempts,
+                )
+                continue
+
+            logger.debug(
+                "Raw LLM response for %s (attempt %d/%d): %s",
+                context,
+                attempt,
+                attempts,
+                response_content[:500] if response_content else "",
             )
-            raise
+
+            try:
+                parsed = extractor(response_content)
+                if return_raw:
+                    return parsed, response_content
+                return parsed
+            except json.JSONDecodeError as json_err:
+                last_error = json_err
+                logger.error(
+                    "Failed to parse LLM response as JSON during %s (attempt %d/%d): %s",
+                    context,
+                    attempt,
+                    attempts,
+                    json_err,
+                    exc_info=attempt == attempts,
+                )
+                if attempt == attempts:
+                    raise
+                logger.info(
+                    "Retrying %s due to JSON parsing error (attempt %d/%d)",
+                    context,
+                    attempt + 1,
+                    attempts,
+                )
+
+        if last_error:
+            raise last_error
+        raise RuntimeError(f"LLM retries exhausted for {context}")
 
     @staticmethod
     def _extract_json_from_response(response_content: str) -> Any:
@@ -176,7 +273,7 @@ class DocumentAnalyzer:
 7. **Natural Section References:** When referring to where information is found in the document, use natural language references to document sections (e.g., "Section 9 of the Loan Agreement", "Definitions Section", "Article 5", "Schedule A") based on the content of the text excerpts. Do NOT mention chunk IDs or technical identifiers. You may reference page numbers when helpful.
 
 ### IMPORTANT Formatting Guidelines:
-You MUST use Markdown formatting in your analysis_summary to improve readability when appropriate:
+YOU MUST ALWAYS use Markdown formatting in your analysis_summary to improve readability:
 - **Bullet points** (using *, -, or +) for concise lists of up to 10 items (e.g., schedule of dates, list of violations, enumerated findings)
 - **Numbered lists** (using 1., 2., etc.) for sequential or ordered information
 - **Bold text** (using **text**) to emphasize important information like dates, percentages, amounts, facts, or key definitions
@@ -256,104 +353,95 @@ Generate a structured analysis for EACH sub-prompt, strictly following the JSON 
             ]
 
             logger.info(f"Sending comprehensive analysis request for {len(formatted_sub_prompts)} sub-prompts in {filename} to AI")
-
-            # Call the LLM with all sub-prompts and contexts
-            response_content = await self._get_completion(messages, model_name=ANALYSIS_MODEL_NAME)
-            logger.info(f"Received comprehensive AI analysis response for {filename}")
-
-            # Parse the JSON response
             try:
-                cleaned_response = response_content.strip()
-                match = re.search(r"```json\s*(\{.*?\})\s*```", cleaned_response, re.DOTALL)
-                if match:
-                    json_str = match.group(1)
-                elif cleaned_response.startswith("{") and cleaned_response.endswith("}"):
-                    json_str = cleaned_response
-                else:
-                    first_brace = cleaned_response.find('{')
-                    last_brace = cleaned_response.rfind('}')
-                    if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
-                        json_str = cleaned_response[first_brace:last_brace+1]
-                        logger.warning("Used basic brace finding for JSON extraction in comprehensive analysis.")
-                    else:
-                        raise json.JSONDecodeError("Could not find JSON structure in analysis response.", cleaned_response, 0)
-
-                parsed_json = json.loads(json_str)
-
-                # Validate the response structure
-                if not isinstance(parsed_json, dict) or "analyses" not in parsed_json:
-                    logger.error("Invalid response format: 'analyses' key missing")
-                    return self._create_fallback_analyses(sub_prompts_with_contexts)
-
-                analyses = parsed_json["analyses"]
-                if not isinstance(analyses, list):
-                    logger.error("Invalid response format: 'analyses' is not a list")
-                    return self._create_fallback_analyses(sub_prompts_with_contexts)
-
-                # Process each analysis
-                results = []
-                for analysis in analyses:
-                    # Basic validation
-                    if not isinstance(analysis, dict):
-                        logger.warning("Skipping invalid analysis entry (not a dict)")
-                        continue
-
-                    # Extract the analysis data
-                    sub_prompt_index = analysis.get("sub_prompt_index")
-                    if sub_prompt_index is None:
-                        logger.warning("Analysis missing sub_prompt_index, using position in list")
-                        sub_prompt_index = len(results) + 1
-
-                    # Find the original sub-prompt data
-                    original_index = sub_prompt_index - 1
-                    if 0 <= original_index < len(sub_prompts_with_contexts):
-                        original_sub_prompt = sub_prompts_with_contexts[original_index].get('sub_prompt', '')
-                        original_title = sub_prompts_with_contexts[original_index].get('title', '')
-                    else:
-                        # This is expected when retrying a single sub-prompt from a multi-prompt analysis
-                        # The LLM may return the original index (e.g., 2) but we only have 1 item in the list
-                        logger.debug(f"Sub-prompt index {sub_prompt_index} out of range for {len(sub_prompts_with_contexts)} sub-prompts (expected for retry scenarios), using LLM-provided values")
-                        original_sub_prompt = analysis.get("sub_prompt_analyzed", "Unknown sub-prompt")
-                        original_title = analysis.get("sub_prompt_title", "Unknown title")
-
-                    # Create the result in the expected format
-                    result = {
-                        "sub_prompt_analyzed": analysis.get("sub_prompt_analyzed", original_sub_prompt),
-                        "analysis_summary": analysis.get("analysis_summary", "No analysis provided"),
-                        "supporting_quotes": analysis.get("supporting_quotes", ["No relevant phrase found."]),
-                        "analysis_context": analysis.get("analysis_context", ""),
-                        "title": analysis.get("sub_prompt_title", original_title)
-                    }
-
-                    # Ensure supporting_quotes is a list
-                    if not isinstance(result["supporting_quotes"], list):
-                        result["supporting_quotes"] = [str(result["supporting_quotes"])]
-
-                    # Convert to JSON string for compatibility with existing code
-                    results.append({
-                        "title": result["title"],
-                        "sub_prompt": result["sub_prompt_analyzed"],
-                        "analysis_json": json.dumps(result, indent=2)
-                    })
-
-                # Check if we have results for all sub-prompts
-                if len(results) < len(sub_prompts_with_contexts):
-                    logger.warning(f"Missing analyses for some sub-prompts: got {len(results)}, expected {len(sub_prompts_with_contexts)}")
-                    # Add fallback analyses for missing sub-prompts
-                    existing_indices = {r.get("sub_prompt") for r in results}
-                    for i, item in enumerate(sub_prompts_with_contexts):
-                        if item.get("sub_prompt") not in existing_indices:
-                            fallback = self._create_fallback_analysis(item)
-                            results.append(fallback)
-
-                return results
-
+                parsed_json = await self._get_json_with_retries(
+                    messages=messages,
+                    model_name=ANALYSIS_MODEL_NAME,
+                    context=f"comprehensive analysis for {filename}",
+                )
+                logger.info(f"Received comprehensive AI analysis response for {filename}")
             except json.JSONDecodeError as json_err:
-                logger.error(f"Failed to parse comprehensive AI analysis response as JSON: {json_err}")
+                logger.error(
+                    "Failed to parse comprehensive AI analysis response as JSON after %d attempt(s): %s",
+                    LLM_MAX_RETRIES,
+                    json_err,
+                )
                 return self._create_fallback_analyses(sub_prompts_with_contexts)
             except Exception as e:
-                logger.error(f"Error processing comprehensive analysis response: {str(e)}", exc_info=True)
+                logger.error(
+                    "Error retrieving comprehensive AI analysis response: %s",
+                    e,
+                    exc_info=True,
+                )
                 return self._create_fallback_analyses(sub_prompts_with_contexts)
+
+            # Validate the response structure
+            if not isinstance(parsed_json, dict) or "analyses" not in parsed_json:
+                logger.error("Invalid response format: 'analyses' key missing")
+                return self._create_fallback_analyses(sub_prompts_with_contexts)
+
+            analyses = parsed_json["analyses"]
+            if not isinstance(analyses, list):
+                logger.error("Invalid response format: 'analyses' is not a list")
+                return self._create_fallback_analyses(sub_prompts_with_contexts)
+
+            # Process each analysis
+            results = []
+            for analysis in analyses:
+                # Basic validation
+                if not isinstance(analysis, dict):
+                    logger.warning("Skipping invalid analysis entry (not a dict)")
+                    continue
+
+                # Extract the analysis data
+                sub_prompt_index = analysis.get("sub_prompt_index")
+                if sub_prompt_index is None:
+                    logger.warning("Analysis missing sub_prompt_index, using position in list")
+                    sub_prompt_index = len(results) + 1
+
+                # Find the original sub-prompt data
+                original_index = sub_prompt_index - 1
+                if 0 <= original_index < len(sub_prompts_with_contexts):
+                    original_sub_prompt = sub_prompts_with_contexts[original_index].get('sub_prompt', '')
+                    original_title = sub_prompts_with_contexts[original_index].get('title', '')
+                else:
+                    # This is expected when retrying a single sub-prompt from a multi-prompt analysis
+                    # The LLM may return the original index (e.g., 2) but we only have 1 item in the list
+                    logger.debug(f"Sub-prompt index {sub_prompt_index} out of range for {len(sub_prompts_with_contexts)} sub-prompts (expected for retry scenarios), using LLM-provided values")
+                    original_sub_prompt = analysis.get("sub_prompt_analyzed", "Unknown sub-prompt")
+                    original_title = analysis.get("sub_prompt_title", "Unknown title")
+
+                # Create the result in the expected format
+                result = {
+                    "sub_prompt_analyzed": analysis.get("sub_prompt_analyzed", original_sub_prompt),
+                    "analysis_summary": analysis.get("analysis_summary", "No analysis provided"),
+                    "supporting_quotes": analysis.get("supporting_quotes", ["No relevant phrase found."]),
+                    "analysis_context": analysis.get("analysis_context", ""),
+                    "title": analysis.get("sub_prompt_title", original_title)
+                }
+
+                # Ensure supporting_quotes is a list
+                if not isinstance(result["supporting_quotes"], list):
+                    result["supporting_quotes"] = [str(result["supporting_quotes"])]
+
+                # Convert to JSON string for compatibility with existing code
+                results.append({
+                    "title": result["title"],
+                    "sub_prompt": result["sub_prompt_analyzed"],
+                    "analysis_json": json.dumps(result, indent=2)
+                })
+
+            # Check if we have results for all sub-prompts
+            if len(results) < len(sub_prompts_with_contexts):
+                logger.warning(f"Missing analyses for some sub-prompts: got {len(results)}, expected {len(sub_prompts_with_contexts)}")
+                # Add fallback analyses for missing sub-prompts
+                existing_indices = {r.get("sub_prompt") for r in results}
+                for i, item in enumerate(sub_prompts_with_contexts):
+                    if item.get("sub_prompt") not in existing_indices:
+                        fallback = self._create_fallback_analysis(item)
+                        results.append(fallback)
+
+            return results
 
         except Exception as e:
             logger.error(f"Error during comprehensive AI document analysis for {filename}: {str(e)}", exc_info=True)
@@ -462,8 +550,11 @@ Do not include any additional keys and do not wrap the JSON in Markdown fences."
         fallback_result = self._keyword_analysis_fallback(keyword_sections, keyword_reasoning)
 
         try:
-            response_content = await self._get_completion(messages, model_name=ANALYSIS_MODEL_NAME)
-            parsed_json = self._extract_json_from_response(response_content)
+            parsed_json = await self._get_json_with_retries(
+                messages=messages,
+                model_name=ANALYSIS_MODEL_NAME,
+                context=f"keyword analysis for {filename}",
+            )
             return self._sanitize_keyword_analysis(parsed_json, keyword_sections, keyword_reasoning)
         except Exception as err:
             logger.error("Keyword mode analysis failed: %s", err, exc_info=True)

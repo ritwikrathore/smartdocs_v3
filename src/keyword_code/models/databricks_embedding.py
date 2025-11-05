@@ -23,7 +23,7 @@ DATABRICKS_MODEL_NAME = "databricks-gte-large-en"
 DEBUG_API_CALLS = True
 
 
-@st.cache_resource
+@st.cache_resource(show_spinner="Summoning helpful elves 🧙‍♀️...")
 def get_databricks_client():
     """
     Creates and caches an OpenAI client configured for Databricks.
@@ -256,7 +256,7 @@ class DatabricksEmbeddingModel:
                 return np.array(empty_embeddings) if convert_to_tensor else [[0.0] * self.embedding_dimension for _ in range(len(sentences))]
 
 
-@st.cache_resource
+@st.cache_resource(show_spinner="Finding our magnifying glass 🔎...")
 def load_databricks_embedding_model():
     """
     Loads and caches the Databricks embedding model.

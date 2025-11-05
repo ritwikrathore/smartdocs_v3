@@ -11,6 +11,8 @@ from io import BytesIO
 from docx import Document
 from docx.shared import Pt, Inches
 from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
 from datetime import datetime
 from typing import Dict, List, Any, Tuple
 import fitz
@@ -112,7 +114,41 @@ def export_to_word(exportable_results_list: List[Dict[str, Any]]) -> bytes:
     date_run = date_paragraph.add_run(f"Report generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     date_run.italic = True
 
-    # Add a page break after the title page
+    def add_table_of_contents(target_doc: Document) -> None:
+        """Insert a Word TOC field capturing heading levels 1-2."""
+        try:
+            target_doc.add_paragraph("Table of Contents", style="TOC Heading")
+        except KeyError:
+            target_doc.add_heading("Table of Contents", level=1)
+
+        paragraph = target_doc.add_paragraph()
+        begin_run = paragraph.add_run()
+        fld_begin = OxmlElement("w:fldChar")
+        fld_begin.set(qn("w:fldCharType"), "begin")
+        begin_run._r.append(fld_begin)
+
+        instr_run = paragraph.add_run()
+        instr_text = OxmlElement("w:instrText")
+        instr_text.set(qn("xml:space"), "preserve")
+        instr_text.text = 'TOC \\o "1-2" \\h \\z \\u'
+        instr_run._r.append(instr_text)
+
+        separate_run = paragraph.add_run()
+        fld_separate = OxmlElement("w:fldChar")
+        fld_separate.set(qn("w:fldCharType"), "separate")
+        separate_run._r.append(fld_separate)
+
+        placeholder_run = paragraph.add_run("(Press Ctrl+A then F9 to update the Table of Contents)")
+        placeholder_run.italic = True
+
+        end_run = paragraph.add_run()
+        fld_end = OxmlElement("w:fldChar")
+        fld_end.set(qn("w:fldCharType"), "end")
+        end_run._r.append(fld_end)
+
+    add_table_of_contents(doc)
+
+    # Add a page break after the title and TOC
     doc.add_page_break()
 
     method_priority = {
@@ -239,9 +275,6 @@ def export_to_word(exportable_results_list: List[Dict[str, Any]]) -> bytes:
             analysis_sections = list(analysis.get("analysis_sections", {}).items())
             total_sections = len(analysis_sections)
 
-            if total_sections:
-                doc.add_page_break()
-
             # Process each analysis section
             for section_idx, (section_key, section_data) in enumerate(analysis_sections):
                 if section_idx > 0:
@@ -347,7 +380,7 @@ def export_to_word(exportable_results_list: List[Dict[str, Any]]) -> bytes:
                                 img_stream = BytesIO(snapshot_bytes)
                                 img_paragraph = doc.add_paragraph()
                                 img_run = img_paragraph.add_run()
-                                img_run.add_picture(img_stream, width=Inches(3.0))
+                                img_run.add_picture(img_stream, width=Inches(6.0))
                                 caption = doc.add_paragraph("Excerpt from annotated PDF")
                                 try:
                                     caption.style = "Caption"

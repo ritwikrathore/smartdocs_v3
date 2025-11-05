@@ -339,9 +339,16 @@ logger = logging.getLogger(__name__)
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", 4))
 ENABLE_PARALLEL = os.environ.get("ENABLE_PARALLEL", "true").lower() == "true"
 
-# --- Load Embedding Model ---
-# Ensure the embedding model is loaded early
-embedding_model = load_embedding_model()
+# --- Embedding Model Accessor ---
+_EMBEDDING_MODEL = None
+
+
+def get_embedding_model():
+    """Lazily load and cache the shared embedding model."""
+    global _EMBEDDING_MODEL
+    if _EMBEDDING_MODEL is None:
+        _EMBEDDING_MODEL = load_embedding_model()
+    return _EMBEDDING_MODEL
 
 # --- Sidebar ---
 with st.sidebar:
@@ -456,11 +463,7 @@ def process_rag_requests(results: list[dict[str, any]]) -> tuple[list[dict[str, 
                     requests_processed = True
                     try:
                         result_meta = request_data.get("result", {}) or {}
-                        keyword_sections_meta = result_meta.get("keyword_mode_sections") if isinstance(result_meta, dict) else {}
-                        is_keyword_result = isinstance(result_meta, dict) and bool(result_meta.get("keyword_mode"))
-                        section_is_keyword = isinstance(keyword_sections_meta, dict) and section_key in keyword_sections_meta
-
-                        if is_keyword_result or section_is_keyword:
+                        if isinstance(result_meta, dict) and result_meta.get("keyword_mode"):
                             st.session_state.rag_retry_requests[section_key]["status"] = "skipped_keyword_mode"
                             logger.info(
                                 "Skipping RAG retry for section %s because keyword mode does not support retrials",
@@ -492,7 +495,7 @@ def process_rag_requests(results: list[dict[str, any]]) -> tuple[list[dict[str, 
                         query = (base_query or "").strip()[:256]
 
                         # Models
-                        emb_model = embedding_model  # loaded at top of this page
+                        emb_model = get_embedding_model()
                         reranker_model = load_reranker_model()
 
                         # Compute a baseline set of current results to inform the agent
@@ -853,6 +856,8 @@ else:
             """,
             unsafe_allow_html=True,
         )
+
+    embedding_model = get_embedding_model()
 
     # Check if embedding model loaded successfully
     if embedding_model is None:

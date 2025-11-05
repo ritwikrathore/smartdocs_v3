@@ -26,9 +26,14 @@ from .citation_utils import (
 from .export_utils import export_to_word
 from ..utils.helpers import render_limited_markdown
 
-# Load the embedding model using the cached function
-embedding_model = load_embedding_model()
-reranker_model = load_reranker_model()
+def _get_embedding_model():
+    """Lazily retrieve the shared embedding model."""
+    return load_embedding_model()
+
+
+def _get_reranker_model():
+    """Lazily retrieve the reranker model."""
+    return load_reranker_model()
 
 
 def display_analysis_results(results: List[Dict[str, Any]]):
@@ -46,6 +51,9 @@ def display_analysis_results(results: List[Dict[str, Any]]):
     if not results:
         st.warning("No analysis results to display.")
         return
+
+    embedding_model = _get_embedding_model()
+    reranker_model = _get_reranker_model()
 
     # Define CSS styles based on app.py.bak
     st.markdown("""
@@ -156,9 +164,8 @@ def display_analysis_results(results: List[Dict[str, Any]]):
                         # Display analysis sections
                         analysis_sections = ai_analysis.get("analysis_sections", {})
                         citation_counter = 0  # For numbering citations within a tab
+                        is_keyword_mode_result = bool(result.get("keyword_mode"))
                         keyword_mode_sections = result.get("keyword_mode_sections", {}) or {}
-                        has_keyword_sections = isinstance(keyword_mode_sections, dict) and bool(keyword_mode_sections)
-                        is_keyword_mode_result = bool(result.get("keyword_mode")) or has_keyword_sections
 
                         for section_key, section_data in analysis_sections.items():
                             # Extract the actual title from the section key (removing "section_n_" prefix)
@@ -172,7 +179,7 @@ def display_analysis_results(results: List[Dict[str, Any]]):
                             # Format section name for display
                             display_section_name = section_title.replace("_", " ").title()
                             keyword_section_details = None
-                            if has_keyword_sections:
+                            if is_keyword_mode_result and isinstance(keyword_mode_sections, dict):
                                 keyword_section_details = keyword_mode_sections.get(section_key)
                                 if isinstance(keyword_section_details, dict):
                                     keyword_label = keyword_section_details.get("keyword")
@@ -562,7 +569,7 @@ def display_rag_retry_button_header(section_key: str, result: Dict[str, Any], se
     # Instead, we'll create buttons directly without columns, stacked vertically
     # Analyze button removed per new agent/tool design
 
-    if st.button("↻", key=f"retry_{retry_key}", help="Retry Retrieval", use_container_width=True):
+    if st.button("↻", key=f"retry_{retry_key}", help="Retry Retrieval (beta)", use_container_width=True):
         # Store the retry request in session state
         if "rag_retry_requests" not in st.session_state:
             st.session_state.rag_retry_requests = {}

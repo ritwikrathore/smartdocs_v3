@@ -25,14 +25,6 @@ from src.keyword_code.utils.ui_helpers import (
     render_branding
 )
 
-# Initialize Databricks LLM client
-databricks_llm = get_databricks_llm()
-if not databricks_llm:
-    st.error("Failed to initialize Databricks LLM client. Please check your configuration.")
-    st.stop()
-
-
-
 # --- Helper Functions ---
 
 def _safe_str(obj, max_len=500):
@@ -51,7 +43,9 @@ async def _chat_completion_async(messages, model: Optional[str] = None, temperat
     Async wrapper for Databricks LLM completion.
     Uses the centralized DatabricksLLMClient.
     """
+    databricks_llm = get_databricks_llm()
     if not databricks_llm:
+        logger.error("Databricks LLM client not initialized")
         raise RuntimeError("Databricks LLM client not initialized")
 
     # Use the async method from DatabricksLLMClient

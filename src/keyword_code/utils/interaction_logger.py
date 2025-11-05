@@ -10,11 +10,11 @@ This module provides functions to log various interactions in the RAG pipeline:
 All logs are written to a file for later analysis.
 """
 
-import os
 import json
 import logging
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from pathlib import Path
 
 # Import the configuration
 from ..config import ENABLE_INTERACTION_LOGGING
@@ -30,6 +30,9 @@ INTERACTION_LOG_FILE = None
 # File handler for the interaction logger
 _file_handler = None
 
+# Resolve the project root once so we do not rely on the runtime working directory
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+
 
 def setup_interaction_logging(log_file_path: str = None) -> None:
     """
@@ -43,14 +46,23 @@ def setup_interaction_logging(log_file_path: str = None) -> None:
     # If already set up, remove existing handler
     if _file_handler is not None:
         interaction_logger.removeHandler(_file_handler)
+        try:
+            _file_handler.close()
+        except Exception:
+            pass
         _file_handler = None
 
     # Create logs directory if it doesn't exist
     if log_file_path is None:
-        logs_dir = os.path.join(os.getcwd(), "logs")
-        os.makedirs(logs_dir, exist_ok=True)
+        logs_dir = PROJECT_ROOT / "logs"
+        logs_dir.mkdir(exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_file_path = os.path.join(logs_dir, f"rag_interactions_{timestamp}.log")
+        log_file_path = logs_dir / f"rag_interactions_{timestamp}.log"
+    else:
+        log_file_path = Path(log_file_path)
+        if not log_file_path.is_absolute():
+            log_file_path = PROJECT_ROOT / log_file_path
+        log_file_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Create file handler
     _file_handler = logging.FileHandler(log_file_path, mode='a', encoding='utf-8')
@@ -65,7 +77,7 @@ def setup_interaction_logging(log_file_path: str = None) -> None:
 
     # Enable logging
     INTERACTION_LOGGING_ENABLED = True
-    INTERACTION_LOG_FILE = log_file_path
+    INTERACTION_LOG_FILE = str(log_file_path)
 
     interaction_logger.info(f"Interaction logging enabled. Log file: {log_file_path}")
 

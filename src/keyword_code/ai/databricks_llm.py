@@ -13,7 +13,7 @@ DATABRICKS_BASE_URL = "https://adb-3858882779799477.17.azuredatabricks.net/servi
 DATABRICKS_LLM_MODEL = "databricks-llama-4-maverick"
 
 
-@st.cache_resource
+@st.cache_resource(show_spinner="Calling the storytelling dragons 🐉...")
 def get_databricks_llm_client():
     """
     Creates and caches an OpenAI client configured for Databricks LLM.
@@ -147,7 +147,7 @@ class DatabricksLLMClient:
         return self.get_completion(messages, max_tokens)
 
 
-@st.cache_resource
+@st.cache_resource(show_spinner="Gathering the wise council 🧙‍♂️...")
 def get_databricks_llm():
     """
     Creates and caches a DatabricksLLMClient instance.

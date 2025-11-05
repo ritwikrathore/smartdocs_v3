@@ -24,9 +24,14 @@ from .citation_utils import (
 )
 from .export_utils import export_to_word
 
-# Load the embedding model using the cached function
-embedding_model = load_embedding_model()
-reranker_model = load_reranker_model()
+def _get_embedding_model():
+    """Lazily retrieve the shared embedding model."""
+    return load_embedding_model()
+
+
+def _get_reranker_model():
+    """Lazily retrieve the reranker model."""
+    return load_reranker_model()
 
 
 def display_tools_column(results_with_real_analysis: List, tools_col):
@@ -37,6 +42,9 @@ def display_tools_column(results_with_real_analysis: List, tools_col):
         results_with_real_analysis: List of tuples containing (result, ai_analysis) pairs
         tools_col: Streamlit column object for the tools
     """
+    embedding_model = _get_embedding_model()
+    reranker_model = _get_reranker_model()
+
     with tools_col:
         # Header style from app.py.bak
         st.markdown('<div class="header-title">Analysis Tools & PDF Viewer</div>', unsafe_allow_html=True)

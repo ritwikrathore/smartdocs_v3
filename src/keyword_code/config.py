@@ -45,13 +45,13 @@ else:
     logger.error("DATABRICKS_API_KEY not found in environment variables after load_dotenv()")
 
 # --- Worker Configuration ---
-MAX_WORKERS = int(os.environ.get("MAX_WORKERS", 4))
+MAX_WORKERS = int(os.environ.get("MAX_WORKERS", 3))
 ENABLE_PARALLEL = os.environ.get("ENABLE_PARALLEL", "true").lower() == "true"
 
 # --- RAG Configuration ---
 FUZZY_MATCH_THRESHOLD = 85  # Lowered threshold (0-100) to better handle quotation mark differences
 RAG_TOP_K = 15  # Number of relevant chunks to retrieve per sub-prompt
-RAG_WORKERS = 4  # Number of workers for parallel RAG processing
+RAG_WORKERS = 3  # Number of workers for parallel RAG processing
 
 # --- Chunking Configuration ---
 # Sentence chunker parameters
@@ -84,6 +84,9 @@ ENABLE_LLM_RERANKER_FALLBACK = True  # Enable automatic fallback to LLM-based re
 # Using Databricks LLM
 DECOMPOSITION_MODEL_NAME = "databricks-llama-4-maverick"  # Databricks model name
 ANALYSIS_MODEL_NAME = "databricks-llama-4-maverick"  # Databricks model name
+
+# --- LLM Retry Configuration ---
+LLM_MAX_RETRIES = int(os.environ.get("LLM_MAX_RETRIES", 3))
 
 # --- UI Configuration ---
 # Define primary colors
@@ -146,6 +149,21 @@ SAVED_PROMPTS = {
                     "3. Distressed sale \n"
                     "4. Bankruptcy \n"
                     "5. Rating downgrade \n"
+                ),
+            },
+            {
+                "label": "ASC 320 Analysis",
+                "explanation": "ASC 320 Debt Security analysis whose legal form is debt i.e., Bonds, Subscription agreements, Debenture Trust Deed, Note Purchase Agreement, Note Pricing Supplement, etc.",
+                "prompt": (
+                    "1. Is the investment in the form of a bond, note or debenture? \n"
+                    "2. Does the bond, note or debenture have a maturity date or redemption date? \n"
+                    "3. Does the bond, note or debenture have a repayment schedule or amortization schedule? \n"
+                    "4. Does the bond, note or debenture have an interest rate, coupon rate, margin or spread? \n"
+                    "5. Is the bond, note or debenture issued in series, classes, units, integral multiple or in any other denominations? \n"
+                    "6. Is the bond/note or debenture issued in registered, bearer or dematerialized form? \n"
+                    "7. Does the company maintain a register of bond holders or note holders or debenture holders? \n"
+                    "8. Does the company issue any certificate to the bond holders or note holders or debenture holders? \n"
+                    "9. Are the bonds, notes or debentures listed? \n"
                 ),
             },
         ]

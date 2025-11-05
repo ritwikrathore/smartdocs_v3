@@ -9,7 +9,7 @@ from ..config import logger
 from .databricks_embedding import load_databricks_embedding_model
 
 
-@st.cache_resource  # Use cache_resource for non-data objects like models
+@st.cache_resource(show_spinner="Brewing a knowledge potion ☕...")  # Use cache_resource for non-data objects like models
 def load_embedding_model():
     """
     Loads the Databricks embedding model and caches it.
