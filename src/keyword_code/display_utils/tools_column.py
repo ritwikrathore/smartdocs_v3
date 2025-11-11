@@ -132,6 +132,16 @@ def display_tools_column(results_with_real_analysis: List, tools_col):
                     verification_results = result.get("verification_results", {})
                     phrase_locations = result.get("phrase_locations", {})
 
+                    # Build mapping from section_key to original sub_prompt
+                    section_to_prompt = {}
+                    sub_prompt_results = result.get("sub_prompt_results") or []
+                    for sub_prompt_entry in sub_prompt_results:
+                        if isinstance(sub_prompt_entry, dict):
+                            sec_key = sub_prompt_entry.get("section_key")
+                            sub_prompt_text = sub_prompt_entry.get("sub_prompt")
+                            if sec_key and sub_prompt_text:
+                                section_to_prompt[sec_key] = sub_prompt_text
+
                     # Prepare a list of flattened data for this file
                     file_data = []
                     phrase_details: Dict[str, Any] = {}
@@ -239,7 +249,8 @@ def display_tools_column(results_with_real_analysis: List, tools_col):
                         "analysis": ai_analysis,
                         "phrase_details": phrase_details,
                         "phrase_locations": phrase_locations,
-                        "annotated_pdf": result.get("annotated_pdf")
+                        "annotated_pdf": result.get("annotated_pdf"),
+                        "section_to_prompt": section_to_prompt
                     })
 
                 # Excel Export

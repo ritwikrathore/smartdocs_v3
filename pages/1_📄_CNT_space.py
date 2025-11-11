@@ -486,13 +486,39 @@ def process_rag_requests(results: list[dict[str, any]]) -> tuple[list[dict[str, 
                         filename = result_meta.get("filename")
                         preprocessed_doc = st.session_state.get("preprocessed_data", {}).get(filename, {})
 
+                        custom_prompt_candidate = request_data.get("custom_prompt")
+                        guided_prompt_override = None
+                        if isinstance(custom_prompt_candidate, str):
+                            candidate_trimmed = custom_prompt_candidate.strip()
+                            if candidate_trimmed:
+                                guided_prompt_override = candidate_trimmed[:512]
+
+                        default_prompt = request_data.get("default_prompt")
+
                         chunks = preprocessed_doc.get("chunks", [])
                         precomputed_embeddings = preprocessed_doc.get("chunk_embeddings")
                         valid_chunk_indices = preprocessed_doc.get("valid_chunk_indices")
 
-                        # Use page-level analysis text as a proxy query; fallback to section key
-                        base_query = section_data.get("Analysis") or section_key.replace('_', ' ')
-                        query = (base_query or "").strip()[:256]
+                        # Use guided prompt override when supplied; otherwise fall back to analysis text or section slug
+                        base_query_source = guided_prompt_override or section_data.get("Analysis") or section_key.replace('_', ' ')
+                        query = (base_query_source or "").strip()
+                        if not query:
+                            query = section_key.replace('_', ' ')
+                        query = query[:256]
+
+                        if guided_prompt_override:
+                            logger.info(
+                                "RAG retry for %s (%s) using guided prompt override: %s",
+                                section_key,
+                                filename,
+                                guided_prompt_override[:120],
+                            )
+                        else:
+                            logger.info(
+                                "RAG retry for %s (%s) using automatic query pipeline.",
+                                section_key,
+                                filename,
+                            )
 
                         # Models
                         emb_model = get_embedding_model()
@@ -536,6 +562,9 @@ def process_rag_requests(results: list[dict[str, any]]) -> tuple[list[dict[str, 
                             "analysis": analysis.model_dump() if hasattr(analysis, "model_dump") else getattr(analysis, "__dict__", analysis),
                             "original_results": current_results,
                             "filename": filename,
+                            "guided_prompt": guided_prompt_override or default_prompt or query,
+                            "used_custom_prompt": bool(guided_prompt_override),
+                            "default_prompt": default_prompt,
                         }
 
                         # --- Finish the pipeline: send RAG results to LLM, validate, and fact extract ---
@@ -548,25 +577,35 @@ def process_rag_requests(results: list[dict[str, any]]) -> tuple[list[dict[str, 
                             # Derive sub-prompt/title for this section from existing results
                             sub_prompt_results = (result_meta or {}).get("sub_prompt_results", [])
 
-                            # Extract index from section_key like "section_3_loan_currency"
-                            idx_match = re.match(r"section_(\d+)_", str(section_key))
-                            sp_index = int(idx_match.group(1)) if idx_match else None
+                            sub_prompt_entry = None
+                            for entry in sub_prompt_results:
+                                if isinstance(entry, dict) and entry.get("section_key") == section_key:
+                                    sub_prompt_entry = entry
+                                    break
 
-                            # Default fallbacks
+                            if sub_prompt_entry is None:
+                                idx_match = re.match(r"section_(\d+)_", str(section_key))
+                                sp_index = int(idx_match.group(1)) if idx_match else None
+                                if isinstance(sp_index, int) and 1 <= sp_index <= len(sub_prompt_results):
+                                    candidate_entry = sub_prompt_results[sp_index - 1]
+                                    if isinstance(candidate_entry, dict):
+                                        sub_prompt_entry = candidate_entry
+
                             derived_title = section_key.replace("section_", "").replace("_", " ")
-                            derived_sub_prompt = section_data.get("Context", "").replace("From sub-prompt: ", "").strip() or base_query
+                            derived_sub_prompt = section_data.get("Context", "").replace("From sub-prompt: ", "").strip() or base_query_source
 
-                            if isinstance(sp_index, int) and 1 <= sp_index <= len(sub_prompt_results):
-                                sp_entry = sub_prompt_results[sp_index - 1]
-                                derived_title = sp_entry.get("title", derived_title)
-                                derived_sub_prompt = sp_entry.get("sub_prompt", derived_sub_prompt)
+                            if isinstance(sub_prompt_entry, dict):
+                                derived_title = sub_prompt_entry.get("title", derived_title)
+                                derived_sub_prompt = sub_prompt_entry.get("sub_prompt", derived_sub_prompt)
+
+                            effective_sub_prompt = guided_prompt_override or derived_sub_prompt
 
                             # Prepare single sub-prompt with retried relevant chunks
                             # Note: We don't include the original index here since we're only analyzing one sub-prompt
                             # The analyzer will assign index 1 to this single sub-prompt
                             sub_prompts_with_contexts = [{
                                 "title": derived_title,
-                                "sub_prompt": derived_sub_prompt,
+                                "sub_prompt": effective_sub_prompt,
                                 "relevant_chunks": new_results or [],
                             }]
 
@@ -593,7 +632,7 @@ def process_rag_requests(results: list[dict[str, any]]) -> tuple[list[dict[str, 
                                         supporting_quotes = [str(supporting_quotes)]
                                     # Use the analysis_context from LLM (natural language description of where info was found)
                                     # instead of showing the sub-prompt text
-                                    analysis_context = parsed.get("analysis_context", f"From sub-prompt: {derived_sub_prompt}")
+                                    analysis_context = parsed.get("analysis_context", f"From sub-prompt: {effective_sub_prompt}")
                                     ai_section = {
                                         "Analysis": analysis_text,
                                         "Supporting_Phrases": supporting_quotes or ["No relevant phrase found."],
@@ -631,7 +670,7 @@ def process_rag_requests(results: list[dict[str, any]]) -> tuple[list[dict[str, 
                                 "verification_results": verification_results,
                                 "phrase_locations": phrase_locations,
                                 "extracted_facts": extracted_facts,
-                                "sub_prompt": derived_sub_prompt,
+                                "sub_prompt": effective_sub_prompt,
                                 "title": derived_title,
                             })
 

@@ -10,7 +10,7 @@ import pandas as pd
 import fitz
 from io import BytesIO
 from datetime import datetime
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 from ..config import logger, RAG_TOP_K
 from ..models.embedding import load_embedding_model, load_reranker_model
 from ..rag.retrieval import retrieve_relevant_chunks_for_chat
@@ -54,6 +54,13 @@ def display_analysis_results(results: List[Dict[str, Any]]):
 
     embedding_model = _get_embedding_model()
     reranker_model = _get_reranker_model()
+
+    if "guided_prompt_defaults" not in st.session_state:
+        st.session_state.guided_prompt_defaults = {}
+
+    def _make_guided_prompt_key(filename: str, section_key: str) -> str:
+        raw = f"guided_prompt_{filename}_{section_key}"
+        return re.sub(r"[^0-9a-zA-Z_]+", "_", raw)
 
     # Define CSS styles based on app.py.bak
     st.markdown("""
@@ -161,6 +168,23 @@ def display_analysis_results(results: List[Dict[str, Any]]):
                             else:
                                 st.caption("No PDF")
 
+                        # Map section keys to their originating sub-prompts for guided retries
+                        section_prompt_map: Dict[str, str] = {}
+                        sub_prompt_results = result.get("sub_prompt_results") or []
+                        for idx, sub_prompt_entry in enumerate(sub_prompt_results, start=1):
+                            if not isinstance(sub_prompt_entry, dict):
+                                continue
+                            section_identifier = sub_prompt_entry.get("section_key")
+                            if not isinstance(section_identifier, str) or not section_identifier:
+                                title_candidate = sub_prompt_entry.get("title", f"section_{idx}")
+                                if isinstance(title_candidate, str) and title_candidate:
+                                    section_identifier = f"section_{idx}_{title_candidate.replace(' ', '_').lower()}"
+                                else:
+                                    section_identifier = f"section_{idx}_sub_prompt"
+                            prompt_text = sub_prompt_entry.get("sub_prompt", "")
+                            if isinstance(prompt_text, str):
+                                section_prompt_map[section_identifier] = prompt_text
+
                         # Display analysis sections
                         analysis_sections = ai_analysis.get("analysis_sections", {})
                         citation_counter = 0  # For numbering citations within a tab
@@ -186,26 +210,77 @@ def display_analysis_results(results: List[Dict[str, Any]]):
                                     if isinstance(keyword_label, str) and keyword_label.strip():
                                         display_section_name = keyword_label.strip()
 
+                            default_prompt_for_section = section_prompt_map.get(section_key)
+                            allow_guided_prompt = bool(default_prompt_for_section) and not keyword_section_details and not section_key.startswith("error_")
+                            prompt_state_key = None
+                            user_prompt_value: str | None = None
+                            guided_prompt_changed = False
+
                             # Create a container for the section title with improved styling and RAG retry button
                             with st.container(border=False):
                                 # Create columns for title and RAG retry button
-                                title_col, rag_col = st.columns([0.92, 0.08])
+                                title_col, rag_col = st.columns([0.9, 0.1], gap="small")
 
                                 with title_col:
-                                    st.markdown(f"""
-                                        <div style='background-color: #f5f5f5; padding: 0px 16px; border-radius: 8px;
-                                                margin: 16px 0 8px 0; border-left: 4px solid #1976d2;'>
-                                            <h4 style='color: #333; font-size: 1.2rem; margin: 0; font-weight: 600;'>
-                                                {display_section_name}
-                                            </h4>
-                                        </div>
-                                    """, unsafe_allow_html=True)
+                                    if allow_guided_prompt:
+                                        prompt_state_key = _make_guided_prompt_key(filename, section_key)
+                                        default_prompt_text = default_prompt_for_section or ""
+                                        guided_defaults = st.session_state.guided_prompt_defaults
+                                        stored_default = guided_defaults.get(prompt_state_key)
+                                        current_session_value = st.session_state.get(prompt_state_key)
+
+                                        # Initialize session state only if not present
+                                        if stored_default is None:
+                                            guided_defaults[prompt_state_key] = default_prompt_text
+                                            if current_session_value is None:
+                                                st.session_state[prompt_state_key] = default_prompt_text
+                                        elif stored_default != default_prompt_text:
+                                            if current_session_value is None or (current_session_value or "").strip() == stored_default.strip():
+                                                st.session_state[prompt_state_key] = default_prompt_text
+                                            guided_defaults[prompt_state_key] = default_prompt_text
+
+                                        # Add a styled label/tab above the text input
+                                        st.markdown(f"""
+                                            <div style='background: linear-gradient(135deg, #1976d2 0%, #1565c0 100%); 
+                                                    padding: 8px 16px; border-radius: 8px 8px 0 0; margin-bottom: 0;'>
+                                                <span style='color: white; font-weight: 600; font-size: 0.95rem;'>
+                                                    {display_section_name}
+                                                </span>
+                                            </div>
+                                        """, unsafe_allow_html=True)
+
+                                        # Use text_input for single-line field and rely solely on session state
+                                        user_prompt_value = st.text_input(
+                                            label="Guided prompt",
+                                            key=prompt_state_key,
+                                            label_visibility="collapsed",
+                                            placeholder="Refine the retrieval prompt for this section...",
+                                            help="Edit the sub-prompt used for RAG retries. Leave unchanged to reuse the automatic version."
+                                        )
+
+                                        trimmed_default = default_prompt_text.strip()
+                                        trimmed_current = (user_prompt_value or "").strip()
+                                        guided_prompt_changed = bool(trimmed_current) and trimmed_current != trimmed_default
+                                    else:
+                                        st.markdown(f"""
+                                            <div style='background-color: #f5f5f5; padding: 0px 16px; border-radius: 8px;
+                                                    margin: 16px 0 8px 0; border-left: 4px solid #1976d2;'>
+                                                <h4 style='color: #333; font-size: 1.2rem; margin: 0; font-weight: 600;'>
+                                                    {display_section_name}
+                                                </h4>
+                                            </div>
+                                        """, unsafe_allow_html=True)
 
                                 with rag_col:
-                                    st.markdown('<div style="margin-top: 16px;">', unsafe_allow_html=True)
-                                    # Add RAG retry button in the header
-                                    display_rag_retry_button_header(section_key, result, section_data)
-                                    st.markdown('</div>', unsafe_allow_html=True)
+                                    # Add RAG retry button in the header - aligned with text input
+                                    display_rag_retry_button_header(
+                                        section_key,
+                                        result,
+                                        section_data,
+                                        guided_prompt=user_prompt_value,
+                                        default_prompt=default_prompt_for_section,
+                                        prompt_changed=guided_prompt_changed,
+                                    )
 
                             # Display RAG analysis and retry results if available (below the header)
                             # Retry results are integrated into the main view; no separate section
@@ -550,7 +625,15 @@ def display_analysis_results(results: List[Dict[str, Any]]):
     display_tools_column(results_with_real_analysis, tools_col)
 
 
-def display_rag_retry_button_header(section_key: str, result: Dict[str, Any], section_data: Dict[str, Any]):
+def display_rag_retry_button_header(
+    section_key: str,
+    result: Dict[str, Any],
+    section_data: Dict[str, Any],
+    *,
+    guided_prompt: Optional[str] = None,
+    default_prompt: Optional[str] = None,
+    prompt_changed: bool = False,
+):
     """
     Display RAG retry button in the section header.
 
@@ -569,16 +652,31 @@ def display_rag_retry_button_header(section_key: str, result: Dict[str, Any], se
     # Instead, we'll create buttons directly without columns, stacked vertically
     # Analyze button removed per new agent/tool design
 
+    trimmed_prompt = (guided_prompt or "").strip()
+    trimmed_default = (default_prompt or "").strip()
+    use_custom_prompt = prompt_changed and bool(trimmed_prompt)
+    if not use_custom_prompt and trimmed_prompt and trimmed_prompt != trimmed_default:
+        use_custom_prompt = True
+
     if st.button("↻", key=f"retry_{retry_key}", help="Retry Retrieval (beta)", use_container_width=True):
         # Store the retry request in session state
         if "rag_retry_requests" not in st.session_state:
             st.session_state.rag_retry_requests = {}
 
-        st.session_state.rag_retry_requests[section_key] = {
+        request_payload: Dict[str, Any] = {
             "status": "requested",
             "section_data": section_data,
-            "result": result
+            "result": result,
+            "default_prompt": default_prompt,
         }
+
+        if use_custom_prompt:
+            request_payload["custom_prompt"] = trimmed_prompt
+            request_payload["guided_prompt_changed"] = True
+        else:
+            request_payload["guided_prompt_changed"] = False
+
+        st.session_state.rag_retry_requests[section_key] = request_payload
         st.rerun()
 
 
@@ -646,6 +744,12 @@ def display_rag_results_section(section_key: str):
         ai_section = retry_data.get("ai_section")
         if ai_section:
             with st.expander("🧠 AI Response (Retry) + Validation", expanded=True):
+                guided_prompt_text = retry_data.get("guided_prompt")
+                if isinstance(guided_prompt_text, str) and guided_prompt_text.strip():
+                    prompt_label = "Guided Prompt Used" if retry_data.get("used_custom_prompt") else "Automatic Prompt Used"
+                    st.markdown(f"**{prompt_label}:**")
+                    st.code(guided_prompt_text.strip())
+
                 # Analysis text with Markdown rendering
                 analysis_text = ai_section.get("Analysis", "")
                 if analysis_text:

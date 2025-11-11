@@ -13,22 +13,26 @@ root_dir = Path(__file__).parent.parent.parent  # This should point to the proje
 env_path = root_dir / '.env'
 
 # --- Logging Configuration ---
+# Set to True to enable application log files (app_*.log)
+ENABLE_APP_LOGGING = False  # Disabled by default - only console logging when False
+
 # Create logs directory if it doesn't exist
 logs_dir = root_dir / "logs"
 logs_dir.mkdir(exist_ok=True)
 
-# Create a timestamped log file for all application logs
-timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-app_log_file = logs_dir / f"app_{timestamp}.log"
+# Configure handlers based on ENABLE_APP_LOGGING
+handlers = [logging.StreamHandler()]  # Always have console output
+if ENABLE_APP_LOGGING:
+    # Create a timestamped log file for all application logs
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    app_log_file = logs_dir / f"app_{timestamp}.log"
+    handlers.append(logging.FileHandler(app_log_file, mode='a', encoding='utf-8'))
 
-# Configure root logger with both console and file handlers
+# Configure root logger
 logging.basicConfig(
     level=logging.DEBUG,
     format="%(asctime)s - %(threadName)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.StreamHandler(),  # Console output
-        logging.FileHandler(app_log_file, mode='a', encoding='utf-8')  # File output
-    ]
+    handlers=handlers
 )
 logger = logging.getLogger(__name__)
 
@@ -65,7 +69,7 @@ RERANKER_MODEL_PATH = os.environ.get("RERANKER_MODEL_PATH", "src/keyword_code/re
 
 # --- Interaction Logging Configuration ---
 # Set to True to enable detailed logging of BM25, semantic search, reranker, and LLM interactions
-ENABLE_INTERACTION_LOGGING = True  # Disabled by default
+ENABLE_INTERACTION_LOGGING = False  # Disabled by default
 
 # --- Databricks Models ---
 # Configuration for Databricks services
@@ -103,23 +107,25 @@ SAVED_PROMPTS = {
             {
                 "label": "Loans Analysis",
                 "prompt": (
-                    "1. What is the currency of the loan? \n"
-                    "2. What is the loan amount for different tranches and loan types such as 'A Loan', 'B1 Loan', 'C Loan'? \n"
-                    "3. What is the spread rate or margin rate for different loans? \n"
-                    "4. What are the business day definitions? \n"
-                    "5. What is the applicable business day convention for adjusting the interest payment date if the scheduled date falls on a non-business day? \n"
-                    "6. What are the interest payment dates? \n"
-                    "7. What are the interest terms, variable or fixed rate? Is it Term SOFR, NON-USD Index, or NCCR for different loans? \n"
-                    "8. What rounding adjustments, if any, are required for the interest rates? \n"
-                    "9. Interest shall accrue from day to day on what basis? \n"
-                    "10. What are the terms for partial prepayment / prepayment premium and allocation of principal amounts outstanding? \n"
-                    "11. What is the method for applying prepayments—is it pro rata basis or in inverse order of maturity? \n"
-                    "12. What are the repayment terms and can you list the full repayment schedule with dates? \n"
-                    "13. What are all the fees the borrower shall pay and the percentages / amounts? \n"
-                    "14. what is the commitment fee percentage on undisbursed amount of the loan? \n"
-                    "15. What are the terms for default interest? \n"
-                    "16. What is the maturity date? \n"
-                    "17. When does the availability period end? \n"
+                    "1. What is the Investment Number for this Project? \n"
+                    "2. When is this document Dated? \n"
+                    "3. What is the currency of the loan? \n"
+                    "4. What is the loan amount for different tranches and loan types such as 'A Loan', 'B1 Loan', 'C Loan'? \n"
+                    "5. What is the spread rate or margin rate for different loans? \n"
+                    "6. What are the business day definitions? \n"
+                    "7. What is the applicable business day convention for adjusting the interest payment date if the scheduled date falls on a non-business day? \n"
+                    "8. What are the interest payment dates? \n"
+                    "9. What are the interest terms, variable or fixed rate? Is it Term SOFR, NON-USD Index, or NCCR for different loans? \n"
+                    "10. What rounding adjustments, if any, are required for the interest rates? \n"
+                    "11. Interest shall accrue from day to day on what basis? \n"
+                    "12. What are the terms for partial prepayment / prepayment premium and allocation of principal amounts outstanding? \n"
+                    "13. What is the method for applying prepayments—is it pro rata basis or in inverse order of maturity? \n"
+                    "14. What are the repayment terms and can you list the full repayment schedule with dates? \n"
+                    "15. What are all the fees the borrower shall pay and the percentages / amounts? \n"
+                    "16. what is the commitment fee percentage on undisbursed amount of the loan? \n"
+                    "17. What are the terms for default interest? \n"
+                    "18. What is the maturity date? \n"
+                    "19. When does the availability period end? \n"
                 ),
             },
             {

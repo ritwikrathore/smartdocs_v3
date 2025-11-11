@@ -650,6 +650,7 @@ def process_file_wrapper(args):
                         "title": f"Keyword Group: {keyword_label}",
                         "sub_prompt": f"Occurrences of '{keyword_label}'",
                         "analysis_json": json.dumps(sub_prompt_payload, indent=2),
+                        "section_key": order_key,
                     }
                 )
 
@@ -829,6 +830,9 @@ def process_file_wrapper(args):
             try:
                 sub_analysis = json.loads(result["analysis_json"])
                 section_key = f"section_{i+1}_{result['title'].replace(' ', '_').lower()}"
+
+                # Track the section key on the sub-prompt payload so downstream UI can map prompts.
+                result.setdefault("section_key", section_key)
 
                 # Log the structure of the sub-analysis for debugging
                 logger.info(f"Sub-analysis structure for '{result['title']}': {list(sub_analysis.keys())}")

@@ -186,19 +186,28 @@ def export_to_word(exportable_results_list: List[Dict[str, Any]]) -> bytes:
             return [raw_locations]
         return []
 
-    def extract_clip_image(pdf_document: fitz.Document | None, location: Dict[str, Any]) -> bytes | None:
+    def extract_clip_image(pdf_document: fitz.Document | None, location: Dict[str, Any], all_locations: List[Dict[str, Any]] = None) -> bytes | None:
+        """
+        Extract a clip image from the PDF. If multiple locations are provided on the same page,
+        creates a bounding box that encompasses all of them (useful for exact match highlights
+        that span multiple regions like clause number + full clause text).
+        
+        Args:
+            pdf_document: The PDF document
+            location: Primary location dict with page_num and rect
+            all_locations: Optional list of all candidate locations for this phrase
+            
+        Returns:
+            PNG image bytes or None if extraction fails
+        """
         if pdf_document is None or not isinstance(location, dict):
             return None
 
         page_index = location.get("page_num")
-        rect_coords = location.get("rect")
 
         try:
             page_index = int(page_index)
         except Exception:
-            return None
-
-        if not isinstance(rect_coords, (list, tuple)) or len(rect_coords) != 4:
             return None
 
         try:
@@ -207,7 +216,43 @@ def export_to_word(exportable_results_list: List[Dict[str, Any]]) -> bytes:
             logger.error(f"Failed to access page {page_index} for citation snapshot: {e}")
             return None
 
-        clip_rect = fitz.Rect(rect_coords)
+        # Collect all rectangles on the same page
+        rects_to_include = []
+        
+        # Add the primary location's rect
+        rect_coords = location.get("rect")
+        if isinstance(rect_coords, (list, tuple)) and len(rect_coords) == 4:
+            rects_to_include.append(fitz.Rect(rect_coords))
+        
+        # If we have additional locations, check for same-page rects
+        if all_locations and isinstance(all_locations, list):
+            for loc in all_locations:
+                if not isinstance(loc, dict):
+                    continue
+                    
+                # Only include locations from the same page
+                loc_page = loc.get("page_num")
+                try:
+                    loc_page = int(loc_page)
+                except Exception:
+                    continue
+                    
+                if loc_page == page_index:
+                    loc_rect_coords = loc.get("rect")
+                    if isinstance(loc_rect_coords, (list, tuple)) and len(loc_rect_coords) == 4:
+                        loc_rect = fitz.Rect(loc_rect_coords)
+                        # Only add if it's not a duplicate and not empty
+                        if not loc_rect.is_empty and not any(loc_rect == r for r in rects_to_include):
+                            rects_to_include.append(loc_rect)
+        
+        if not rects_to_include:
+            return None
+        
+        # Create a combined bounding box that encompasses all rectangles
+        clip_rect = rects_to_include[0]
+        for rect in rects_to_include[1:]:
+            clip_rect.include_rect(rect)
+        
         if clip_rect.is_empty:
             return None
 
@@ -259,6 +304,7 @@ def export_to_word(exportable_results_list: List[Dict[str, Any]]) -> bytes:
         phrase_details_map = file_result.get("phrase_details", {}) or {}
         phrase_locations_map = file_result.get("phrase_locations", {}) or {}
         annotated_pdf_b64 = file_result.get("annotated_pdf")
+        section_to_prompt = file_result.get("section_to_prompt", {}) or {}
         annotated_pdf_doc = None
 
         if annotated_pdf_b64:
@@ -279,9 +325,14 @@ def export_to_word(exportable_results_list: List[Dict[str, Any]]) -> bytes:
             for section_idx, (section_key, section_data) in enumerate(analysis_sections):
                 if section_idx > 0:
                     doc.add_page_break()
-                # Add section heading
-                section_name = section_key.replace("_", " ").title()
-                doc.add_heading(section_name, 2)
+                
+                # Use original sub_prompt as section heading if available, otherwise use formatted section name
+                original_prompt = section_to_prompt.get(section_key)
+                if original_prompt:
+                    doc.add_heading(original_prompt, 2)
+                else:
+                    section_name = section_key.replace("_", " ").title()
+                    doc.add_heading(section_name, 2)
 
                 # Add analysis text
                 if section_data.get("Analysis"):
@@ -374,7 +425,9 @@ def export_to_word(exportable_results_list: List[Dict[str, Any]]) -> bytes:
                             details_run.font.size = Pt(9)
 
                         # Attach a citation snapshot when possible.
-                        snapshot_bytes = extract_clip_image(annotated_pdf_doc, best_location) if best_location else None
+                        # Pass all candidate locations so the image can capture multiple highlights on the same page
+                        # (e.g., clause number "5.3" + full clause text as separate highlights)
+                        snapshot_bytes = extract_clip_image(annotated_pdf_doc, best_location, candidate_locations) if best_location else None
                         if snapshot_bytes:
                             try:
                                 img_stream = BytesIO(snapshot_bytes)

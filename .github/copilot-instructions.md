@@ -34,6 +34,6 @@
 - Monitor large objects with `memory_monitor.cleanup_memory` instead of manual `del`—the app auto-clears embeddings when RAM pressure is high.
 
 ## Local Development
-- Install with `pip install -r requirements.txt` (Python 3.11+ recommended); launch with `streamlit run Home.py` from the repo root.
+- Install with `python -m pip install -r requirements.txt` (Python 3.11+ recommended); launch with `streamlit run Home.py` from the repo root.
 - spaCy model `en_core_web_sm` is downloaded at runtime into `models/spacy/`; ensure write access when running locally or in CI.
 - Tests folder is currently empty—manual verification relies on logs, annotated PDFs, and fact extraction outputs; add regression notebooks or Streamlit scripts near `tests/` if needed.
