@@ -239,26 +239,22 @@ def display_analysis_results(results: List[Dict[str, Any]]):
                                                 st.session_state[prompt_state_key] = default_prompt_text
                                             guided_defaults[prompt_state_key] = default_prompt_text
 
-                                        # Add a styled label/tab above the text input
-                                        st.markdown(f"""
-                                            <div style='background: linear-gradient(135deg, #1976d2 0%, #1565c0 100%); 
-                                                    padding: 8px 16px; border-radius: 8px 8px 0 0; margin-bottom: 0;'>
-                                                <span style='color: white; font-weight: 600; font-size: 0.95rem;'>
-                                                    {display_section_name}
-                                                </span>
-                                            </div>
-                                        """, unsafe_allow_html=True)
+                                        trimmed_default = (default_prompt_text or "").strip()
+                                        if trimmed_default and not (st.session_state.get(prompt_state_key) or "").strip():
+                                            # Ensure the guided prompt field displays the original question when empty
+                                            st.session_state[prompt_state_key] = trimmed_default
+
+                                        placeholder_text = trimmed_default or "Refine the retrieval prompt for this section..."
 
                                         # Use text_input for single-line field and rely solely on session state
                                         user_prompt_value = st.text_input(
                                             label="Guided prompt",
                                             key=prompt_state_key,
                                             label_visibility="collapsed",
-                                            placeholder="Refine the retrieval prompt for this section...",
+                                            placeholder=placeholder_text,
                                             help="Edit the sub-prompt used for RAG retries. Leave unchanged to reuse the automatic version."
                                         )
 
-                                        trimmed_default = default_prompt_text.strip()
                                         trimmed_current = (user_prompt_value or "").strip()
                                         guided_prompt_changed = bool(trimmed_current) and trimmed_current != trimmed_default
                                     else:
@@ -296,7 +292,7 @@ def display_analysis_results(results: List[Dict[str, Any]]):
 
                                     analysis_html_parts = [
                                         f"<div style='background-color: #f8f9fa; padding: .5rem; border-radius: 0.5rem; margin-bottom: 1rem;'>",
-                                        f"<h4 style='color: #1e88e5; font-size: 1.1rem;'>Analysis</h4>",
+                                        f"<h4 style='color: #1e88e5; font-size: 1.1rem;'>{display_section_name}</h4>",
                                         f"<div style='color: #424242; line-height: 1.6;'>{rendered_analysis}"
                                     ]
                                     if context_content:
@@ -508,9 +504,6 @@ def display_analysis_results(results: List[Dict[str, Any]]):
             # Add Follow-up Question Interface at the bottom of the analysis results
             st.markdown('<hr style="margin: 20px 0; border: 0; border-top: 2px solid #e0e0e0;">', unsafe_allow_html=True)
             st.markdown('<div class="header-title" style="font-size: 1.3rem;">Follow-up Questions [Beta]</div>', unsafe_allow_html=True)
-            st.caption("Ask follow-up questions to get more specific insights about your documents. AI will use the same document context to provide detailed answers.")
-            st.caption("⚠ This feature is still in beta. Some features like PDF annotation might not function as expected.")
-            st.markdown('<hr style="margin: 12px 0; border: 0; border-top: 1px solid #e0e0e0;">', unsafe_allow_html=True)
 
             # Display existing follow-up Q&A if any
             if st.session_state.get("followup_qa"):
@@ -547,7 +540,7 @@ def display_analysis_results(results: List[Dict[str, Any]]):
             input_col, button_col = st.columns([0.90, 0.10], gap="small")
             with input_col:
                 followup_question = st.text_input(
-                    "Ask a follow-up question about the analysis:",
+                    "Ask follow-up questions to get more specific insights about your documents. AI will use the same document context to provide detailed answers:",
                     placeholder="e.g., Can you provide more details about the investment timeline?",
                     key="followup_question_input"
                 )

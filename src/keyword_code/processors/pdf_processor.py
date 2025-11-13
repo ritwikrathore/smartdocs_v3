@@ -5,11 +5,13 @@ PDF processing functionality.
 import json
 import fitz  # PyMuPDF
 import re
+import unicodedata
 from typing import Any, Dict, List, Optional, Tuple
 from thefuzz import fuzz
 from ..config import (
     logger, FUZZY_MATCH_THRESHOLD,
-    SENTENCES_PER_CHUNK, MIN_CHUNK_CHAR_LENGTH
+    SENTENCES_PER_CHUNK, MIN_CHUNK_CHAR_LENGTH,
+    highlight_debug_logger, ENABLE_HIGHLIGHT_DEBUG_LOGGING
 )
 from ..utils.helpers import normalize_text, remove_markdown_formatting
 from ..utils.spacy_utils import ensure_spacy_model
@@ -18,6 +20,51 @@ from ..rag.chunking import SentenceChunker, create_chunks_from_text
 
 class PDFProcessor:
     """Handles PDF processing, chunking, verification, and annotation."""
+
+    _HIGHLIGHT_METHOD_PRIORITY: Dict[str, int] = {
+        "exact_cleaned_search": 0,
+        "exact_original_search": 0,
+        "exact_normalized_search": 0,
+        "exact_quote_stripped_search": 0,
+        "exact_with_section_prefix": 0,
+        "exact_normalized_with_section_prefix": 0,
+        "exact_original_search_expanded": 0,
+        "exact_normalized_search_expanded": 0,
+        "exact_quote_stripped_search_expanded": 0,
+        "exact_with_section_prefix_expanded": 0,
+        "exact_normalized_with_section_prefix_expanded": 0,
+        "fuzzy_span_match": 1,
+        "cross_page_fuzzy_match_part1": 2,
+        "cross_page_fuzzy_match_part2": 2,
+        "special_case_quotes_handling": 2,
+        "fuzzy_chunk_fallback_individual": 3,
+        "fuzzy_chunk_fallback": 4,
+    }
+
+    _SEARCH_CHAR_TRANSLATION = {
+        ord("\u2010"): "-",
+        ord("\u2011"): "-",
+        ord("\u2012"): "-",
+        ord("\u2013"): "-",
+        ord("\u2014"): "-",
+        ord("\u2015"): "-",
+        ord("\u2212"): "-",
+        ord("\u00ad"): "",
+        ord("\ufb01"): "fi",
+        ord("\ufb02"): "fl",
+    }
+
+    _QUOTE_TRANSLATION = {
+        ord("\u201c"): '"',
+        ord("\u201d"): '"',
+        ord("\u201e"): '"',
+        ord("\u201f"): '"',
+        ord("\u2019"): "'",
+        ord("\u2018"): "'",
+        ord("\u2032"): "'",
+        ord("\u2035"): "'",
+        ord("\u0060"): "'",
+    }
 
     def __init__(self, pdf_bytes: bytes):
         if not isinstance(pdf_bytes, bytes):
@@ -247,6 +294,7 @@ class PDFProcessor:
         """Verifies AI phrases from the aggregated analysis against chunks and locates them."""
         verification_results = {}
         phrase_locations = {}
+        method_stats: Dict[str, int] = {}
 
         chunks_data = self.chunks
         if not chunks_data:
@@ -336,6 +384,43 @@ class PDFProcessor:
                     if not normalized_phrase: continue
 
                     found_match_for_phrase = False
+                    phrase_matches: List[Dict[str, Any]] = []
+                    phrase_best_priority: Optional[int] = None
+
+                    # Initialize highlight debug tracking for this phrase
+                    if ENABLE_HIGHLIGHT_DEBUG_LOGGING and highlight_debug_logger:
+                        highlight_debug_logger.info("="*100)
+                        highlight_debug_logger.info(f"PHRASE: {original_phrase}")
+                        highlight_debug_logger.info(f"  Pre-normalization: '{original_phrase}'")
+                        highlight_debug_logger.info(f"  Post-normalization (for fuzzy): '{normalized_phrase}'")
+                        highlight_debug_logger.info("-"*100)
+
+                    def add_match(method: str, match_data: Dict[str, Any]) -> None:
+                        """Record a match while retaining only the highest-priority methods per phrase."""
+                        nonlocal phrase_matches, phrase_best_priority
+                        priority = self._get_method_priority(method)
+
+                        if phrase_best_priority is None or priority < phrase_best_priority:
+                            if phrase_matches and priority < (phrase_best_priority or 99):
+                                logger.debug(
+                                    "Dropping %d lower-priority highlight(s) for phrase '%s' in favor of method '%s'.",
+                                    len(phrase_matches),
+                                    original_phrase[:60],
+                                    method,
+                                )
+                            phrase_matches = [{**match_data, "method": method}]
+                            phrase_best_priority = priority
+                            return
+
+                        if priority == phrase_best_priority:
+                            phrase_matches.append({**match_data, "method": method})
+                            return
+
+                        logger.debug(
+                            "Skipping lower-priority highlight method '%s' for phrase '%s' because better match already exists.",
+                            method,
+                            original_phrase[:60],
+                        )
 
                     # Log the normalized phrase for debugging
                     logger.debug(f"Normalized phrase for verification: '{normalized_phrase}'")
@@ -374,47 +459,96 @@ class PDFProcessor:
 
                                 if not clip_rect.is_empty:
                                     try:
-                                        cleaned_search_phrase = remove_markdown_formatting(original_phrase)
-                                        cleaned_search_phrase = re.sub(r"\s+", " ", cleaned_search_phrase).strip()
-                                        instances = page.search_for(cleaned_search_phrase, clip=clip_rect, quads=False)
+                                        exact_hits = self._find_exact_matches(
+                                            page=page,
+                                            clip_rect=clip_rect,
+                                            original_phrase=original_phrase,
+                                            chunk_text=chunk.get("text"),
+                                        )
 
-                                        if instances:
-                                            logger.debug(f"Found {len(instances)} instance(s) via search_for in chunk {chunk['chunk_id']} area for '{cleaned_search_phrase[:60]}...'")
-                                            for rect in instances:
+                                        if exact_hits:
+                                            logger.debug(
+                                                "Found %d exact match instance(s) in chunk %s for phrase '%s'",
+                                                len(exact_hits),
+                                                chunk.get("chunk_id"),
+                                                original_phrase[:60],
+                                            )
+                                            if ENABLE_HIGHLIGHT_DEBUG_LOGGING and highlight_debug_logger:
+                                                highlight_debug_logger.info(f"  ✓ EXACT MATCH in chunk {chunk.get('chunk_id')}")
+                                                for rect, method in exact_hits:
+                                                    highlight_debug_logger.info(f"    Method: {method}")
+                                            for rect, method in exact_hits:
                                                 if isinstance(rect, fitz.Rect) and not rect.is_empty:
-                                                    phrase_locations[original_phrase].append({
-                                                        "page_num": page_num,
-                                                        "rect": [rect.x0, rect.y0, rect.x1, rect.y1],
-                                                        "chunk_id": chunk["chunk_id"],
-                                                        "match_score": score,
-                                                        "method": "exact_cleaned_search",
-                                                    })
-                                        else:
-                                            # Fallback to chunk bounding box if exact search fails within the verified chunk
-                                            logger.debug(f"Exact search failed for '{cleaned_search_phrase[:60]}...' in verified chunk {chunk['chunk_id']} (score: {score}). Falling back to chunk bbox.")
-
-                                            # Try to find a more precise area to highlight by looking at individual bboxes
-                                            # rather than the combined clip_rect which can be very large
-                                            individual_bboxes = chunk.get('bboxes', [])
-                                            if individual_bboxes and len(individual_bboxes) <= 3:  # Only use individual boxes if there aren't too many
-                                                for bbox in individual_bboxes:
-                                                    if isinstance(bbox, fitz.Rect) and not bbox.is_empty:
-                                                        phrase_locations[original_phrase].append({
+                                                    add_match(
+                                                        method,
+                                                        {
                                                             "page_num": page_num,
-                                                            "rect": [bbox.x0, bbox.y0, bbox.x1, bbox.y1],
-                                                            "chunk_id": chunk["chunk_id"],
+                                                            "rect": [rect.x0, rect.y0, rect.x1, rect.y1],
+                                                            "chunk_id": chunk.get("chunk_id"),
                                                             "match_score": score,
-                                                            "method": "fuzzy_chunk_fallback_individual",
-                                                        })
+                                                        },
+                                                    )
+                                        else:
+                                            # Try fuzzy span matching within the chunk before falling back to full chunk
+                                            logger.debug(
+                                                "Exact search failed for phrase '%s' in verified chunk %s (score: %s). Trying fuzzy span matching.",
+                                                original_phrase[:60],
+                                                chunk.get("chunk_id"),
+                                                score,
+                                            )
+                                            
+                                            fuzzy_span_match = self._find_fuzzy_span_in_chunk(
+                                                original_phrase=original_phrase,
+                                                chunk=chunk,
+                                                page=page,
+                                                doc=doc,
+                                                fuzzy_score=score,
+                                            )
+                                            
+                                            if fuzzy_span_match:
+                                                if ENABLE_HIGHLIGHT_DEBUG_LOGGING and highlight_debug_logger:
+                                                    highlight_debug_logger.info(f"  ✓ FUZZY SPAN MATCH in chunk {chunk.get('chunk_id')} (score: {score})")
+                                                    highlight_debug_logger.info(f"    Matched span: '{fuzzy_span_match.get('matched_text', '')[:100]}...'")
+                                                
+                                                add_match(
+                                                    "fuzzy_span_match",
+                                                    {
+                                                        "page_num": page_num,
+                                                        "rect": fuzzy_span_match["rect"],
+                                                        "chunk_id": chunk.get("chunk_id"),
+                                                        "match_score": score,
+                                                    },
+                                                )
                                             else:
-                                                # If there are too many individual boxes or none, fall back to the combined area
-                                                phrase_locations[original_phrase].append({
-                                                    "page_num": page_num,
-                                                    "rect": [clip_rect.x0, clip_rect.y0, clip_rect.x1, clip_rect.y1],
-                                                    "chunk_id": chunk["chunk_id"],
-                                                    "match_score": score,
-                                                    "method": "fuzzy_chunk_fallback",
-                                                })
+                                                # Final fallback to chunk bounding box
+                                                if ENABLE_HIGHLIGHT_DEBUG_LOGGING and highlight_debug_logger:
+                                                    highlight_debug_logger.info(f"  ✗ FALLBACK in chunk {chunk.get('chunk_id')} (fuzzy score: {score})")
+                                                    chunk_text_sample = chunk.get("text", "")[:200].replace("\n", " ")
+                                                    highlight_debug_logger.info(f"    Chunk text sample: '{chunk_text_sample}...'")
+
+                                                individual_bboxes = chunk.get('bboxes', [])
+                                                if individual_bboxes and len(individual_bboxes) <= 3:
+                                                    for bbox in individual_bboxes:
+                                                        if isinstance(bbox, fitz.Rect) and not bbox.is_empty:
+                                                            add_match(
+                                                                "fuzzy_chunk_fallback_individual",
+                                                                {
+                                                                    "page_num": page_num,
+                                                                    "rect": [bbox.x0, bbox.y0, bbox.x1, bbox.y1],
+                                                                    "chunk_id": chunk.get("chunk_id"),
+                                                                    "match_score": score,
+                                                                },
+                                                            )
+                                                elif not clip_rect.is_empty:
+                                                    add_match(
+                                                        "fuzzy_chunk_fallback",
+                                                        {
+                                                            "page_num": page_num,
+                                                            "rect": [clip_rect.x0, clip_rect.y0, clip_rect.x1, clip_rect.y1],
+                                                            "chunk_id": chunk.get("chunk_id"),
+                                                            "match_score": score,
+                                                        },
+                                                    )
                                     except Exception as search_err: logger.error(f"Error during search_for/fallback in chunk {chunk['chunk_id']}: {search_err}")
                             # else: logger.warning(f"Invalid page number {page_num} for chunk {chunk['chunk_id']}")
 
@@ -466,13 +600,15 @@ class PDFProcessor:
                                                 elif isinstance(bbox, (list, tuple)) and len(bbox) == 4: clip_rect_A.include_rect(fitz.Rect(bbox))
                                             except Exception as bbox_err: logger.warning(f"Skipping invalid bbox {bbox} in chunk {chunk_A['chunk_id']}: {bbox_err}")
                                         if not clip_rect_A.is_empty:
-                                            phrase_locations[original_phrase].append({
-                                                "page_num": page_A_num,
-                                                "rect": [clip_rect_A.x0, clip_rect_A.y0, clip_rect_A.x1, clip_rect_A.y1],
-                                                "chunk_id": chunk_A["chunk_id"],
-                                                "match_score": score,  # Use combined score
-                                                "method": "cross_page_fuzzy_match_part1",
-                                            })
+                                            add_match(
+                                                "cross_page_fuzzy_match_part1",
+                                                {
+                                                    "page_num": page_A_num,
+                                                    "rect": [clip_rect_A.x0, clip_rect_A.y0, clip_rect_A.x1, clip_rect_A.y1],
+                                                    "chunk_id": chunk_A.get("chunk_id"),
+                                                    "match_score": score,
+                                                },
+                                            )
 
                                     # Location for chunk_B part (page N+1)
                                     page_B_num = chunk_B["page_num"]
@@ -484,13 +620,15 @@ class PDFProcessor:
                                                 elif isinstance(bbox, (list, tuple)) and len(bbox) == 4: clip_rect_B.include_rect(fitz.Rect(bbox))
                                             except Exception as bbox_err: logger.warning(f"Skipping invalid bbox {bbox} in chunk {chunk_B['chunk_id']}: {bbox_err}")
                                         if not clip_rect_B.is_empty:
-                                            phrase_locations[original_phrase].append({
-                                                "page_num": page_B_num,
-                                                "rect": [clip_rect_B.x0, clip_rect_B.y0, clip_rect_B.x1, clip_rect_B.y1],
-                                                "chunk_id": chunk_B["chunk_id"],
-                                                "match_score": score,  # Use combined score
-                                                "method": "cross_page_fuzzy_match_part2",
-                                            })
+                                            add_match(
+                                                "cross_page_fuzzy_match_part2",
+                                                {
+                                                    "page_num": page_B_num,
+                                                    "rect": [clip_rect_B.x0, clip_rect_B.y0, clip_rect_B.x1, clip_rect_B.y1],
+                                                    "chunk_id": chunk_B.get("chunk_id"),
+                                                    "match_score": score,
+                                                },
+                                            )
                                     break  # Found a cross-page match for this phrase, move to the next phrase
 
                     # Special case handling for phrases with quotation marks
@@ -529,17 +667,25 @@ class PDFProcessor:
                                         except Exception as bbox_err: logger.warning(f"Skipping invalid bbox {bbox} in chunk {chunk['chunk_id']}: {bbox_err}")
 
                                     if not clip_rect.is_empty:
-                                        phrase_locations[original_phrase].append({
-                                            "page_num": page_num,
-                                            "rect": [clip_rect.x0, clip_rect.y0, clip_rect.x1, clip_rect.y1],
-                                            "chunk_id": chunk["chunk_id"],
-                                            "match_score": score,
-                                            "method": "special_case_quotes_handling",
-                                        })
+                                        add_match(
+                                            "special_case_quotes_handling",
+                                            {
+                                                "page_num": page_num,
+                                                "rect": [clip_rect.x0, clip_rect.y0, clip_rect.x1, clip_rect.y1],
+                                                "chunk_id": chunk.get("chunk_id"),
+                                                "match_score": score,
+                                            },
+                                        )
                                 break  # Found a match, no need to check other chunks
 
                     if not found_match_for_phrase:
                         logger.warning(f"NOT Verified: '{original_phrase[:60]}...' did not meet fuzzy threshold ({FUZZY_MATCH_THRESHOLD}) in any chunk or cross-page combination.")
+
+                    phrase_locations[original_phrase] = phrase_matches
+                    if phrase_matches:
+                        for match in phrase_matches:
+                            method = match.get("method")
+                            method_stats[method] = method_stats.get(method, 0) + 1
             finally:
                 if doc: doc.close()
 
@@ -548,6 +694,20 @@ class PDFProcessor:
             logger.debug(f"Problematic JSON string: {ai_analysis_json_str[:500]}...")  # Log start of bad JSON
         except Exception as e:
             logger.error(f"Error during phrase verification and location: {str(e)}", exc_info=True)
+
+        total_highlights = sum(method_stats.values())
+        if total_highlights:
+            breakdown = []
+            for method, count in sorted(method_stats.items(), key=lambda item: (self._get_method_priority(item[0]), item[0])):
+                percentage = (count / total_highlights) * 100
+                breakdown.append(f"{method}: {count} ({percentage:.1f}%)")
+            logger.info(
+                "Highlight method breakdown (total %d): %s",
+                total_highlights,
+                "; ".join(breakdown),
+            )
+        else:
+            logger.info("Highlight method breakdown: no highlights recorded.")
 
         return verification_results, phrase_locations
 
@@ -619,3 +779,314 @@ class PDFProcessor:
             return self.pdf_bytes  # Return original on error
         finally:
             if doc: doc.close()
+
+    @classmethod
+    def _get_method_priority(cls, method: Optional[str]) -> int:
+        if not method:
+            return 99
+        if method in cls._HIGHLIGHT_METHOD_PRIORITY:
+            return cls._HIGHLIGHT_METHOD_PRIORITY[method]
+        if method.endswith("_expanded"):
+            base = method.rsplit("_expanded", 1)[0]
+            if base in cls._HIGHLIGHT_METHOD_PRIORITY:
+                return cls._HIGHLIGHT_METHOD_PRIORITY[base]
+        if method.startswith("exact_"):
+            return 0
+        return 99
+
+    @classmethod
+    def _get_search_flags(cls, *, ignore_case: bool = True) -> int:
+        flags = 0
+        for attr in ("TEXT_DEHYPHENATE", "TEXT_PRESERVE_WHITESPACE", "TEXT_PRESERVE_LIGATURES"):
+            flags |= getattr(fitz, attr, 0)
+        if ignore_case:
+            flags |= getattr(fitz, "TEXT_IGNORECASE", 0)
+        return flags
+
+    @classmethod
+    def _normalize_for_search(
+        cls,
+        text: str,
+        *,
+        convert_quotes: bool = False,
+        strip_quotes: bool = False,
+    ) -> str:
+        normalized = unicodedata.normalize("NFKC", text)
+        normalized = normalized.replace("\u00A0", " ")
+        normalized = normalized.translate(cls._SEARCH_CHAR_TRANSLATION)
+        if convert_quotes:
+            normalized = normalized.translate(cls._QUOTE_TRANSLATION)
+        if strip_quotes:
+            normalized = normalized.replace('"', "").replace("'", "")
+        normalized = re.sub(r"\s+", " ", normalized)
+        return normalized.strip()
+
+    @classmethod
+    def _build_search_candidates(
+        cls,
+        original_phrase: str,
+        chunk_text: Optional[str] = None,
+    ) -> List[Tuple[str, str]]:
+        candidates: List[Tuple[str, str]] = []
+        if not original_phrase:
+            return candidates
+
+        seen: Dict[str, bool] = {}
+
+        def add_candidate(label: str, value: str) -> None:
+            candidate = value.strip()
+            if candidate and candidate not in seen:
+                seen[candidate] = True
+                candidates.append((label, candidate))
+
+        # Base normalized versions
+        normalized_original = cls._normalize_for_search(original_phrase, convert_quotes=False, strip_quotes=False)
+        add_candidate("exact_original_search", normalized_original)
+        add_candidate(
+            "exact_normalized_search",
+            cls._normalize_for_search(original_phrase, convert_quotes=True, strip_quotes=False),
+        )
+        add_candidate(
+            "exact_quote_stripped_search",
+            cls._normalize_for_search(original_phrase, convert_quotes=True, strip_quotes=True),
+        )
+
+        # DISABLED: Extract section header prefixes from chunk text if available
+        # This caused regression - needs more careful implementation
+        # if chunk_text and normalized_original:
+        #     prefixes = cls._extract_section_prefixes(chunk_text, normalized_original)
+        #     for prefix in prefixes:
+        #         # Try adding the prefix to each base candidate
+        #         add_candidate(
+        #             "exact_with_section_prefix",
+        #             prefix + normalized_original
+        #         )
+        #         # Also try normalized version with prefix
+        #         normalized_with_quotes = cls._normalize_for_search(original_phrase, convert_quotes=True, strip_quotes=False)
+        #         if normalized_with_quotes != normalized_original:
+        #             add_candidate(
+        #                 "exact_normalized_with_section_prefix",
+        #                 prefix + normalized_with_quotes
+        #             )
+
+        return candidates
+
+    @classmethod
+    def _extract_section_prefixes(cls, chunk_text: str, normalized_phrase: str) -> List[str]:
+        """Extract potential section header prefixes from chunk text that precede the phrase."""
+        prefixes: List[str] = []
+        if not chunk_text or not normalized_phrase:
+            return prefixes
+
+        # Normalize chunk text for comparison
+        normalized_chunk = cls._normalize_for_search(chunk_text, convert_quotes=False, strip_quotes=False)
+        
+        # Find where the phrase might appear in the chunk
+        phrase_start_pos = normalized_chunk.find(normalized_phrase[:50])  # Use first 50 chars for matching
+        if phrase_start_pos == -1:
+            return prefixes
+
+        # Extract text before the phrase (up to 100 chars)
+        prefix_text = normalized_chunk[max(0, phrase_start_pos - 100):phrase_start_pos]
+        
+        # Common legal document section header patterns
+        patterns = [
+            r'([A-Z][a-z]+\.\s*\([a-z]\)\s*)$',  # "Fees. (a) "
+            r'(\([a-z]+\)\s*)$',                   # "(a) " or "(iv) "
+            r'(\d+\.\d+\s+[A-Z][a-z]+\.\s*)$',    # "2.07 Fees. "
+            r'(\d+\.\d+\s*)$',                     # "2.07 "
+            r'([A-Z][a-z]+\s+\d+\.\d+\s*)$',      # "Section 2.07 "
+            r'([A-Z][A-Z\s]+\.\s*)$',              # "DEFAULT RATE INTEREST. "
+            r'(\([a-z]\)\s+[A-Z][a-z]+\.\s*)$',   # "(a) Fees. "
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, prefix_text)
+            if match:
+                prefix = match.group(1)
+                # Verify this prefix + phrase exists in original chunk
+                if (prefix + normalized_phrase[:30]) in normalized_chunk:
+                    prefixes.append(prefix)
+                    break  # Use first matching pattern
+
+        return prefixes
+
+    @staticmethod
+    def _expand_rect(rect: fitz.Rect, expand_by: float, page: fitz.Page) -> fitz.Rect:
+        if rect.is_empty or expand_by <= 0:
+            return rect
+        page_rect = page.rect
+        expanded = fitz.Rect(
+            max(rect.x0 - expand_by, page_rect.x0),
+            max(rect.y0 - expand_by, page_rect.y0),
+            min(rect.x1 + expand_by, page_rect.x1),
+            min(rect.y1 + expand_by, page_rect.y1),
+        )
+        return expanded
+
+    def _find_exact_matches(
+        self,
+        *,
+        page: fitz.Page,
+        clip_rect: fitz.Rect,
+        original_phrase: str,
+        chunk_text: Optional[str] = None,
+    ) -> List[Tuple[fitz.Rect, str]]:
+        if not original_phrase:
+            return []
+
+        candidates = self._build_search_candidates(original_phrase, chunk_text)
+        if not candidates:
+            return []
+
+        if ENABLE_HIGHLIGHT_DEBUG_LOGGING and highlight_debug_logger:
+            highlight_debug_logger.info(f"  Search candidates generated: {len(candidates)}")
+            for idx, (label, candidate) in enumerate(candidates, 1):
+                highlight_debug_logger.info(f"    Candidate {idx} ({label}): '{candidate}'")
+
+        flags = self._get_search_flags(ignore_case=True)
+
+        results: List[Tuple[fitz.Rect, str]] = []
+        target_rect = fitz.Rect(clip_rect) if clip_rect and not clip_rect.is_empty else None
+
+        for label, candidate in candidates:
+            try:
+                if target_rect:
+                    search_hits = page.search_for(candidate, clip=target_rect, flags=flags, quads=False)
+                else:
+                    search_hits = page.search_for(candidate, flags=flags, quads=False)
+            except Exception as search_error:
+                logger.debug("Exact search error for candidate '%s': %s", candidate[:80], search_error)
+                if ENABLE_HIGHLIGHT_DEBUG_LOGGING and highlight_debug_logger:
+                    highlight_debug_logger.info(f"    Search error for '{label}': {search_error}")
+                continue
+
+            if search_hits:
+                if ENABLE_HIGHLIGHT_DEBUG_LOGGING and highlight_debug_logger:
+                    highlight_debug_logger.info(f"    ✓ Match found with '{label}' ({len(search_hits)} instance(s))")
+                for rect in search_hits:
+                    results.append((rect, label))
+                return results
+            else:
+                if ENABLE_HIGHLIGHT_DEBUG_LOGGING and highlight_debug_logger:
+                    highlight_debug_logger.info(f"    ✗ No match with '{label}'")
+
+        if target_rect:
+            expanded = self._expand_rect(target_rect, 2.0, page)
+            if expanded and expanded != target_rect and not expanded.is_empty:
+                if ENABLE_HIGHLIGHT_DEBUG_LOGGING and highlight_debug_logger:
+                    highlight_debug_logger.info(f"  Trying expanded clip rectangle...")
+                for label, candidate in candidates:
+                    try:
+                        search_hits = page.search_for(candidate, clip=expanded, flags=flags, quads=False)
+                    except Exception as search_error:
+                        logger.debug("Expanded search error for candidate '%s': %s", candidate[:80], search_error)
+                        continue
+
+                    if search_hits:
+                        if ENABLE_HIGHLIGHT_DEBUG_LOGGING and highlight_debug_logger:
+                            highlight_debug_logger.info(f"    ✓ Match found with expanded '{label}' ({len(search_hits)} instance(s))")
+                        for rect in search_hits:
+                            results.append((rect, f"{label}_expanded"))
+                        return results
+
+        return results
+
+    def _find_fuzzy_span_in_chunk(
+        self,
+        *,
+        original_phrase: str,
+        chunk: Dict[str, Any],
+        page: fitz.Page,
+        doc: fitz.Document,
+        fuzzy_score: float,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Find the best fuzzy matching span within a chunk's text when exact search fails.
+        Returns bounding box for the matched span to enable precise highlighting.
+        """
+        chunk_text = chunk.get("text", "")
+        if not chunk_text or not original_phrase:
+            return None
+
+        # Normalize both for comparison
+        normalized_phrase = normalize_text(remove_markdown_formatting(original_phrase))
+        normalized_chunk = normalize_text(chunk_text)
+
+        # Use sliding window to find best matching span
+        phrase_words = normalized_phrase.split()
+        chunk_words = normalized_chunk.split()
+        
+        if len(phrase_words) < 3:  # Too short, not reliable
+            return None
+
+        best_score = 0
+        best_start_word = -1
+        best_end_word = -1
+        window_size = len(phrase_words)
+
+        # Slide through chunk looking for best match
+        for i in range(len(chunk_words) - window_size + 1):
+            window = " ".join(chunk_words[i:i + window_size])
+            # Use token_set_ratio for better flexibility with word order
+            score = fuzz.token_set_ratio(normalized_phrase, window)
+            
+            if score > best_score:
+                best_score = score
+                best_start_word = i
+                best_end_word = i + window_size
+
+        # Require high similarity for fuzzy span match
+        if best_score < 85 or best_start_word == -1:
+            return None
+
+        # Get character positions in original chunk text
+        # Reconstruct from word positions
+        current_word_idx = 0
+        char_start = -1
+        char_end = -1
+        current_pos = 0
+
+        for char in chunk_text:
+            if current_word_idx == best_start_word and char_start == -1:
+                char_start = current_pos
+            if current_word_idx == best_end_word and char_end == -1:
+                char_end = current_pos
+                break
+            if char.isspace():
+                if current_pos > 0 and not chunk_text[current_pos - 1].isspace():
+                    current_word_idx += 1
+            current_pos += 1
+
+        if char_start == -1 or char_end == -1:
+            return None
+
+        matched_text = chunk_text[char_start:char_end]
+
+        # Try to find this span on the page
+        page_num = chunk.get("page_num", -1)
+        if not (0 <= page_num < doc.page_count):
+            return None
+
+        # Use page.search_for to find the matched span
+        flags = self._get_search_flags(ignore_case=True)
+        try:
+            # Clean the matched text
+            search_text = self._normalize_for_search(matched_text, convert_quotes=False, strip_quotes=False)
+            rects = page.search_for(search_text, flags=flags, quads=False)
+            
+            if rects and len(rects) > 0:
+                # Combine all rectangles (handles multi-line text)
+                combined_rect = fitz.Rect(rects[0])
+                for rect in rects[1:]:
+                    combined_rect.include_rect(rect)
+                
+                return {
+                    "rect": [combined_rect.x0, combined_rect.y0, combined_rect.x1, combined_rect.y1],
+                    "matched_text": matched_text,
+                    "fuzzy_score": best_score,
+                }
+        except Exception as e:
+            logger.debug(f"Error during fuzzy span search: {e}")
+
+        return None

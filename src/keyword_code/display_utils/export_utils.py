@@ -296,6 +296,208 @@ def export_to_word(exportable_results_list: List[Dict[str, Any]]) -> bytes:
             if line_idx < len(lines) - 1:
                 paragraph.add_run().add_break()
 
+    def split_table_row(row_text: str) -> List[str]:
+        row_text = row_text.strip()
+        if row_text.startswith("|"):
+            row_text = row_text[1:]
+        if row_text.endswith("|"):
+            row_text = row_text[:-1]
+        return [cell.strip() for cell in row_text.split("|")]
+
+    def is_table_separator(row_text: str) -> bool:
+        stripped = row_text.strip()
+        if not stripped or "|" not in stripped:
+            return False
+        stripped = stripped.strip("|")
+        segments = stripped.split("|")
+        if not segments:
+            return False
+        for segment in segments:
+            segment = segment.strip()
+            if not segment:
+                return False
+            if not re.fullmatch(r":?-{3,}:?", segment):
+                return False
+        return True
+
+    def is_table_header(row_text: str) -> bool:
+        stripped = row_text.strip()
+        if "|" not in stripped:
+            return False
+        cells = split_table_row(stripped)
+        return len(cells) >= 2
+
+    def is_table_row(row_text: str) -> bool:
+        stripped = row_text.strip()
+        return bool(stripped) and "|" in stripped
+
+    def infer_alignment(spec: str) -> str:
+        spec = spec.strip()
+        left = spec.startswith(":")
+        right = spec.endswith(":")
+        if left and right:
+            return "center"
+        if right:
+            return "right"
+        return "left"
+
+    def parse_markdown_blocks(text: str) -> List[Dict[str, Any]]:
+        """Parse limited Markdown into block structures (paragraphs, lists, tables)."""
+        blocks: List[Dict[str, Any]] = []
+        if not text:
+            return blocks
+
+        lines = text.split('\n')
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            stripped = line.strip()
+
+            if not stripped:
+                i += 1
+                continue
+
+            if is_table_header(line) and i + 1 < len(lines) and is_table_separator(lines[i + 1]):
+                table_lines = [line, lines[i + 1]]
+                i += 2
+                while i < len(lines) and is_table_row(lines[i]):
+                    if not lines[i].strip():
+                        break
+                    table_lines.append(lines[i])
+                    i += 1
+                blocks.append({"type": "table", "lines": table_lines})
+                continue
+
+            ul_match = re.match(r'^([\*\-\+])\s+(.+)$', stripped)
+            if ul_match:
+                items: List[str] = []
+                while i < len(lines):
+                    candidate = lines[i].strip()
+                    bullet_match = re.match(r'^([\*\-\+])\s+(.+)$', candidate)
+                    if not bullet_match:
+                        break
+                    items.append(bullet_match.group(2))
+                    i += 1
+                blocks.append({"type": "ul", "items": items})
+                continue
+
+            ol_match = re.match(r'^(\d+)\.\s+(.+)$', stripped)
+            if ol_match:
+                items: List[str] = []
+                while i < len(lines):
+                    candidate = lines[i].strip()
+                    numbered_match = re.match(r'^(\d+)\.\s+(.+)$', candidate)
+                    if not numbered_match:
+                        break
+                    items.append(numbered_match.group(2))
+                    i += 1
+                blocks.append({"type": "ol", "items": items})
+                continue
+
+            paragraph_lines = [lines[i]]
+            i += 1
+            while i < len(lines):
+                next_line = lines[i]
+                next_stripped = next_line.strip()
+                if not next_stripped:
+                    paragraph_lines.append(next_line)
+                    i += 1
+                    break
+                if is_table_header(next_line) and i + 1 < len(lines) and is_table_separator(lines[i + 1]):
+                    break
+                if re.match(r'^([\*\-\+])\s+(.+)$', next_stripped) or re.match(r'^(\d+)\.\s+(.+)$', next_stripped):
+                    break
+                paragraph_lines.append(next_line)
+                i += 1
+
+            paragraph_text = '\n'.join(paragraph_lines).strip('\n')
+            if paragraph_text:
+                blocks.append({"type": "paragraph", "text": paragraph_text})
+
+        return blocks
+
+    def add_markdown_list(doc_obj: Document, items: List[str], ordered: bool) -> None:
+        style = 'List Number' if ordered else 'List Bullet'
+        for item in items:
+            paragraph = doc_obj.add_paragraph(style=style)
+            add_markdown_runs(paragraph, item)
+
+    def add_markdown_table(doc_obj: Document, table_lines: List[str]) -> None:
+        if len(table_lines) < 2:
+            return
+
+        header_cells = split_table_row(table_lines[0])
+        if not header_cells:
+            return
+
+        alignment_specs = split_table_row(table_lines[1]) if len(table_lines) > 1 else []
+        alignments = [infer_alignment(spec) for spec in alignment_specs]
+        num_cols = len(header_cells)
+        if len(alignments) < num_cols:
+            alignments.extend(["left"] * (num_cols - len(alignments)))
+        elif len(alignments) > num_cols:
+            alignments = alignments[:num_cols]
+
+        body_rows: List[List[str]] = []
+        for raw_row in table_lines[2:]:
+            if not is_table_row(raw_row):
+                break
+            cells = split_table_row(raw_row)
+            if len(cells) < num_cols:
+                cells.extend([""] * (num_cols - len(cells)))
+            elif len(cells) > num_cols:
+                cells = cells[:num_cols]
+            body_rows.append(cells)
+
+        table = doc_obj.add_table(rows=len(body_rows) + 1, cols=num_cols)
+        try:
+            table.style = "Light Grid Accent 1"
+        except Exception:
+            try:
+                table.style = "Light Grid"
+            except Exception:
+                pass
+
+        alignment_map = {
+            "left": WD_ALIGN_PARAGRAPH.LEFT,
+            "center": WD_ALIGN_PARAGRAPH.CENTER,
+            "right": WD_ALIGN_PARAGRAPH.RIGHT,
+        }
+
+        for col_idx, header_text in enumerate(header_cells):
+            cell = table.cell(0, col_idx)
+            paragraph = cell.paragraphs[0]
+            paragraph.text = ""
+            paragraph.alignment = alignment_map.get(alignments[col_idx], WD_ALIGN_PARAGRAPH.LEFT)
+            add_markdown_runs(paragraph, header_text)
+            for run in paragraph.runs:
+                run.bold = True
+
+        for row_idx, row_cells in enumerate(body_rows, start=1):
+            for col_idx, cell_text in enumerate(row_cells):
+                cell = table.cell(row_idx, col_idx)
+                paragraph = cell.paragraphs[0]
+                paragraph.text = ""
+                paragraph.alignment = alignment_map.get(alignments[col_idx], WD_ALIGN_PARAGRAPH.LEFT)
+                add_markdown_runs(paragraph, cell_text)
+
+    def render_markdown_content(doc_obj: Document, text: str, initial_paragraph=None) -> None:
+        blocks = parse_markdown_blocks(text)
+        used_initial = False
+        for block in blocks:
+            block_type = block.get("type")
+            if block_type == "paragraph":
+                paragraph = initial_paragraph if initial_paragraph is not None and not used_initial else doc_obj.add_paragraph()
+                add_markdown_runs(paragraph, block.get("text", ""))
+            elif block_type == "ul":
+                add_markdown_list(doc_obj, block.get("items", []), ordered=False)
+            elif block_type == "ol":
+                add_markdown_list(doc_obj, block.get("items", []), ordered=True)
+            elif block_type == "table":
+                add_markdown_table(doc_obj, block.get("lines", []))
+            used_initial = True
+            initial_paragraph = None
+
     # Process each file's results
     total_files = len(exportable_results_list)
     for file_index, file_result in enumerate(exportable_results_list):
@@ -336,10 +538,11 @@ def export_to_word(exportable_results_list: List[Dict[str, Any]]) -> bytes:
 
                 # Add analysis text
                 if section_data.get("Analysis"):
+                    analysis_text = section_data.get("Analysis")
                     p = doc.add_paragraph()
                     label_run = p.add_run("Analysis: ")
                     label_run.bold = True
-                    add_markdown_runs(p, section_data.get("Analysis"))
+                    render_markdown_content(doc, analysis_text, initial_paragraph=p)
 
                 # Add context if available
                 if section_data.get("Context"):

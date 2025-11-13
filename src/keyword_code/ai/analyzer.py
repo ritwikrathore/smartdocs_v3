@@ -18,6 +18,60 @@ from ..utils.interaction_logger import log_llm_interaction
 _thread_local = threading.local()
 
 
+def _sanitize_unescaped_control_chars(json_str: str) -> Tuple[str, bool]:
+    """Escape control characters that appear unescaped within JSON strings."""
+
+    sanitized_chars: List[str] = []
+    in_string = False
+    escape_next = False
+    sanitized = False
+
+    for ch in json_str:
+        if in_string:
+            if escape_next:
+                sanitized_chars.append(ch)
+                escape_next = False
+                continue
+
+            if ch == "\\":
+                sanitized_chars.append(ch)
+                escape_next = True
+                continue
+
+            if ch == '"':
+                sanitized_chars.append(ch)
+                in_string = False
+                continue
+
+            code_point = ord(ch)
+            if ch == "\n":
+                sanitized_chars.append("\\n")
+                sanitized = True
+                continue
+            if ch == "\r":
+                sanitized_chars.append("\\r")
+                sanitized = True
+                continue
+            if ch == "\t":
+                sanitized_chars.append("\\t")
+                sanitized = True
+                continue
+            if code_point < 0x20:
+                sanitized_chars.append(f"\\u{code_point:04x}")
+                sanitized = True
+                continue
+
+            sanitized_chars.append(ch)
+            continue
+
+        sanitized_chars.append(ch)
+        if ch == '"':
+            in_string = True
+            escape_next = False
+
+    return "".join(sanitized_chars), sanitized
+
+
 class DocumentAnalyzer:
     def __init__(self):
         # Initialize Databricks LLM client
@@ -188,7 +242,11 @@ class DocumentAnalyzer:
             else:
                 raise json.JSONDecodeError("Could not locate JSON payload in response.", cleaned_response, 0)
 
-        return json.loads(json_str)
+        sanitized_json_str, sanitized = _sanitize_unescaped_control_chars(json_str)
+        if sanitized:
+            logger.debug("Escaped control characters in JSON payload before parsing.")
+
+        return json.loads(sanitized_json_str)
 
     @property
     def output_schema_analysis(self) -> dict:
@@ -264,25 +322,26 @@ class DocumentAnalyzer:
             system_prompt = """You are an intelligent document analyzer specializing in legal and financial documents. You will be given a main prompt, multiple sub-prompts derived from it, and relevant document excerpts for each sub-prompt. Your task is to analyze each sub-prompt using its specific context and provide a structured response.
 
 ### IMPORTANT Core Instructions:
-1. **Analyze Each Sub-prompt Separately:** For each sub-prompt, provide a focused analysis using ONLY the context provided for that specific sub-prompt.
+1. **Analyze Each Sub-prompt Separately:** For each sub-prompt, provide a detailed analysis using ONLY the context provided for that specific sub-prompt.
 2. **Structured Response:** Your response must follow the JSON structure specified below, with an analysis for each sub-prompt.
-3. **Direct Answers:** For each sub-prompt, provide a comprehensive analysis that directly answers the question.
+3. **Direct Answers:** For each sub-prompt, provide a comprehensive analysis that directly answers the question. If the question is not answerable, clearly state this in the analysis.
 4. **Exact Supporting Quotes:** For each sub-prompt, include direct, verbatim quotes from its context that support your analysis.
 5. **No Cross-Referencing:** Do not use context from one sub-prompt to answer another sub-prompt, even if they seem related.
 6. **No Information Found:** If the context for a sub-prompt does not contain information to answer it, clearly state this in the analysis.
-7. **Natural Section References:** When referring to where information is found in the document, use natural language references to document sections (e.g., "Section 9 of the Loan Agreement", "Definitions Section", "Article 5", "Schedule A") based on the content of the text excerpts. Do NOT mention chunk IDs or technical identifiers. You may reference page numbers when helpful.
+7. **Natural Section References:** When referring to where information is found in the document, use natural language references to document sections (e.g., "Section 9 of the Loan Agreement", "Definitions Section", "Article 5", "Schedule A") based on the content of the text excerpts. Do NOT mention chunk IDs or technical identifiers.
 
 ### IMPORTANT Formatting Guidelines:
-YOU MUST ALWAYS use Markdown formatting in your analysis_summary to improve readability:
+*YOU MUST ALWAYS USE MARKDOWN* in your analysis_summary to improve readability. Apply the following options **only inside the analysis_summary field**; other JSON fields such as supporting_quotes must remain plain strings without Markdown tables or list scaffolding:
 - **Bullet points** (using *, -, or +) for concise lists of up to 10 items (e.g., schedule of dates, list of violations, enumerated findings)
-- **Numbered lists** (using 1., 2., etc.) for sequential or ordered information
+- **Numbered lists** (using 1., 2., etc.) for sequential or ordered information such as repayment schedules, payment terms, or fee structures and tables
 - **Bold text** (using **text**) to emphasize important information like dates, percentages, amounts, facts, or key definitions
 - **Italic text** (using *text*) for subtle emphasis or document references
+- **Tables** (Markdown table syntax) only when the provided excerpts contain inherently tabular information that benefits from a structured layout. Keep tables concise (no more than 12 columns or 20 rows), reuse the source column labels when available, never fabricate tables when list formats suffice, and do not place tables in supporting_quotes or other JSON properties.
 
 DO NOT use any of the following:
 - Headers (#, ##, etc.) - the UI provides its own section headers
 - Code blocks (```) - not applicable for document analysis
-- Tables - not supported in the UI
+- Tables unless the relevant context clearly contains tabular data as described above
 - Other complex Markdown elements
 
 ### JSON Output Schema:

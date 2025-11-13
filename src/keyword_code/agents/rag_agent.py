@@ -6,8 +6,7 @@ import asyncio
 from typing import Dict, List, Any, Optional, Tuple
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent, RunContext
-from pydantic_ai.models.openai import OpenAIChatModel
-from pydantic_ai.providers.openai import OpenAIProvider
+from pydantic_ai.models.openai import OpenAIModel
 import os
 
 from ..config import logger
@@ -63,7 +62,7 @@ class RAGOptimizationAgent:
         # Create the agent
         self.agent = Agent(
             model=self.model,
-            output_type=RAGAnalysis,
+            result_type=RAGAnalysis,
             system_prompt="""You are an expert RAG (Retrieval-Augmented Generation) optimization agent.
             
 Your job is to analyze queries and current RAG results to recommend optimal retrieval parameters.
@@ -83,7 +82,7 @@ Be concise but thorough in your analysis."""
         )
     
     def _create_databricks_model(self):
-        """Create an OpenAIChatModel configured for Databricks Serving (OpenAI-compatible)."""
+        """Create an OpenAIModel configured for Databricks Serving (OpenAI-compatible)."""
         try:
             # Lazy import to avoid circulars
             from ..ai.databricks_llm import DATABRICKS_BASE_URL, DATABRICKS_LLM_MODEL
@@ -92,8 +91,12 @@ Be concise but thorough in your analysis."""
             if not api_key:
                 raise RuntimeError("DATABRICKS_API_KEY is not set in environment variables")
 
-            provider = OpenAIProvider(api_key=api_key, base_url=DATABRICKS_BASE_URL)
-            return OpenAIChatModel(DATABRICKS_LLM_MODEL, provider=provider)
+            # OpenAIModel accepts base_url and api_key directly
+            return OpenAIModel(
+                model_name=DATABRICKS_LLM_MODEL,
+                base_url=DATABRICKS_BASE_URL,
+                api_key=api_key
+            )
         except Exception as e:
             # Log the error but don't fail startup
             logger.error(f"Error using Databricks LLM: {e}")

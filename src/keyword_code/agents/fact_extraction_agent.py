@@ -9,8 +9,7 @@ from typing import Dict, List, Any, Optional, Union
 from enum import Enum
 from pydantic import BaseModel, Field, field_validator, ValidationError
 from pydantic_ai import Agent, RunContext
-from pydantic_ai.models.openai import OpenAIChatModel
-from pydantic_ai.providers.openai import OpenAIProvider
+from pydantic_ai.models.openai import OpenAIModel
 import os
 import re
 
@@ -187,7 +186,7 @@ class FactTypeIdentificationAgent:
         # Create the agent for fact type identification
         self.agent = Agent(
             model=self.model,
-            output_type=FactTypeAnalysis,
+            result_type=FactTypeAnalysis,
             system_prompt="""You are an expert at analyzing queries to identify what types of facts should be extracted.
 
 Your job is to analyze a user's query or sub-prompt and determine what types of factual information they are looking for.
@@ -215,16 +214,19 @@ Analyze the query and identify the expected fact types."""
         )
     
     def _create_databricks_model(self):
-        """Create an OpenAIChatModel configured for Databricks."""
+        """Create an OpenAIModel configured for Databricks."""
         try:
             api_key = os.environ.get("DATABRICKS_API_KEY")
             if not api_key:
                 raise RuntimeError("DATABRICKS_API_KEY is not set in environment variables")
 
-            provider = OpenAIProvider(api_key=api_key, base_url=DATABRICKS_BASE_URL)
-            # Use OpenAIChatModel without structured output constraints
+            # Use OpenAIModel without structured output constraints
             # Databricks doesn't support all JSON schema features
-            return OpenAIChatModel(DATABRICKS_LLM_MODEL, provider=provider)
+            return OpenAIModel(
+                model_name=DATABRICKS_LLM_MODEL,
+                base_url=DATABRICKS_BASE_URL,
+                api_key=api_key
+            )
         except Exception as e:
             logger.error(f"Error creating Databricks model: {e}")
             return None
@@ -330,7 +332,7 @@ class FactExtractionAgent:
         # Create the agent for fact extraction
         self.agent = Agent(
             model=self.model,
-            output_type=FactExtractionResult,
+            result_type=FactExtractionResult,
             system_prompt="""You are an expert at extracting structured facts from analysis text.
 
 Your job is to extract specific facts from analysis text based on the expected fact types.
@@ -360,14 +362,17 @@ Be thorough and accurate in your extractions."""
         )
     
     def _create_databricks_model(self):
-        """Create an OpenAIChatModel configured for Databricks."""
+        """Create an OpenAIModel configured for Databricks."""
         try:
             api_key = os.environ.get("DATABRICKS_API_KEY")
             if not api_key:
                 raise RuntimeError("DATABRICKS_API_KEY is not set in environment variables")
             
-            provider = OpenAIProvider(api_key=api_key, base_url=DATABRICKS_BASE_URL)
-            return OpenAIChatModel(DATABRICKS_LLM_MODEL, provider=provider)
+            return OpenAIModel(
+                model_name=DATABRICKS_LLM_MODEL,
+                base_url=DATABRICKS_BASE_URL,
+                api_key=api_key
+            )
         except Exception as e:
             logger.error(f"Error creating Databricks model: {e}")
             return None

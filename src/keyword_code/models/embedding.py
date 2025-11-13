@@ -42,7 +42,7 @@ def load_reranker_model():
     Returns:
         Reranker model instance (DatabricksRerankerModel or LLMRerankerModel) or None
     """
-    from ..config import USE_DATABRICKS_RERANKER
+    from ..config import USE_DATABRICKS_RERANKER, ENABLE_LLM_RERANKER_FALLBACK
     from ..config import logger
     model = None
     if USE_DATABRICKS_RERANKER:
@@ -76,8 +76,31 @@ def load_reranker_model():
             logger.info("=" * 60)
             return None
     else:
-        logger.info("Databricks reranker is disabled in configuration. Reranking will be disabled.")
-        return None
+        logger.info("Databricks reranker is disabled in configuration.")
+
+        if not ENABLE_LLM_RERANKER_FALLBACK:
+            logger.info("LLM fallback reranker is also disabled. Reranking will be disabled.")
+            return None
+
+        logger.info("Attempting to load LLM-based fallback reranker because fallback is enabled.")
+        try:
+            from .llm_reranker import load_llm_reranker_model
+            model = load_llm_reranker_model()
+
+            if model:
+                logger.info("=" * 60)
+                logger.info("RERANKER INITIALIZATION")
+                logger.info("=" * 60)
+                logger.info("✓ LLM-based fallback reranker loaded successfully (Databricks reranker disabled)")
+                logger.info("=" * 60)
+                return model
+
+            logger.error("✗ Failed to load LLM fallback reranker. Reranking will be disabled.")
+            return None
+        except Exception as e:
+            logger.error(f"✗ Error loading LLM fallback reranker: {e}", exc_info=True)
+            logger.error("Reranking will be disabled.")
+            return None
 
 
 

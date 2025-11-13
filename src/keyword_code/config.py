@@ -69,13 +69,32 @@ RERANKER_MODEL_PATH = os.environ.get("RERANKER_MODEL_PATH", "src/keyword_code/re
 
 # --- Interaction Logging Configuration ---
 # Set to True to enable detailed logging of BM25, semantic search, reranker, and LLM interactions
-ENABLE_INTERACTION_LOGGING = False  # Disabled by default
+ENABLE_INTERACTION_LOGGING = True  # Disabled by default
+
+# --- Highlight Debug Logging Configuration ---
+# Set to True to enable detailed logging of phrase matching attempts for highlight debugging
+ENABLE_HIGHLIGHT_DEBUG_LOGGING = True  # Disabled by default
+
+# Create highlight debug logger if enabled
+highlight_debug_logger = None
+if ENABLE_HIGHLIGHT_DEBUG_LOGGING:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    highlight_debug_log_file = logs_dir / f"highlight_debug_{timestamp}.log"
+    highlight_debug_logger = logging.getLogger("highlight_debug")
+    highlight_debug_logger.setLevel(logging.DEBUG)
+    highlight_debug_logger.propagate = False  # Don't propagate to root logger
+    highlight_debug_handler = logging.FileHandler(highlight_debug_log_file, mode='a', encoding='utf-8')
+    highlight_debug_handler.setFormatter(logging.Formatter("%(asctime)s - %(message)s"))
+    highlight_debug_logger.addHandler(highlight_debug_handler)
+    logger.info(f"Highlight debug logging enabled: {highlight_debug_log_file}")
+else:
+    highlight_debug_logger = None
 
 # --- Databricks Models ---
 # Configuration for Databricks services
 USE_DATABRICKS_EMBEDDING = True  # Use Databricks for embeddings
 USE_DATABRICKS_LLM = True  # Use Databricks for LLM
-USE_DATABRICKS_RERANKER = True  # Use Databricks for reranking
+USE_DATABRICKS_RERANKER = False  # Use Databricks for reranking
 
 # --- Reranker Configuration ---
 # The Databricks reranker model has a maximum context window of 512 tokens
@@ -109,9 +128,9 @@ SAVED_PROMPTS = {
                 "prompt": (
                     "1. What is the Investment Number for this Project? \n"
                     "2. When is this document Dated? \n"
-                    "3. What is the currency of the loan? \n"
-                    "4. What is the loan amount for different tranches and loan types such as 'A Loan', 'B1 Loan', 'C Loan'? \n"
-                    "5. What is the spread rate or margin rate for different loans? \n"
+                    "3. What is the loan principal amount and currency associated with the said amount for different tranches and loan types? \n"
+                    "4. What is the spread rate or margin rate for different loans? \n"
+                    "5. Is there a reference to a Credit Adjustment Spread (CAS)?\n"
                     "6. What are the business day definitions? \n"
                     "7. What is the applicable business day convention for adjusting the interest payment date if the scheduled date falls on a non-business day? \n"
                     "8. What are the interest payment dates? \n"
@@ -120,8 +139,8 @@ SAVED_PROMPTS = {
                     "11. Interest shall accrue from day to day on what basis? \n"
                     "12. What are the terms for partial prepayment / prepayment premium and allocation of principal amounts outstanding? \n"
                     "13. What is the method for applying prepayments—is it pro rata basis or in inverse order of maturity? \n"
-                    "14. What are the repayment terms and can you list the full repayment schedule with dates? \n"
-                    "15. What are all the fees the borrower shall pay and the percentages / amounts? \n"
+                    "14. What are the repayment terms and can you list the full repayment schedule with dates in a table? \n"
+                    "15. What are all the fees the borrower shall pay and the percentages / amounts and are there any references of a separate fee letter? \n"
                     "16. what is the commitment fee percentage on undisbursed amount of the loan? \n"
                     "17. What are the terms for default interest? \n"
                     "18. What is the maturity date? \n"
@@ -146,18 +165,6 @@ SAVED_PROMPTS = {
                 ),
             },
             {
-                "label": "Guarentee Analysis",
-                "explanation": "CNTPI Guarentee Agreement Analysis",
-                "prompt": (
-                    "Check if clauses relating to the following keywords are present in the agreement: \n"
-                    "1. Default \n"
-                    "2. Restructuring \n"
-                    "3. Distressed sale \n"
-                    "4. Bankruptcy \n"
-                    "5. Rating downgrade \n"
-                ),
-            },
-            {
                 "label": "ASC 320 Analysis",
                 "explanation": "ASC 320 Debt Security analysis whose legal form is debt i.e., Bonds, Subscription agreements, Debenture Trust Deed, Note Purchase Agreement, Note Pricing Supplement, etc.",
                 "prompt": (
@@ -170,6 +177,45 @@ SAVED_PROMPTS = {
                     "7. Does the company maintain a register of bond holders or note holders or debenture holders? \n"
                     "8. Does the company issue any certificate to the bond holders or note holders or debenture holders? \n"
                     "9. Are the bonds, notes or debentures listed? \n"
+                ),
+            },
+            {
+                "label": "Loan Option Analysis",
+                "prompt": (
+                    "1. What is the loan/facility amount? \n"
+                    "2. What is the interest rate/margin/spread for this loan? \n"
+                    "3. Is there any interest rate step up/ interest rate step down/ interest rate caps or interest rate floors on the loan? \n"
+                    "4. What is the default rate interest/default interest rate of this loan? \n"
+                    "5. Is there any - No term SOFR recommended fallback rate or Term recommended fallback rate index cessation effective date provision in the agreement? \n"
+                    "6. What is the interest rate for market disruption/ market disruption event/benchmark replacement event/replacement of benchmark rate? \n"
+                    "7. What is the repayment/redemption provision of the loan? \n"
+                    "8. Does the loan contain any extension/rollover provision? \n"
+                    "9. Can the borrower voluntarily prepay the loan? \n"
+                    "10. What are the conditions that would require the borrower to make an early loan repayment/prepayment? \n"
+                    "11. Does the loan contain any mandatory prepayment/redemption or acceleration provisions? \n"
+                    "12. Is there any prepayment premium? \n"
+                    "13. What constitutes fees, increased costs and unwinding costs in the loan agreement? \n"
+                    "14. Does the agreement contain a make-whole amount provision? \n"
+                    "15. Is the loan due and payable if the borrower is liquidated or declared bankrupt? \n"
+                    "16. Is there any illegality or illegality of participation provision in the agreement? \n"
+                    "17. Are the borrowers jointly and severally liable for the loan? \n"
+                    "18. Is there any bail-in provision, loss absorption provision or subordination provision in the agreement? \n"
+                ),
+            },
+            {
+                "label": "Guarantee Analysis",
+                "prompt": (
+                    "1. What constitutes credit event, loss, proof of loss, covered loss, net loss, borrower default, event of default? \n"
+                    "2. Is IFC entitled to a right to recoveries in respect of the covered loss? \n"
+                    "3. Does any of the credit event, loss, proof of loss, covered loss, net loss, borrower default, event of default encompasses more than failure to pay? \n"
+                    "4. Does borrower default mean that the borrower fails to pay the required amount on the due date? \n"
+                    "5. Is there a defined grace period prior to a claim being made? \n"
+                    "6. Is the guaranteed obligation/ eligible obligation/ reimbursement obligation/reference portfolio a loan/note/facility/bond? \n"
+                    "7. Is IFC obligated to pay the claim amount only if, and to the extent that, the Donor/Commission provides IFC with the necessary funds? \n"
+                    "8. What constitutes covered amount or covered percentage by IFC? \n"
+                    "9. Under what circumstances can a claim, payment demand, default notice be made to IFC? \n"
+                    "10. Does IFC agree to extend to the Borrower, stand-by Dollar loans (the \"IFC Stand-by Loan\") to finance the payment of the Obligations? \n"
+                    "11. Is there any legal requirement by the guaranteed party for legal transfer of title of the covered portion of the bond holding to IFC? \n"
                 ),
             },
         ]

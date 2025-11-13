@@ -12,13 +12,11 @@ logger = logging.getLogger(__name__)
 # Optional: use Pydantic-AI if available for LLM-based evaluation
 try:
     from pydantic_ai import Agent
-    from pydantic_ai.models.openai import OpenAIChatModel
-    from pydantic_ai.providers.openai import OpenAIProvider
+    from pydantic_ai.models.openai import OpenAIModel
     _HAS_PYDANTIC_AI = True
 except Exception:  # pragma: no cover - graceful fallback if not installed
     Agent = None
-    OpenAIChatModel = None
-    OpenAIProvider = None
+    OpenAIModel = None
     _HAS_PYDANTIC_AI = False
 
 # Import SmartReview to reuse Databricks config constants if available
@@ -60,12 +58,15 @@ def _get_agent():  # -> Agent | None (kept untyped for broader compatibility)
     try:
         # Use OpenAI-compatible provider bound to Databricks endpoint
         # This works because Databricks serving endpoints are OpenAI-compatible
-        provider = OpenAIProvider(base_url=dbx_base_url, api_key=dbx_api_key)
-        model = OpenAIChatModel(model_name, provider=provider)
+        model = OpenAIModel(
+            model_name=model_name,
+            base_url=dbx_base_url,
+            api_key=dbx_api_key
+        )
 
         _agent = Agent(
             model=model,
-            output_type=list[RankedFinding],
+            result_type=list[RankedFinding],
             system_prompt=(
                 "You are a VIOLATION FILTER for document review findings. Your role is to EXCLUDE false positives and return ONLY true violations.\n\n"
 
