@@ -5,9 +5,11 @@ PDF-related utilities for display.
 import streamlit as st
 import base64
 import fitz
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, TYPE_CHECKING
 from ..config import logger
-from ..processors.pdf_processor import PDFProcessor
+
+if TYPE_CHECKING:  # Avoid runtime circular import while keeping type hints
+    from ..processors.pdf_processor import PDFProcessor
 
 
 def restore_original_bytes_if_needed(filename: str) -> Optional[bytes]:
@@ -147,6 +149,9 @@ def regenerate_annotated_pdfs_from_chat_chunks(relevant_chunks: List[Dict[str, A
 
             phrase_locations = {"[Chat RAG]": locations}
             try:
+                # Local import to avoid circular dependency at module load time
+                from ..processors.pdf_processor import PDFProcessor
+
                 processor = PDFProcessor(orig_bytes)
                 annotated_bytes = processor.add_annotations(phrase_locations)
             except Exception as ann_err:

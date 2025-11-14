@@ -64,6 +64,7 @@ from .utils.interaction_logger import (
     setup_interaction_logging, disable_interaction_logging, INTERACTION_LOGGING_ENABLED,
     log_rag_parameters
 )
+from .utils.langfuse_tracing import start_trace, update_current_trace, update_current_span
 from .models.embedding import load_embedding_model, load_reranker_model
 from .processors.pdf_processor import PDFProcessor
 from .processors.word_processor import WordProcessor
@@ -324,6 +325,43 @@ def process_file_wrapper(args):
         logger.error(f"Skipping processing for {filename}: Embedding model not loaded.")
         return {"filename": filename, "error": "Embedding model failed to load.", "annotated_pdf": None, "verification_results": {}, "phrase_locations": {}, "ai_analysis": json.dumps({"error": "Embedding model failed to load."})}
 
+    trace_input = {
+        "filename": filename,
+        "prompt": user_prompt,
+        "mode": mode,
+    }
+    trace_metadata = {
+        "mode": mode,
+        "use_advanced_extraction": bool(use_advanced_extraction),
+        "preprocessed_available": bool(preprocessed_data_for_file),
+        "memory_before_bytes": memory_before.get("used"),
+    }
+    trace_tags = [f"mode:{mode}"]
+
+    try:
+        current_session_id = get_session_id()
+    except Exception as session_err:
+        logger.debug("Unable to determine session id for Langfuse trace: %s", session_err)
+        current_session_id = None
+
+    trace_context = start_trace(
+        name="document.process",
+        input_data=trace_input,
+        metadata=trace_metadata,
+        session_id=current_session_id,
+        tags=trace_tags,
+    )
+    trace_entered = False
+    try:
+        if trace_context is not None:
+            trace_context.__enter__()
+            trace_entered = True
+    except Exception as trace_err:
+        logger.debug("Unable to start Langfuse trace: %s", trace_err)
+        trace_context = None
+
+    exc_type = exc_value = exc_tb = None
+
     try:
         logger.info(f"Starting processing for {filename}")
         file_extension = Path(filename).suffix.lower()
@@ -378,6 +416,10 @@ def process_file_wrapper(args):
             # Review mode validation is handled separately by run_auto_review_update()
             # This function should not be called for review mode in normal flow
             # Return a minimal result indicating review mode processing
+            update_current_trace(output={
+                "status": "skipped",
+                "mode": "review",
+            })
             return {
                 "filename": filename,
                 "mode": "review",
@@ -714,6 +756,13 @@ def process_file_wrapper(args):
                     "user_request_context": user_request_context,
                     "raw_keyword_occurrences": keyword_context["raw_keyword_sections"],
                 }
+                keyword_sections_count = len(keyword_context.get("aggregated_analysis", {}).get("analysis_sections", {})) if keyword_context else 0
+                update_current_trace(output={
+                    "status": "success",
+                    "keyword_mode": True,
+                    "keyword_sections": keyword_sections_count,
+                    "total_occurrences": keyword_context.get("total_occurrences", 0) if keyword_context else 0,
+                })
                 return keyword_response
 
         logger.info(f"Ask mode: Starting decomposition and RAG workflow for {filename}")
@@ -988,10 +1037,25 @@ def process_file_wrapper(args):
                 "raw_keyword_occurrences": keyword_context.get("raw_keyword_sections", {}),
             })
 
+        analysis_sections_count = len(aggregated_analysis.get("analysis_sections", {}))
+        update_current_trace(output={
+            "status": "success",
+            "keyword_mode": bool(keyword_context),
+            "analysis_sections": analysis_sections_count,
+            "sub_prompts_processed": len(all_sub_prompt_results),
+        })
+
         return result_payload
 
     except Exception as e:
+        exc_type, exc_value, exc_tb = type(e), e, e.__traceback__
         logger.error(f"Error processing {filename}: {str(e)}", exc_info=True)
+
+        update_current_span(level="ERROR", status_message=str(e))
+        update_current_trace(output={
+            "status": "error",
+            "message": str(e),
+        })
 
         # Perform memory cleanup on error
         cleanup_memory(force=True)
@@ -1004,6 +1068,12 @@ def process_file_wrapper(args):
             "phrase_locations": {},
             "ai_analysis": json.dumps({"error": f"Processing failed: {str(e)}"})
         }
+    finally:
+        if trace_context is not None and trace_entered:
+            try:
+                trace_context.__exit__(exc_type, exc_value, exc_tb)
+            except Exception as exit_err:
+                logger.debug("Failed to close Langfuse trace: %s", exit_err)
 
 
 def display_page():

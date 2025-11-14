@@ -271,7 +271,8 @@ class DocumentAnalyzer:
         self,
         filename: str,
         main_prompt: str,
-        sub_prompts_with_contexts: List[Dict[str, Any]]
+        sub_prompts_with_contexts: List[Dict[str, Any]],
+        all_chunks: Optional[List[Dict[str, Any]]] = None
     ) -> List[Dict[str, Any]]:
         """
         Analyzes all sub-prompts with their relevant contexts in a single LLM call.
@@ -292,6 +293,22 @@ class DocumentAnalyzer:
                 logger.warning(f"No sub-prompts with contexts provided for {filename}")
                 return []
 
+            # Extract table of contents for document navigation context
+            toc_context = ""
+            if all_chunks:
+                toc_chunks = [c for c in all_chunks if c.get('metadata', {}).get('document_scope') == 'table_of_contents']
+                if toc_chunks:
+                    toc_entries_list = []
+                    for toc_chunk in toc_chunks:
+                        entries = toc_chunk.get('metadata', {}).get('toc_entries', [])
+                        toc_entries_list.extend(entries)
+                    
+                    if toc_entries_list:
+                        toc_lines = [f"  - {entry.get('entry', '')}: Page {entry.get('page_number', 'N/A')}" 
+                                    for entry in toc_entries_list[:50]]  # Limit to first 50 entries
+                        toc_context = "\n".join(toc_lines)
+                        logger.info(f"Extracted {len(toc_entries_list)} TOC entries for analyzer context")
+
             # Format all sub-prompts and their contexts
             formatted_sub_prompts = []
             for i, item in enumerate(sub_prompts_with_contexts):
@@ -304,12 +321,35 @@ class DocumentAnalyzer:
                     formatted_context = "No relevant text found for this sub-prompt."
                 else:
                     # Format relevant chunks for this sub-prompt
-                    # Note: We provide page numbers but not chunk IDs to encourage natural section references
-                    formatted_context = "\n\n---\n\n".join([
-                        f"Page: {chunk.get('page_num', -1) + 1}\n"
-                        f"TEXT: {chunk.get('text', '')}"
-                        for chunk in relevant_chunks
-                    ])
+                    # Include metadata to help the model understand document structure
+                    formatted_chunks = []
+                    for chunk in relevant_chunks:
+                        metadata = chunk.get('metadata', {})
+                        location_parts = []
+                        
+                        # Build location description from metadata
+                        if metadata.get('article_number'):
+                            location_parts.append(f"{metadata.get('article_type', 'Article')} {metadata['article_number']}")
+                            if metadata.get('article_title'):
+                                location_parts.append(metadata['article_title'])
+                        
+                        if metadata.get('section_number'):
+                            location_parts.append(metadata['section_number'])
+                            if metadata.get('section_title'):
+                                location_parts.append(metadata['section_title'])
+                        
+                        if metadata.get('subsection_label'):
+                            location_parts.append(f"Subsection ({metadata['subsection_label']})")
+                        
+                        # Fallback to page number if no metadata
+                        location = ' - '.join(location_parts) if location_parts else f"Page {chunk.get('page_num', -1) + 1}"
+                        
+                        formatted_chunks.append(
+                            f"LOCATION: {location}\n"
+                            f"TEXT: {chunk.get('text', '')}"
+                        )
+                    
+                    formatted_context = "\n\n---\n\n".join(formatted_chunks)
 
                 formatted_sub_prompts.append({
                     "index": i + 1,
@@ -379,13 +419,17 @@ Your entire response MUST be a single JSON object following this schema and Form
 """
 
             # Create the human prompt with all sub-prompts and their contexts
+            toc_section = ""
+            if toc_context:
+                toc_section = f"\n\nDocument Structure (Table of Contents):\n{toc_context}\n"
+            
             human_prompt = f"""Please analyze the following document based on the main prompt and its derived sub-prompts, using the relevant excerpts provided for each sub-prompt.
 
 Document Name:
 {filename}
 
 Main Prompt:
-{main_prompt}
+{main_prompt}{toc_section}
 
 Sub-prompts and their contexts:
 """

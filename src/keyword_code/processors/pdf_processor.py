@@ -18,6 +18,395 @@ from ..utils.spacy_utils import ensure_spacy_model
 from ..rag.chunking import SentenceChunker, create_chunks_from_text
 
 
+class DocumentStructureTracker:
+    """Utility to derive hierarchical metadata (Article/Section/Subsection) for PDF chunks."""
+
+    _ARTICLE_PATTERN = re.compile(r"^ARTICLE\s+(?P<number>[IVXLCDM]+|\d+)\b(?P<rest>.*)", re.IGNORECASE)
+    _SECTION_PATTERN = re.compile(
+        r"^Section\s+(?P<number>\d+(?:\.\d+)*(?:\([A-Za-z0-9]+\))?)(?P<rest>.*)",
+        re.IGNORECASE,
+    )
+    _ANNEX_PATTERN = re.compile(r"^ANNEX\s+(?P<label>[A-Z0-9]+)\b(?P<rest>.*)", re.IGNORECASE)
+    _SCHEDULE_PATTERN = re.compile(r"^SCHEDULE\s+(?P<label>[A-Z0-9]+)\b(?P<rest>.*)", re.IGNORECASE)
+    _RECITAL_PATTERN = re.compile(r"^RECITALS?\s*(?:\((?P<label>[A-Z])\))?(?P<rest>.*)", re.IGNORECASE)
+    _SUBSECTION_PATTERN = re.compile(r"^\((?P<label>[A-Za-z0-9ivxIVX]+)\)\s*(?P<rest>.*)")
+    _PAGE_MARKER_PATTERN = re.compile(r"^\s*[-–—]?\s*(?P<marker>(?:[ivxlcdmIVXLCDM]+|\d+))\s*[-–—]?\s*$")
+    _HEADING_BOUNDARY_PATTERN = re.compile(
+        r"\b(?:Section\s+\d|ARTICLE\s+[IVXLCDM\d]+|ANNEX\s+[A-Z0-9]+|SCHEDULE\s+[A-Z0-9]+|RECITALS?\s*\(|RECITAL\s*\(|ANNEX\s+|SCHEDULE\s+)",
+        re.IGNORECASE,
+    )
+    _TOC_ENTRY_PATTERN = re.compile(
+        r"(?P<entry>(?:ARTICLE|Section|ANNEX|SCHEDULE)\s+[\w\.\(\)]+)(?P<dots>\.{3,}|\s{2,})(?P<page>\d+)\s*$",
+        re.IGNORECASE,
+    )
+
+    def __init__(self) -> None:
+        self.scope: str = "preamble"
+        self.article_type: Optional[str] = None
+        self.article_number: Optional[str] = None
+        self.article_title: Optional[str] = None
+        self.section_number: Optional[str] = None
+        self.section_title: Optional[str] = None
+        self.subsection_label: Optional[str] = None
+        self.subsection_title: Optional[str] = None
+        self.within_table_of_contents: bool = False
+        self.pending_top_level_title: Optional[str] = None
+        self.pending_section_title: bool = False
+        self.toc_entries: List[Dict[str, Any]] = []
+
+    def process_chunk(self, text: str, page_num: Optional[int]) -> Dict[str, Any]:
+        """Analyze chunk text and return metadata dictionary"""
+        working_text = (text or "").strip()
+
+        if not working_text:
+            return self._build_metadata()
+
+        if self._is_page_marker(working_text):
+            return self._build_metadata(scope_override="page_marker")
+
+        if self._is_table_of_contents(working_text, page_num):
+            self.within_table_of_contents = True
+            self.scope = "table_of_contents"
+            self.article_type = "Table of Contents"
+            self.article_number = None
+            self.article_title = None
+            self.section_number = None
+            self.section_title = None
+            self.subsection_label = None
+            self.subsection_title = None
+            return self._build_metadata()
+
+        if self.within_table_of_contents:
+            # Extract TOC entries while in TOC region
+            self._extract_toc_entries(working_text)
+            # Continue processing - still in TOC
+            return self._build_metadata()
+
+        # Check if we're leaving TOC (detected non-TOC content)
+        if self.within_table_of_contents and not self._looks_like_toc_content(working_text):
+            self.within_table_of_contents = False
+            self._reset_for_new_top_level()
+            self.scope = "preamble"
+
+        # Handle pending titles (article/annex/schedule) that may be on this chunk
+        working_text = self._maybe_capture_pending_top_level_title(working_text)
+        working_text = self._maybe_capture_pending_section_title(working_text)
+
+        remaining = working_text
+        while remaining:
+            remaining = remaining.lstrip()
+            if not remaining:
+                break
+
+            top_level_match = self._ANNEX_PATTERN.match(remaining) or self._SCHEDULE_PATTERN.match(remaining) or self._ARTICLE_PATTERN.match(remaining)
+            if not top_level_match:
+                top_level_match = self._RECITAL_PATTERN.match(remaining)
+
+            if top_level_match:
+                remainder = self._handle_top_level_match(top_level_match, remaining)
+                if remainder is remaining:
+                    break  # Safety guard to prevent infinite loop
+                remaining = remainder
+                continue
+
+            section_match = self._SECTION_PATTERN.match(remaining)
+            if section_match:
+                remainder = self._handle_section_match(section_match, remaining)
+                if remainder is remaining:
+                    break
+                remaining = remainder
+                continue
+
+            subsection_match = self._SUBSECTION_PATTERN.match(remaining)
+            if subsection_match and self.section_number:
+                remainder = self._handle_subsection_match(subsection_match, remaining)
+                if remainder is remaining:
+                    break
+                remaining = remainder
+                # Only consume the first subsection per chunk to avoid stripping substantive content
+                break
+
+            break  # No more structural markers at the start
+
+        return self._build_metadata()
+
+    def _handle_top_level_match(self, match: re.Match, original_text: str) -> str:
+        pattern = match.re
+        rest = match.group("rest") if "rest" in match.groupdict() else ""
+        remainder = original_text[match.end():]
+
+        if pattern is self._ANNEX_PATTERN:
+            label = match.group("label").strip()
+            title, trailing = self._split_heading_title(rest)
+            self.scope = "annex"
+            self.article_type = "Annex"
+            self.article_number = label
+            self.article_title = title or self.article_title
+            self.pending_top_level_title = None if title else "Annex"
+            self._reset_section()
+            return trailing or remainder
+
+        if pattern is self._SCHEDULE_PATTERN:
+            label = match.group("label").strip()
+            title, trailing = self._split_heading_title(rest)
+            self.scope = "schedule"
+            self.article_type = "Schedule"
+            self.article_number = label
+            self.article_title = title or self.article_title
+            self.pending_top_level_title = None if title else "Schedule"
+            self._reset_section()
+            return trailing or remainder
+
+        if pattern is self._ARTICLE_PATTERN:
+            number = match.group("number").strip()
+            title, trailing = self._split_heading_title(rest)
+            self.scope = "article"
+            self.article_type = "Article"
+            self.article_number = number
+            self.article_title = title or None
+            self.pending_top_level_title = None if title else "Article"
+            self._reset_section()
+            return trailing or remainder
+
+        if pattern is self._RECITAL_PATTERN:
+            label = match.group("label")
+            title, trailing = self._split_heading_title(rest)
+            self.scope = "recital"
+            self.article_type = "Recitals"
+            self.article_number = "Recitals"
+            if label:
+                self.section_number = f"Recital ({label})"
+                self.section_title = title or self.section_title
+                self.pending_section_title = False if title else True
+            else:
+                # Bare RECITAL header – treat as introduction to recitals
+                self.section_number = "Recitals"
+                self.section_title = title or self.section_title or "Recitals"
+            self.subsection_label = None
+            self.subsection_title = None
+            return trailing or remainder
+
+        return remainder
+
+    def _handle_section_match(self, match: re.Match, original_text: str) -> str:
+        rest = match.group("rest") or ""
+        remainder = original_text[match.end():]
+
+        number = match.group("number").strip()
+        cleaned_number = number
+        if not cleaned_number.lower().startswith("section"):
+            cleaned_number = f"Section {cleaned_number}"
+
+        self.section_number = cleaned_number
+        title, trailing = self._split_heading_title(rest)
+        if title:
+            self.section_title = title
+            self.pending_section_title = False
+        else:
+            self.section_title = None
+            self.pending_section_title = True
+
+        self.subsection_label = None
+        self.subsection_title = None
+
+        return trailing or remainder
+
+    def _handle_subsection_match(self, match: re.Match, original_text: str) -> str:
+        label = match.group("label").strip()
+        rest = match.group("rest") or ""
+        remainder = original_text[match.end():]
+
+        clean_label = label.strip().strip("().")
+        title, trailing = self._split_heading_title(rest)
+        self.subsection_label = clean_label
+        self.subsection_title = title or self.subsection_title
+
+        return trailing or remainder
+
+    def _maybe_capture_pending_top_level_title(self, text: str) -> str:
+        if not self.pending_top_level_title:
+            return text
+
+        title, remainder = self._split_heading_title(text)
+        if title:
+            self.article_title = title
+            self.pending_top_level_title = None
+            return remainder
+        return text
+
+    def _maybe_capture_pending_section_title(self, text: str) -> str:
+        if not self.pending_section_title:
+            return text
+
+        title, remainder = self._split_heading_title(text)
+        if title:
+            self.section_title = title
+            self.pending_section_title = False
+            return remainder
+        return text
+
+    def _split_heading_title(self, text: str) -> Tuple[Optional[str], str]:
+        if not text:
+            return None, ""
+
+        cleaned = text.lstrip(" .:-–—")
+        if not cleaned:
+            return None, ""
+
+        boundary_match = self._HEADING_BOUNDARY_PATTERN.search(cleaned)
+        if boundary_match:
+            title = cleaned[: boundary_match.start()].strip(" .:-–—")
+            remainder = cleaned[boundary_match.start():]
+            return (title or None), remainder
+
+        # If no explicit boundary, attempt to cut at first sentence break to avoid capturing entire chunk
+        sentence_break = re.search(r"(?<=[.;:])\s{2,}|(?<=[.;:])\s(?=[A-Z])", cleaned)
+        if sentence_break:
+            title = cleaned[: sentence_break.start()].strip(" .:-–—")
+            remainder = cleaned[sentence_break.start():]
+            return (title or None), remainder
+
+        # Fallback: if cleaned text is short, treat it as title; otherwise keep for body content
+        if len(cleaned) <= 80:
+            return cleaned.strip(" .:-–—") or None, ""
+
+        return None, text
+
+    def _reset_for_new_top_level(self) -> None:
+        self.article_type = None
+        self.article_number = None
+        self.article_title = None
+        self._reset_section()
+        self.pending_top_level_title = None
+
+    def _reset_section(self) -> None:
+        self.section_number = None
+        self.section_title = None
+        self.subsection_label = None
+        self.subsection_title = None
+        self.pending_section_title = False
+
+    def _is_table_of_contents(self, text: str, page_num: Optional[int]) -> bool:
+        upper_text = text.upper()
+        if "TABLE OF CONTENTS" in upper_text:
+            return True
+        if page_num is not None and page_num <= 5:
+            if re.search(r"\.{5,}", text) and any(keyword in upper_text for keyword in ("SECTION", "ARTICLE", "ANNEX", "SCHEDULE")):
+                return True
+        return False
+
+    def _is_page_marker(self, text: str) -> bool:
+        return bool(self._PAGE_MARKER_PATTERN.match(text))
+
+    def _looks_like_toc_content(self, text: str) -> bool:
+        """Check if text appears to be TOC content (dots/page numbers/section refs)."""
+        upper_text = text.upper()
+        # Has dots connecting to page numbers
+        if re.search(r"\.{5,}\s*\d+", text):
+            return True
+        # Has section/article references with page numbers
+        if re.search(r"(?:SECTION|ARTICLE|ANNEX|SCHEDULE)\s+[\w\.]+.*\d+\s*$", text, re.IGNORECASE):
+            return True
+        # Mostly whitespace with scattered numbers (page refs)
+        if re.search(r"^\s*\d+\s*$", text):
+            return True
+        return False
+
+    def _extract_toc_entries(self, text: str) -> None:
+        """Extract structured entries from table of contents text."""
+        lines = text.split("\n")
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            
+            # Try to match TOC entry pattern
+            match = self._TOC_ENTRY_PATTERN.search(line)
+            if match:
+                entry = match.group("entry").strip()
+                page = match.group("page").strip()
+                self.toc_entries.append({
+                    "entry": entry,
+                    "page_number": int(page),
+                    "raw_text": line,
+                })
+            # Also capture entries without dots (sometimes formatted differently)
+            elif re.search(r"(?:ARTICLE|Section|ANNEX|SCHEDULE)\s+[\w\.\(\)]+", line, re.IGNORECASE):
+                # Extract page number from end if present
+                page_match = re.search(r"(\d+)\s*$", line)
+                if page_match:
+                    entry_text = line[:page_match.start()].strip()
+                    self.toc_entries.append({
+                        "entry": entry_text,
+                        "page_number": int(page_match.group(1)),
+                        "raw_text": line,
+                    })
+
+    def _build_metadata(self, scope_override: Optional[str] = None) -> Dict[str, Any]:
+        scope = scope_override or self.scope or "unknown"
+
+        article_type = self.article_type
+        article_number = self.article_number
+        article_title = self.article_title
+
+        if scope not in {"table_of_contents", "page_marker"}:
+            if not article_type:
+                article_type = "Preamble"
+            if article_type == "Preamble" and not article_title:
+                article_title = "Introductory Statements"
+            if article_type == "Preamble" and not article_number:
+                article_number = "Preamble"
+
+        metadata: Dict[str, Any] = {
+            "document_scope": scope,
+            "article_type": article_type,
+            "article_number": article_number,
+            "article_title": article_title,
+            "section_number": self.section_number,
+            "section_title": self.section_title,
+            "subsection_label": self.subsection_label,
+            "subsection_title": self.subsection_title,
+        }
+
+        # Add TOC entries if this is a table of contents chunk
+        if scope == "table_of_contents" and self.toc_entries:
+            metadata["toc_entries"] = self.toc_entries.copy()
+
+        path: List[str] = []
+        if article_type:
+            if article_type == "Article" and article_number:
+                article_entry = f"Article {article_number}"
+            elif article_type in {"Annex", "Schedule"} and article_number:
+                article_entry = f"{article_type} {article_number}"
+            else:
+                article_entry = article_type
+            if article_title:
+                article_entry = f"{article_entry} - {article_title}"
+            path.append(article_entry)
+
+        section_number = self.section_number
+        section_title = self.section_title
+        if not section_number and article_type == "Preamble" and scope == "preamble":
+            section_number = "Preamble"
+            if not section_title:
+                section_title = "Introductory Statements"
+
+        if section_number:
+            section_entry = section_number
+            if section_title:
+                section_entry = f"{section_entry} - {section_title}"
+            path.append(section_entry)
+
+        if self.subsection_label:
+            subsection_entry = f"Subsection {self.subsection_label}"
+            if self.subsection_title:
+                subsection_entry = f"{subsection_entry} - {self.subsection_title}"
+            path.append(subsection_entry)
+
+        metadata["hierarchy_path"] = path
+        return metadata
+
+
 class PDFProcessor:
     """Handles PDF processing, chunking, verification, and annotation."""
 
@@ -270,7 +659,8 @@ class PDFProcessor:
                 if page_chunks:
                     current_chunk_id_counter += len(page_chunks)
 
-            self._full_text = "\\n\\n".join(all_text_parts) # Join chunks for full text
+            self._assign_chunk_metadata()
+            self._full_text = "\n\n".join(all_text_parts) # Join chunks for full text
             self._processed = True
             logger.info(
                 f"Sentence-based extraction complete. Generated {len(self._chunks)} chunks. "
@@ -287,6 +677,25 @@ class PDFProcessor:
             if doc:
                 doc.close()
         return self._chunks, self._full_text if self._full_text is not None else ""
+
+    def _assign_chunk_metadata(self) -> None:
+        """Attach hierarchical metadata to each extracted chunk."""
+        if not self._chunks:
+            return
+
+        tracker = DocumentStructureTracker()
+        for chunk in self._chunks:
+            try:
+                chunk_text = chunk.get("text", "")
+                page_num = chunk.get("page_num")
+                chunk["metadata"] = tracker.process_chunk(chunk_text, page_num)
+            except Exception as meta_err:
+                logger.warning(
+                    "Failed to derive metadata for chunk %s on page %s: %s",
+                    chunk.get("chunk_id"),
+                    chunk.get("page_num"),
+                    meta_err,
+                )
 
     def verify_and_locate_phrases(
         self, ai_analysis_json_str: str  # Expects the *aggregated* JSON string
