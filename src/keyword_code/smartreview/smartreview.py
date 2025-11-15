@@ -49,7 +49,18 @@ async def _chat_completion_async(messages, model: Optional[str] = None, temperat
         raise RuntimeError("Databricks LLM client not initialized")
 
     # Use the async method from DatabricksLLMClient
-    response_text = await databricks_llm.get_completion_async(messages, max_tokens=8192)
+    response_data = await databricks_llm.get_completion_async(messages, max_tokens=8192)
+    
+    # Extract content and usage
+    response_text = response_data.get("content") if response_data else None
+    if not response_text:
+        raise RuntimeError("Failed to get response from Databricks LLM")
+    
+    # Update current generation with usage if available
+    usage_info = response_data.get("usage") if response_data else None
+    if usage_info:
+        from ..utils.langfuse_tracing import update_current_generation
+        update_current_generation(usage_details=usage_info)
 
     # Wrap in a response-like object for compatibility
     class MockResponse:

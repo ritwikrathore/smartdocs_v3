@@ -57,7 +57,7 @@ class DatabricksLLMClient:
         self.client = get_databricks_llm_client()
         self.model_name = DATABRICKS_LLM_MODEL
 
-    def get_completion(self, messages: List[Dict[str, str]], max_tokens: int = 8192) -> Optional[str]:
+    def get_completion(self, messages: List[Dict[str, str]], max_tokens: int = 8192) -> Optional[Dict[str, Any]]:
         """
         Get completion from Databricks LLM.
 
@@ -66,7 +66,7 @@ class DatabricksLLMClient:
             max_tokens: Maximum number of tokens to generate
 
         Returns:
-            Generated text or None if there was an error
+            Dictionary with 'content' and 'usage' keys, or None if there was an error
         """
         if self.client is None:
             logger.error("Cannot get completion: Databricks LLM client not initialized")
@@ -109,20 +109,34 @@ class DatabricksLLMClient:
                 max_tokens=max_tokens
             )
 
-            # Extract the generated text
+            # Extract the generated text and usage info
             if response.choices and len(response.choices) > 0:
                 response_content = response.choices[0].message.content
+
+                # Extract token usage information
+                usage_info = None
+                if hasattr(response, 'usage') and response.usage:
+                    usage_info = {
+                        "prompt_tokens": response.usage.prompt_tokens,
+                        "completion_tokens": response.usage.completion_tokens,
+                        "total_tokens": response.usage.total_tokens,
+                    }
 
                 # Log the full response in DEBUG mode
                 logger.debug("=" * 80)
                 logger.debug("AI API RESPONSE")
                 logger.debug("=" * 80)
                 logger.debug(f"Response Length: {len(response_content)} characters")
+                if usage_info:
+                    logger.debug(f"Token Usage: {usage_info}")
                 logger.debug("Response Content:")
                 logger.debug(response_content)
                 logger.debug("=" * 80)
 
-                return response_content
+                return {
+                    "content": response_content,
+                    "usage": usage_info
+                }
             else:
                 logger.warning("Empty response from Databricks LLM API")
                 return None
@@ -131,7 +145,7 @@ class DatabricksLLMClient:
             logger.error(f"Error getting completion from Databricks LLM: {e}")
             return None
 
-    async def get_completion_async(self, messages: List[Dict[str, str]], max_tokens: int = 8192) -> Optional[str]:
+    async def get_completion_async(self, messages: List[Dict[str, str]], max_tokens: int = 8192) -> Optional[Dict[str, Any]]:
         """
         Async wrapper for get_completion.
         This is a simple wrapper that calls the synchronous method, as the OpenAI client doesn't have async methods.
@@ -142,7 +156,7 @@ class DatabricksLLMClient:
             max_tokens: Maximum number of tokens to generate
 
         Returns:
-            Generated text or None if there was an error
+            Dictionary with 'content' and 'usage' keys, or None if there was an error
         """
         return self.get_completion(messages, max_tokens)
 
@@ -166,8 +180,8 @@ def get_databricks_llm():
         ]
         test_response = client.get_completion(test_messages, max_tokens=10)
 
-        if test_response:
-            logger.info(f"Databricks LLM client initialized successfully. Test response: {test_response[:20]}...")
+        if test_response and test_response.get("content"):
+            logger.info(f"Databricks LLM client initialized successfully. Test response: {test_response['content'][:20]}...")
             return client
         else:
             logger.error("Databricks LLM client test failed: No response")

@@ -6,7 +6,7 @@ import asyncio
 import re
 import numpy as np
 from typing import Any, Dict, List, Tuple, Optional, Set, Callable
-from ..config import logger, RAG_TOP_K, RAG_WORKERS
+from ..config import logger, RAG_TOP_K, RAG_CANDIDATE_POOL_SIZE, RAG_WORKERS
 from ..utils.async_utils import run_tasks_in_parallel, run_in_threadpool
 from ..utils.interaction_logger import (
     log_bm25_results,
@@ -491,6 +491,7 @@ async def retrieve_relevant_chunks_async(
     bm25_terms: Optional[List[str]] = None,
     alternate_hyde_queries: Optional[List[str]] = None,
     alternate_hyde_top_k: int = 5,
+    candidate_pool_size: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     """
     Asynchronously retrieves the top_k most relevant chunks using hybrid search (BM25 + semantic) and reranking.
@@ -500,7 +501,7 @@ async def retrieve_relevant_chunks_async(
         prompt: The query text presented to the LLM and semantic search
         chunks: List of text chunks to search
         model: Embedding model (DatabricksEmbeddingModel or compatible)
-        top_k: Number of top results to return
+        top_k: Number of final top results to return after reranking
         precomputed_embeddings: Optional precomputed embeddings
         valid_chunk_indices: Optional list of valid chunk indices
         reranker_model: Optional reranker model
@@ -510,6 +511,7 @@ async def retrieve_relevant_chunks_async(
         bm25_terms: Ordered list of lexical phrases that should be OR'ed together for BM25
         alternate_hyde_queries: Optional list of speculative HYDE phrases to seed additional semantic retrieval
         alternate_hyde_top_k: Number of HYDE-based semantic hits to request per speculative query
+        candidate_pool_size: Number of candidates to retrieve before reranking (if None, uses RAG_CANDIDATE_POOL_SIZE or top_k)
     """
     if not chunks or not prompt or model is None:
         logger.warning(f"RAG retrieval skipped for prompt '{prompt[:50]}...': No chunks, prompt, or model.")
@@ -519,6 +521,14 @@ async def retrieve_relevant_chunks_async(
     if not any(chunk_texts):
         logger.warning(f"RAG retrieval skipped for prompt '{prompt[:50]}...': All chunk texts are empty.")
         return []
+
+    # Determine candidate pool size: use provided value, else RAG_CANDIDATE_POOL_SIZE if reranker available, else top_k
+    if candidate_pool_size is None:
+        candidate_pool_size = RAG_CANDIDATE_POOL_SIZE if reranker_model is not None else top_k
+    
+    logger.info(
+        f"RAG: Retrieving {candidate_pool_size} candidates for reranking, will return top {top_k} after reranking"
+    )
 
     try:
         effective_bm25_terms = [term.strip() for term in (bm25_terms or []) if isinstance(term, str) and term.strip()]
@@ -538,7 +548,7 @@ async def retrieve_relevant_chunks_async(
         bm25_results = get_bm25_results(
             prompt,
             chunks,
-            top_k,
+            candidate_pool_size,  # Use candidate_pool_size instead of top_k
             bm25_terms=effective_bm25_terms or None,
         )
         logger.info("RAG: BM25 retrieval completed with %d results", len(bm25_results))
@@ -548,7 +558,7 @@ async def retrieve_relevant_chunks_async(
             prompt=prompt,
             chunks=chunks,
             model=model,
-            top_k=top_k,
+            top_k=candidate_pool_size,  # Use candidate_pool_size instead of top_k
             precomputed_embeddings=precomputed_embeddings,
             valid_chunk_indices=valid_chunk_indices,
         )
@@ -573,7 +583,8 @@ async def retrieve_relevant_chunks_async(
         hyde_scores_dict: Dict[int, float] = {}
         hyde_ranked_results: List[Tuple[int, float]] = []
         if hyde_queries_cleaned:
-            hyde_top_k = max(1, min(alternate_hyde_top_k, top_k if top_k > 0 else alternate_hyde_top_k))
+            # HYDE still uses smaller top_k since it's for injection/boosting, not the main candidate pool
+            hyde_top_k = max(1, min(alternate_hyde_top_k, candidate_pool_size if candidate_pool_size > 0 else alternate_hyde_top_k))
             hyde_debug_summary: List[Dict[str, Any]] = []
             for hyde_query in hyde_queries_cleaned:
                 hyde_indices, hyde_valid_indices, hyde_cosine_scores, hyde_ranked = await get_semantic_search_results(
@@ -615,7 +626,8 @@ async def retrieve_relevant_chunks_async(
             candidate_scores[idx] = bm25_component + semantic_component
 
         sorted_candidates = sorted(candidate_scores.items(), key=lambda x: x[1], reverse=True)
-        initial_candidates = [idx for idx, _ in sorted_candidates[:top_k]] if sorted_candidates else []
+        # Use candidate_pool_size to get MORE candidates before reranking
+        initial_candidates = [idx for idx, _ in sorted_candidates[:candidate_pool_size]] if sorted_candidates else []
 
         hyde_ranked_indices = [idx for idx, _ in hyde_ranked_results]
         hyde_boosted_indices: Set[int] = set(hyde_ranked_indices)
@@ -624,7 +636,8 @@ async def retrieve_relevant_chunks_async(
         if initial_candidates and hyde_ranked_indices:
             hyde_new_candidates = [idx for idx in hyde_ranked_indices if idx not in initial_candidates]
             if hyde_new_candidates:
-                replace_limit = max(1, int(round(top_k * 0.2))) if top_k > 0 else 1
+                # Calculate replacement limit based on candidate_pool_size, not final top_k
+                replace_limit = max(1, int(round(candidate_pool_size * 0.2))) if candidate_pool_size > 0 else 1
                 replace_count = min(len(initial_candidates), len(hyde_new_candidates), replace_limit)
                 if replace_count > 0:
                     replaced_slice = initial_candidates[-replace_count:]
@@ -641,27 +654,27 @@ async def retrieve_relevant_chunks_async(
                         replaced_slice,
                     )
         elif not initial_candidates and hyde_ranked_indices:
-            initial_candidates = hyde_ranked_indices[:top_k] if top_k > 0 else hyde_ranked_indices
+            initial_candidates = hyde_ranked_indices[:candidate_pool_size] if candidate_pool_size > 0 else hyde_ranked_indices
             hyde_injected_indices = set(initial_candidates)
 
         candidate_indices = list(dict.fromkeys(initial_candidates))
 
-        if len(candidate_indices) < top_k:
+        # Ensure we have candidate_pool_size candidates for reranking
+        if len(candidate_indices) < candidate_pool_size:
             for idx, _ in sorted_candidates:
                 if idx not in candidate_indices:
                     candidate_indices.append(idx)
-                if len(candidate_indices) >= top_k:
+                if len(candidate_indices) >= candidate_pool_size:
                     break
 
-        if len(candidate_indices) < top_k and hyde_ranked_indices:
+        if len(candidate_indices) < candidate_pool_size and hyde_ranked_indices:
             for idx in hyde_ranked_indices:
                 if idx not in candidate_indices:
                     candidate_indices.append(idx)
-                if len(candidate_indices) >= top_k:
+                if len(candidate_indices) >= candidate_pool_size:
                     break
 
         combined_indices = candidate_indices
-        final_top_k = min(top_k, len(combined_indices))
         logger.info(
             "RAG: Candidate pool assembled with %d items (BM25=%d, semantic=%d, hyde=%d, injected=%d)",
             len(combined_indices),
@@ -672,15 +685,16 @@ async def retrieve_relevant_chunks_async(
         )
 
         # --- Step 4: Reranking of Combined Results ---
+        # Rerank all candidates, then select top_k after reranking
 
         if reranker_model is not None and not disable_reranking and combined_indices:
-            logger.info(f"RAG: Reranking {len(combined_indices)} combined results...")
+            logger.info(f"RAG: Reranking {len(combined_indices)} candidates to select top {top_k}...")
             results = await rerank_results(
                 prompt=prompt,
                 chunks=chunks,
                 combined_indices=combined_indices,
                 reranker_model=reranker_model,
-                top_k=final_top_k,
+                top_k=top_k,  # Return final top_k after reranking
                 hyde_boosted_indices=hyde_boosted_indices,
             )
         else:
@@ -689,7 +703,7 @@ async def retrieve_relevant_chunks_async(
             # Format results without reranking, using normalized scores
             # IMPORTANT: Preserve ALL chunk data including bboxes for highlighting
             results = []
-            for chunk_index in combined_indices[:final_top_k]:
+            for chunk_index in combined_indices[:top_k]:  # Use top_k directly
                 chunk = chunks[chunk_index]
                 score = candidate_scores.get(chunk_index, 0.0)
 
@@ -704,7 +718,7 @@ async def retrieve_relevant_chunks_async(
 
             # Sort results by score
             results.sort(key=lambda x: x["score"], reverse=True)
-            results = results[:final_top_k]
+            results = results[:top_k]  # Use top_k directly
 
         logger.info(f"RAG: Retrieved and ranked {len(results)} chunks using parallel hybrid search.")
         return results
@@ -727,6 +741,7 @@ def retrieve_relevant_chunks(
     bm25_terms: Optional[List[str]] = None,
     alternate_hyde_queries: Optional[List[str]] = None,
     alternate_hyde_top_k: int = 5,
+    candidate_pool_size: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     """
     Retrieves the top_k most relevant chunks using hybrid search (BM25 + semantic) and reranking.
@@ -748,6 +763,7 @@ def retrieve_relevant_chunks(
             bm25_terms=bm25_terms,
             alternate_hyde_queries=alternate_hyde_queries,
             alternate_hyde_top_k=alternate_hyde_top_k,
+            candidate_pool_size=candidate_pool_size,
         )
     )
 

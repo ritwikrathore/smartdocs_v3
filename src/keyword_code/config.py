@@ -54,7 +54,8 @@ ENABLE_PARALLEL = os.environ.get("ENABLE_PARALLEL", "true").lower() == "true"
 
 # --- RAG Configuration ---
 FUZZY_MATCH_THRESHOLD = 85  # Lowered threshold (0-100) to better handle quotation mark differences
-RAG_TOP_K = 15  # Number of relevant chunks to retrieve per sub-prompt
+RAG_TOP_K = 15  # Number of final chunks to send to analyzer after reranking
+RAG_CANDIDATE_POOL_SIZE = 25  # Number of candidate chunks to retrieve before reranking (larger pool for better reranker selection)
 RAG_WORKERS = 3  # Number of workers for parallel RAG processing
 
 # --- Chunking Configuration ---
@@ -129,7 +130,7 @@ SAVED_PROMPTS = {
                     "1. What is the Investment Number for this Project? \n"
                     "2. When is this document Dated? \n"
                     "3. What is the loan principal amount and currency associated with the said amount for different tranches and loan types? \n"
-                    "4. What is the spread rate or margin rate for different loans? \n"
+                    "4. What is the relevant spread rate or margin rate for different loans? \n"
                     "5. Is there a reference to a Credit Adjustment Spread (CAS)?\n"
                     "6. What are the business day definitions? \n"
                     "7. What is the applicable business day convention for adjusting the interest payment date if the scheduled date falls on a non-business day? \n"

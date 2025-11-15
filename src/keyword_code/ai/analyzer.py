@@ -569,10 +569,19 @@ class DocumentAnalyzer:
 
                 logger.info("Sending request to Databricks LLM model")
                 # Databricks client handles message formatting internally
-                response_content = await self.databricks_client.get_completion_async(messages, max_tokens=8192)
+                response_data = await self.databricks_client.get_completion_async(messages, max_tokens=8192)
 
-                if not response_content:
+                if not response_data or not response_data.get("content"):
                     raise ValueError("Failed to get response from Databricks LLM")
+
+                response_content = response_data["content"]
+                usage_info = response_data.get("usage")
+
+                # Update current generation with usage if available
+                if usage_info:
+                    from ..utils.langfuse_tracing import update_current_generation
+                    update_current_generation(usage_details=usage_info)
+                    logger.debug(f"Token usage: {usage_info}")
 
                 logger.info("Received response from Databricks LLM model")
 

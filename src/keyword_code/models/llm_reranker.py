@@ -242,6 +242,13 @@ Respond with ONLY the scores, one per line, in order. Example format:
                     input_data={
                         "num_pairs": len(sentence_pairs),
                         "queries_preview": [pair[0][:100] for pair in sentence_pairs[:3]],
+                        "pairs": [
+                            {
+                                "query": pair[0],
+                                "document": pair[1][:500] + ("..." if len(pair[1]) > 500 else ""),  # Truncate for display
+                            }
+                            for pair in sentence_pairs
+                        ],
                     },
                     metadata={
                         "operation": "llm_reranker.batch",
@@ -260,11 +267,25 @@ Respond with ONLY the scores, one per line, in order. Example format:
 
                     score_text = response.choices[0].message.content.strip()
 
+                    # Extract and log token usage
+                    usage_info = None
+                    if hasattr(response, 'usage') and response.usage:
+                        usage_info = {
+                            "prompt_tokens": response.usage.prompt_tokens,
+                            "completion_tokens": response.usage.completion_tokens,
+                            "total_tokens": response.usage.total_tokens,
+                        }
+                        # Update generation with usage info
+                        from ..utils.langfuse_tracing import set_generation_output
+                        set_generation_output(generation, usage=usage_info)
+
                     # Log the full response in DEBUG mode
                     logger.debug("=" * 80)
                     logger.debug("LLM RERANKER API RESPONSE")
                     logger.debug("=" * 80)
                     logger.debug(f"Response Length: {len(score_text)} characters")
+                    if usage_info:
+                        logger.debug(f"Token Usage: {usage_info}")
                     logger.debug("Response Content:")
                     logger.debug(score_text)
                     logger.debug("=" * 80)
@@ -303,7 +324,18 @@ Respond with ONLY the scores, one per line, in order. Example format:
                         logger.info(f"✓ LLM reranker: Successfully scored {len(scores)} pairs in ONE batch call")
                         set_generation_output(
                             generation,
-                            output={"scores": scores, "mean_score": float(np.mean(scores))},
+                            output={
+                                "scores": scores,
+                                "mean_score": float(np.mean(scores)),
+                                "scored_pairs": [
+                                    {
+                                        "query": pair[0],
+                                        "document": pair[1][:500] + ("..." if len(pair[1]) > 500 else ""),
+                                        "score": float(score),
+                                    }
+                                    for pair, score in zip(sentence_pairs, scores)
+                                ],
+                            },
                             metadata={
                                 "num_scores": len(scores),
                                 "mean_score": float(np.mean(scores)),
