@@ -9,66 +9,75 @@ from typing import Any, Dict, List, Optional, Literal, Set
 from pydantic import BaseModel, Field
 
 from ..config import logger, DECOMPOSITION_MODEL_NAME, USE_DATABRICKS_LLM
+from ..utils.langfuse_tracing import (
+    optional_context,
+    record_generation_error,
+    set_generation_output,
+    start_generation,
+)
 
 
-async def decompose_ask_mode_prompt(analyzer, user_prompt: str) -> Dict[str, Any]:
+async def decompose_ask_mode_prompt(
+    analyzer,
+    user_prompt: str,
+    *,
+    first_page_preview: Optional[str] = None,
+    document_index_preview: Optional[str] = None,
+) -> Dict[str, Any]:
     """Decompose the prompt and decide whether keyword mode should run."""
 
     logger.info("[ASK MODE] Decomposing prompt with RAG optimization: '%s'", user_prompt[:100])
 
-    system_prompt = """You are a helpful assistant specializing in financial and legal document analysis. Your task is to analyze the user's prompt and identify distinct questions or analysis tasks within it.
+    system_prompt = """You are a query decomposition assistant for a document analysis RAG system. You receive a user query along with brief previews of the document's first page and table-of-contents index. Your job is to break down the query into focused sub-questions and provide retrieval guidance for each.
 
-First, decide whether the request is best served by a deterministic keyword-only retrieval (Keyword Mode).
+IMPORTANT: You are NOT answering the questions. You are preparing queries and hints for a retrieval system that will find relevant document chunks. Another LLM will analyze those chunks to answer the user's questions.
 
-Trigger Keyword Mode when ALL of the following are true:
-- The user is asking for exact term lookups, specific form fields, codes, or literal phrases.
-- The desired outputs are counts or locations of those exact terms.
+Return a single JSON object with the keys:
+- "user_request_context": string capturing explicit output format instructions from the user (e.g., "return as bullet points", "provide counts"). Empty string if none.
+- "decomposition": list of sub-prompt objects (see below)
 
-Do NOT use Keyword Mode when the prompt requires interpretation, synthesis, summarization, or reasoning beyond literal keyword matches.
+Each sub-prompt object must include:
+1. "title": concise descriptor (max 5-6 words)
+2. "sub_prompt": the exact question/analysis task text
+3. "rag_params": object with retrieval guidance
+4. "hyde": list (0-2) of hypothetical document excerpts for semantic search priming
 
-If you choose Keyword Mode you MUST also emit the explicit keywords that should be searched and group related synonyms together.
+## Retrieval Guidance (rag_params)
+- Set "retrieval_mode" to one of ["hybrid", "semantic", "bm25_dominant"]
+- Provide numeric "bm25_weight" and "semantic_weight" that sum to 1.0
+- Emit "bm25_terms" as an array of literal phrases for lexical matching (e.g., ["investment number", "investment #"])
+- Explain choices in "reasoning"
+- Use "hybrid" (0.5/0.5) for balanced questions, "semantic" (0.3/0.7) for interpretive analysis, "bm25_dominant" (0.65/0.35) for precise term lookups
 
-Return your answer as a single JSON object with the keys:
-- "keyword_mode": boolean
-- "keyword_reasoning": short string justifying your decision
-- "keywords": list where each item is either a single keyword string or a list of related keywords/phrases that should be searched together (e.g., slash-separated synonyms)
-- "user_request_context": short string capturing any explicit instructions the user included about how to handle the results (return an empty string if none were provided)
-- "decomposition": list of sub-prompt objects exactly as described below
+## HYDE (Hypothetical Document Embeddings)
+CRITICAL: HYDE phrases are NOT answers. They are imaginary document excerpts used to prime semantic search.
 
-Break down the prompt into a list of self-contained, individual questions or tasks. For each task, provide:
-1. A concise, descriptive title (max 5-6 words)
-2. The full sub-prompt text
-3. Retrieval guidance inside a `rag_params` object
-4. Optional `keywords` array when the retrieval mode requires literal matching
+Your role: Generate 0-2 short phrases that resemble how the actual document MIGHT phrase the answer.
+- Write as if you're drafting a clause in the document style (formal legal/financial language)
+- Use realistic sample values (e.g., "$500 million", "24 months", "3.50% per annum") NOT placeholders like [amount] or [X]
+- Do NOT reference the document preview (e.g., don't say "on the first page" or "explicitly stated as")
+- Do NOT provide factual answers or make assertions
+- Focus on TERMINOLOGY and PHRASING patterns typical for this document type
+- Leave empty if you cannot imagine plausible document phrasing
 
-## Retrieval Mode & RAG Parameter Rules
+BAD HYDE (answering the question): "The Investment Number is explicitly stated as 51200 on the first page of the document."
+GOOD HYDE (document-like phrasing): "This facility is assigned Investment Number 51200."
 
-Each `rag_params` MUST include:
-- "retrieval_mode": one of ["hybrid", "semantic", "bm25_dominant", "keyword"]
-- "bm25_weight": number (0.0-1.0)
-- "semantic_weight": number (0.0-1.0)
-- "reasoning": string explaining why you selected these parameters
+BAD HYDE (referencing preview): "As shown in Section 3.1, the borrower must..."
+GOOD HYDE (generic clause style): "The Borrower shall maintain a maximum leverage ratio of 3.50:1.00 as set forth in Schedule II."
 
-Use these heuristics:
-- "hybrid": Balanced semantic and keyword retrieval for broad questions (bm25 ≈ 0.5, semantic ≈ 0.5)
-- "semantic": Meaning-focused interpretation or analysis (bm25 ≈ 0.3-0.4, semantic ≈ 0.6-0.7)
-- "bm25_dominant": Precise terminology or numeric lookups where keywords still matter (bm25 ≈ 0.6-0.7, semantic ≈ 0.3-0.4)
-- "keyword": Deterministic keyword-only lookups. Force bm25_weight = 1.0, semantic_weight = 0.0, and include an explicit `keywords` array on the sub-prompt containing the exact strings to search.
+BAD HYDE (using placeholders): "The aggregate principal amount shall not exceed [amount] in [currency]."
+GOOD HYDE (realistic sample values): "The aggregate principal amount of the Loans shall not exceed $500,000,000 in U.S. dollars."
 
-Always ensure bm25_weight + semantic_weight = 1.0 (allowing minor rounding). If you choose "keyword" retrieval there should be no semantic weight.
+Do not output any text outside the JSON object.
 
-Do not include any explanations, introductory text, or markdown formatting outside the JSON structure.
-
-Example Input Prompt:
-"What is the defined / lawful loan currency?
-What is the duration of the availability period?
-What is the loan amount and currency?"
+Example Input Prompt + Context:
+Document First Page Preview: "...Loan Agreement dated..."
+Document Index Preview: "Article I - Definitions (p.5) ..."
+User Prompt: "What is the defined / lawful loan currency? What is the duration of the availability period?"
 
 Example JSON Output:
 {
-    "keyword_mode": false,
-    "keyword_reasoning": "Prompt requests broader analysis, not literal matches",
-    "keywords": [],
     "user_request_context": "",
     "decomposition": [
         {
@@ -78,7 +87,11 @@ Example JSON Output:
                 "retrieval_mode": "semantic",
                 "bm25_weight": 0.4,
                 "semantic_weight": 0.6,
-                "reasoning": "Interpretive legal language benefits from meaning-driven retrieval"
+                "bm25_terms": ["lawful loan currency", "legal loan currency", "currency of the loan"],
+                "reasoning": "Definition clauses use varied terminology; semantic search helps find conceptually related terms",
+                "hyde": [
+                    "All amounts payable hereunder shall be denominated and paid in U.S. dollars, being the Lawful Loan Currency as defined in Article I."
+                ]
             }
         },
         {
@@ -88,138 +101,147 @@ Example JSON Output:
                 "retrieval_mode": "hybrid",
                 "bm25_weight": 0.5,
                 "semantic_weight": 0.5,
-                "reasoning": "Standard financial term with both keyword and semantic signals"
-            }
-        },
-        {
-            "title": "Loan Amount",
-            "sub_prompt": "What is the loan amount?",
-            "rag_params": {
-                "retrieval_mode": "bm25_dominant",
-                "bm25_weight": 0.6,
-                "semantic_weight": 0.4,
-                "reasoning": "Numeric lookup favours precise keyword retrieval"
-            }
-        },
-        {
-            "title": "Loan Currency",
-            "sub_prompt": "What is the loan currency?",
-            "rag_params": {
-                "retrieval_mode": "bm25_dominant",
-                "bm25_weight": 0.6,
-                "semantic_weight": 0.4,
-                "reasoning": "Currency codes are exact terms suited to keyword matching"
+                "bm25_terms": ["availability period", "commitment period", "drawdown period"],
+                "reasoning": "Standard loan timing term with consistent phrasing benefits from balanced retrieval",
+                "hyde": [
+                    "The Availability Period shall commence on the Closing Date and terminate on the date falling 24 months thereafter."
+                ]
             }
         }
     ]
 }
 
-Example Input Prompt:
-"Analyze the termination clause and liability limitations in the loan agreement."
+Example Input Prompt + Context:
+Document First Page Preview: "...Guarantee Agreement..."
+Document Index Preview: ""
+User Prompt: "What happens if the borrower defaults?"
 
 Example JSON Output:
 {
-    "keyword_mode": false,
-    "keyword_reasoning": "Requires interpretive legal analysis",
-    "keywords": [],
     "user_request_context": "",
     "decomposition": [
         {
-            "title": "Termination Clause Analysis",
-            "sub_prompt": "Analyze the termination clause in the loan agreement.",
+            "title": "Borrower Default Consequences",
+            "sub_prompt": "What happens if the borrower defaults?",
             "rag_params": {
                 "retrieval_mode": "semantic",
                 "bm25_weight": 0.3,
                 "semantic_weight": 0.7,
-                "reasoning": "Conceptual legal analysis benefits from semantic understanding"
-            }
-        },
-        {
-            "title": "Liability Limitations Analysis",
-            "sub_prompt": "Analyze the liability limitations in the loan agreement.",
-            "rag_params": {
-                "retrieval_mode": "semantic",
-                "bm25_weight": 0.3,
-                "semantic_weight": 0.7,
-                "reasoning": "Interpretive legal query requires semantic retrieval"
+                "bm25_terms": ["event of default", "default remedies", "acceleration"],
+                "reasoning": "Remedy language varies significantly; prioritize semantic matching to capture concept variations",
+                "hyde": [
+                    "Upon the occurrence of an Event of Default, the Lender may declare all outstanding amounts immediately due and payable."
+                ]
             }
         }
     ]
 }
 
-Example Input Prompt:
-"What is the MT599 Swift message format and field 79 content?"
+Example Input Prompt + Context:
+Document First Page Preview: "...Fee Letter for Revolving Credit Facility..."
+Document Index Preview: "Schedule 1 - Applicable Margin (p.37)"
+User Prompt: "What is the drawn margin and the undrawn commitment fee?"
 
 Example JSON Output:
 {
-    "keyword_mode": true,
-    "keyword_reasoning": "Prompt is focused on specific SWIFT terminology",
-    "keywords": ["MT599", ["Field 79", "Field 79a"]],
     "user_request_context": "",
     "decomposition": [
         {
-            "title": "MT599 Swift Format",
-            "sub_prompt": "What is the MT599 Swift message format?",
+            "title": "Drawn Margin Rate",
+            "sub_prompt": "What is the drawn applicable margin?",
             "rag_params": {
-                "retrieval_mode": "keyword",
-                "bm25_weight": 1.0,
-                "semantic_weight": 0.0,
-                "reasoning": "MT599 is an exact form identifier best served by keyword search"
+                "retrieval_mode": "bm25_dominant",
+                "bm25_weight": 0.65,
+                "semantic_weight": 0.35,
+                "bm25_terms": ["applicable margin", "drawn margin"],
+                "reasoning": "Margin percentages appear verbatim in fee schedules; prioritize exact keyword hits",
+                "hyde": [
+                    "The applicable margin on drawn loans is 2.25 percent per annum, subject to leverage-based step downs as set forth in Schedule 1."
+                ]
             },
-            "keywords": ["MT599", "MT 599"]
+            "keywords": ["applicable margin", "drawn margin"]
         },
         {
-            "title": "Field 79 Content",
-            "sub_prompt": "What is the content of field 79?",
+            "title": "Undrawn Commitment Fee",
+            "sub_prompt": "What is the commitment fee on undrawn amounts?",
             "rag_params": {
-                "retrieval_mode": "keyword",
-                "bm25_weight": 1.0,
-                "semantic_weight": 0.0,
-                "reasoning": "Field numbers require deterministic keyword matching"
-            },
-            "keywords": ["Field 79", "79:"]
+                "retrieval_mode": "bm25_dominant",
+                "bm25_weight": 0.65,
+                "semantic_weight": 0.35,
+                "bm25_terms": ["applicable margin", "drawn margin", "margin on advances"],
+                "reasoning": "Margin percentages appear verbatim in fee schedules; prioritize exact keyword hits",
+                "hyde": [
+                    "The Applicable Margin for Loans shall be 3.50% per annum, subject to adjustment based on the Leverage Ratio."
+                ]
+            }
+        },
+        {
+            "title": "Undrawn Commitment Fee",
+            "sub_prompt": "What is the commitment fee on undrawn amounts?",
+            "rag_params": {
+                "retrieval_mode": "bm25_dominant",
+                "bm25_weight": 0.7,
+                "semantic_weight": 0.3,
+                "bm25_terms": ["commitment fee", "undrawn commitment", "unutilized commitment"],
+                "reasoning": "Fee tables list exact phrasing; BM25 should lead with minimal semantic support",
+                "hyde": [
+                    "The Commitment Fee shall accrue at 0.35% per annum on the daily unused portion of the Commitments."
+                ]
+            }
         }
     ]
 }
 
-Example Input Prompt:
-"What are the interest rates and fees for this loan?"
+Example Input Prompt + Context:
+Document First Page Preview: "...Investment Agreement Number 51200..."
+Document Index Preview: ""
+User Prompt: "What is the investment number?"
 
 Example JSON Output:
 {
-    "keyword_mode": false,
-    "keyword_reasoning": "Requires numerical comparison and interpretation",
-    "keywords": [],
     "user_request_context": "",
     "decomposition": [
         {
-            "title": "Loan Interest Rates",
-            "sub_prompt": "What are the interest rates for this loan?",
+            "title": "Investment Number",
+            "sub_prompt": "What is the investment number?",
             "rag_params": {
                 "retrieval_mode": "bm25_dominant",
-                "bm25_weight": 0.6,
-                "semantic_weight": 0.4,
-                "reasoning": "Numerical financial data requires keyword precision"
-            }
-        },
-        {
-            "title": "Loan Fees",
-            "sub_prompt": "What are the fees for this loan?",
-            "rag_params": {
-                "retrieval_mode": "bm25_dominant",
-                "bm25_weight": 0.6,
-                "semantic_weight": 0.4,
-                "reasoning": "Specific fee information benefits from keyword matching"
+                "bm25_weight": 0.7,
+                "semantic_weight": 0.3,
+                "bm25_terms": ["investment number", "investment no", "investment #"],
+                "reasoning": "Specific identifier requires precise lexical matching",
+                "hyde": [
+                    "This Investment Agreement is assigned Investment Number 51200."
+                ]
             }
         }
     ]
 }
 """
 
+    first_page_preview = (first_page_preview or "").strip()
+    document_index_preview = (document_index_preview or "").strip()
+
+    context_sections: List[str] = []
+    if first_page_preview:
+        context_sections.append(
+            "Document First Page Preview:\n<<<FIRST_PAGE_START>>>\n"
+            + first_page_preview
+            + "\n<<<FIRST_PAGE_END>>>"
+        )
+    if document_index_preview:
+        context_sections.append(
+            "Document Index Preview:\n<<<DOCUMENT_INDEX_START>>>\n"
+            + document_index_preview
+            + "\n<<<DOCUMENT_INDEX_END>>>"
+        )
+
+    context_block = "\n\n".join(context_sections) if context_sections else "Document preview unavailable."
+
     human_prompt = (
-        "Analyze the following prompt and follow the system instructions to decide on Keyword Mode, "
-        "identify keywords if applicable, and produce the decomposed sub-prompts in JSON format:\n\n"
-        f"{user_prompt}"
+        "Use the document preview and user prompt below to follow the system instructions and emit the JSON object.\n\n"
+        f"{context_block}\n\n"
+        f"User Prompt:\n{user_prompt}"
     )
 
     messages = [
@@ -228,10 +250,6 @@ Example JSON Output:
     ]
 
     fallback_result = {
-        "keyword_mode": False,
-        "keyword_reasoning": "Fallback: unable to run keyword decision.",
-        "keywords": [],
-        "keyword_groups": [],
         "user_request_context": "",
         "decomposition": [{
             "title": "Overall Analysis",
@@ -240,8 +258,11 @@ Example JSON Output:
                 "retrieval_mode": "hybrid",
                 "bm25_weight": 0.5,
                 "semantic_weight": 0.5,
-                "reasoning": "Default balanced weights due to decomposition failure"
-            }
+                "bm25_terms": [],
+                "reasoning": "Default balanced weights due to decomposition failure",
+                "hyde": []
+            },
+            "bm25_terms": []
         }]
     }
 
@@ -353,18 +374,149 @@ Example JSON Output:
             unique_terms.append(cleaned)
         return unique_terms
 
-    try:
-        try:
-            parsed_json = await analyzer._get_json_with_retries(
-                messages=messages,
-                model_name=DECOMPOSITION_MODEL_NAME,
-                context="ask mode prompt decomposition",
-            )
-        except json.JSONDecodeError as json_err:
-            logger.error("Failed to parse decomposition response as JSON after retries: %s", json_err)
-            logger.warning("Falling back to using the original prompt due to JSON parsing error.")
-            return fallback_result
+    def _normalize_bm25_terms_field(
+        value: Any,
+        fallback_terms: Optional[List[str]] = None,
+        fallback_prompt: str = "",
+    ) -> List[str]:
+        collected = _collect_keywords_from_value(value)
 
+        if not collected and isinstance(value, str):
+            # Split on OR and commas while keeping quoted phrases
+            segments = re.split(r"\bOR\b|,", value, flags=re.IGNORECASE)
+            for segment in segments:
+                segment_clean = segment.strip().strip('"').strip("'")
+                if segment_clean:
+                    collected.append(segment_clean)
+
+        if not collected and fallback_terms:
+            collected = list(fallback_terms)
+
+        if not collected and isinstance(fallback_prompt, str):
+            fallback_clean = _clean_keyword_text(fallback_prompt)
+            if fallback_clean:
+                collected = [fallback_clean]
+
+        normalized_terms: List[str] = []
+        seen_terms: Set[str] = set()
+        for term in collected:
+            cleaned_term = _clean_keyword_text(term)
+            if not cleaned_term:
+                continue
+            lowered_term = cleaned_term.lower()
+            if lowered_term in seen_terms:
+                continue
+            seen_terms.add(lowered_term)
+            normalized_terms.append(cleaned_term)
+
+        return normalized_terms
+
+    def _normalize_hyde_field(value: Any) -> List[str]:
+        phrases: List[str] = []
+
+        def _append_phrase(candidate: Any) -> None:
+            if isinstance(candidate, str):
+                cleaned = candidate.strip()
+                if cleaned:
+                    phrases.append(cleaned)
+            elif candidate is not None and not isinstance(candidate, (list, tuple, set, dict)):
+                cleaned = str(candidate).strip()
+                if cleaned:
+                    phrases.append(cleaned)
+
+        if isinstance(value, str):
+            _append_phrase(value)
+        elif isinstance(value, (list, tuple, set)):
+            for entry in value:
+                if isinstance(entry, (list, tuple, set)):
+                    for nested in entry:
+                        _append_phrase(nested)
+                else:
+                    _append_phrase(entry)
+        elif isinstance(value, dict):
+            for key in ("hyde", "phrases", "sentences", "text", "values"):
+                if key not in value:
+                    continue
+                candidate = value[key]
+                if isinstance(candidate, (list, tuple, set)):
+                    for nested in candidate:
+                        _append_phrase(nested)
+                else:
+                    _append_phrase(candidate)
+        elif value is not None:
+            _append_phrase(value)
+
+        normalized: List[str] = []
+        seen_local: Set[str] = set()
+        for phrase in phrases:
+            lowered = phrase.lower()
+            if lowered in seen_local:
+                continue
+            seen_local.add(lowered)
+            normalized.append(phrase)
+
+        return normalized[:2]
+
+    try:
+        parsed_json: Any = None
+        raw_response: Optional[str] = None
+        generation_metadata = {"operation": "ask_mode.decomposition"}
+
+        with optional_context(
+            start_generation(
+                name="ask_mode.decomposition",
+                input_data={"messages": messages},
+                metadata=generation_metadata,
+                model=DECOMPOSITION_MODEL_NAME,
+            )
+        ) as generation:
+            try:
+                result = await analyzer._get_json_with_retries(
+                    messages=messages,
+                    model_name=DECOMPOSITION_MODEL_NAME,
+                    context="ask mode prompt decomposition",
+                    return_raw=True,
+                )
+            except Exception as err:
+                record_generation_error(
+                    generation,
+                    err,
+                    metadata={"stage": "ask_mode.prompt_decomposition"},
+                )
+                raise
+
+            if isinstance(result, tuple) and len(result) == 2:
+                parsed_json, raw_response = result
+            else:
+                parsed_json = result
+                raw_response = None
+
+            response_preview = (
+                raw_response[:500] if isinstance(raw_response, str) else None
+            )
+            set_generation_output(
+                generation,
+                output=parsed_json,
+                metadata={"raw_response_preview": response_preview},
+            )
+
+        if parsed_json is None:
+            logger.error("Decomposition LLM returned no data; using fallback result")
+            return fallback_result
+    except json.JSONDecodeError as json_err:
+        logger.error("Failed to parse decomposition response as JSON after retries: %s", json_err)
+        logger.warning("Falling back to using the original prompt due to JSON parsing error.")
+        return fallback_result
+    except TimeoutError:
+        logger.error("Prompt decomposition request timed out. Falling back to original prompt.")
+        return fallback_result
+    except Exception as err:
+        logger.error("Error during prompt decomposition LLM call: %s", err, exc_info=True)
+        logger.warning("Falling back to using the original prompt.")
+        return fallback_result
+
+    # Parse successful response
+    try:
         if isinstance(parsed_json, dict) and "decomposition" in parsed_json:
             decomposition_list = parsed_json["decomposition"]
             if isinstance(decomposition_list, list):
@@ -476,15 +628,27 @@ Example JSON Output:
                             item["title"],
                         )
 
+                    bm25_terms = _normalize_bm25_terms_field(
+                        rag_params.get("bm25_terms"),
+                        fallback_terms=deduped_keywords,
+                        fallback_prompt=item["sub_prompt"],
+                    )
+                    rag_params["bm25_terms"] = bm25_terms
+                    item["bm25_terms"] = bm25_terms
+
+                    hyde_phrases = _normalize_hyde_field(rag_params.get("hyde"))
+                    if not hyde_phrases and isinstance(item.get("hyde"), (list, tuple, set, dict, str)):
+                        hyde_phrases = _normalize_hyde_field(item.get("hyde"))
+                    rag_params["hyde"] = hyde_phrases
+                    item["hyde"] = hyde_phrases
+
                     valid_items.append(item)
 
                 if not valid_items:
                     logger.warning("Decomposition resulted in an empty list after filtering. Falling back.")
                     return fallback_result
 
-                keyword_mode_value = bool(parsed_json.get("keyword_mode", False))
-                raw_keywords = parsed_json.get("keywords", [])
-                keyword_reasoning = parsed_json.get("keyword_reasoning")
+                user_request_context = parsed_json.get("user_request_context", "")
                 user_request_context = parsed_json.get("user_request_context", "")
 
                 if not isinstance(user_request_context, str):
@@ -492,54 +656,16 @@ Example JSON Output:
                 else:
                     user_request_context = user_request_context.strip()
 
-                keyword_groups: List[List[str]] = []
-                normalized_keywords: List[str] = []
-                seen_keywords: Set[str] = set()
-
-                if isinstance(raw_keywords, list):
-                    for entry in raw_keywords:
-                        group_terms: List[str] = []
-                        if isinstance(entry, str):
-                            group_terms.extend(_split_synonyms_if_needed(entry))
-                        elif isinstance(entry, list):
-                            local_seen: Set[str] = set()
-                            for candidate in entry:
-                                for term in _split_synonyms_if_needed(candidate):
-                                    lowered = term.lower()
-                                    if lowered in local_seen:
-                                        continue
-                                    local_seen.add(lowered)
-                                    group_terms.append(term)
-                        elif isinstance(entry, dict):
-                            group_terms.extend(_extract_terms_from_dict(entry))
-
-                        if group_terms:
-                            _add_keyword_group(group_terms, keyword_groups, normalized_keywords, seen_keywords)
-                elif isinstance(raw_keywords, str):
-                    _add_keyword_group(_split_synonyms_if_needed(raw_keywords), keyword_groups, normalized_keywords, seen_keywords)
-
-                if keyword_mode_value and not normalized_keywords:
-                    logger.warning("keyword_mode was true but no valid keywords were returned. Forcing keyword_mode to false.")
-                    keyword_mode_value = False
-
                 result_payload = {
-                    "keyword_mode": keyword_mode_value,
-                    "keyword_reasoning": keyword_reasoning or "LLM did not supply keyword reasoning.",
-                    "keywords": normalized_keywords,
-                    "keyword_groups": keyword_groups,
                     "user_request_context": user_request_context,
                     "decomposition": valid_items,
                 }
 
                 logger.info(
-                    "Successfully decomposed prompt into %d sub-prompts (keyword_mode=%s, keywords=%s, user_context_present=%s)",
+                    "Successfully decomposed prompt into %d sub-prompts (user_context_present=%s)",
                     len(valid_items),
-                    keyword_mode_value,
-                    normalized_keywords,
                     bool(user_request_context),
                 )
-                if keyword_groups:
-                    logger.debug("Keyword groups extracted: %s", keyword_groups)
                 return result_payload
 
             logger.warning("Decomposition JSON found, but 'decomposition' key is not a list. Falling back.")
@@ -547,12 +673,8 @@ Example JSON Output:
 
         logger.warning("Decomposition JSON parsed, but missing 'decomposition' key or wrong structure. Falling back.")
         return fallback_result
-
-    except TimeoutError:
-        logger.error("Prompt decomposition request timed out. Falling back to original prompt.")
-        return fallback_result
-    except Exception as err:
-        logger.error("Error during prompt decomposition LLM call: %s", err, exc_info=True)
+    except Exception as parse_err:
+        logger.error("Error parsing decomposition result structure: %s", parse_err, exc_info=True)
         logger.warning("Falling back to using the original prompt.")
         return fallback_result
 

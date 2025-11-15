@@ -25,6 +25,12 @@ from .citation_utils import (
 )
 from .export_utils import export_to_word
 from ..utils.helpers import render_limited_markdown
+from ..utils.langfuse_tracing import (
+    start_span,
+    set_span_output,
+    record_span_error,
+    get_langfuse_client_cached,
+)
 
 def _get_embedding_model():
     """Lazily retrieve the shared embedding model."""
@@ -562,49 +568,100 @@ def display_analysis_results(results: List[Dict[str, Any]]):
                     try:
                         logger.info(f"Processing follow-up question: {followup_question[:50]}...")
 
-                        # Use the same RAG pipeline as chat with same retrieval depth as main analysis
-                        relevant_chunks = retrieve_relevant_chunks_for_chat(
-                            prompt=followup_question,
-                            top_k_per_doc=RAG_TOP_K,
-                            embedding_model=embedding_model,
-                            reranker_model=reranker_model,
-                            preprocessed_data=st.session_state.get("preprocessed_data", {})
-                        )
+                        # Get trace_id from the first available result to link follow-up to parent trace
+                        parent_trace_id = None
+                        for result in results_with_real_analysis:
+                            result_dict = result[0] if isinstance(result, tuple) else result
+                            if isinstance(result_dict, dict):
+                                parent_trace_id = result_dict.get("trace_id")
+                                if parent_trace_id:
+                                    logger.debug(f"Using parent trace_id for follow-up: {parent_trace_id}")
+                                    break
 
-                        # Generate response using the same analyzer
-                        analyzer = DocumentAnalyzer()
-                        raw_response = run_async(
-                            generate_chat_response(
-                                analyzer,
-                                followup_question,
-                                relevant_chunks
-                            )
-                        )
+                        # Create trace_context for linking to parent trace
+                        trace_context_dict = None
+                        if parent_trace_id:
+                            trace_context_dict = {"trace_id": parent_trace_id}
 
-                        # Process response for citations
-                        processed_text, citation_details = process_chat_response_for_numbered_citations(raw_response)
-
-                        # Refresh PDF highlighting to reflect the new RAG chunks
-                        try:
-                            regenerate_annotated_pdfs_from_chat_chunks(relevant_chunks)
-                        except Exception as _e:
-                            logger.warning(f"Could not refresh PDF highlights for follow-up: {_e}")
-
-                        # Store the Q&A pair with relevant chunks for score information
-                        qa_pair = {
-                            "question": followup_question,
-                            "answer": raw_response,
-                            "processed_text": processed_text,
-                            "citation_details": citation_details,
-                            "relevant_chunks": relevant_chunks,  # Store chunks for score information
-                            "timestamp": datetime.now().isoformat()
+                        # Wrap follow-up processing in a span linked to the parent trace
+                        span_metadata = {
+                            "question_length": len(followup_question),
+                            "parent_trace_id": parent_trace_id,
                         }
 
-                        # Ensure followup_qa exists before appending
-                        if "followup_qa" not in st.session_state:
-                            st.session_state.followup_qa = []
-                        st.session_state.followup_qa.append(qa_pair)
-                        logger.info("Follow-up question processed successfully")
+                        with start_span(
+                            name="follow-up-question",
+                            input_data={"question": followup_question},
+                            metadata=span_metadata,
+                        ) as followup_span:
+                            try:
+                                # If we have a parent trace, manually link this span
+                                if trace_context_dict and followup_span:
+                                    try:
+                                        langfuse_client = get_langfuse_client_cached()
+                                        if langfuse_client:
+                                            # The span is already created, but we log that it should be under the parent
+                                            logger.debug(f"Follow-up span created, intended parent trace: {parent_trace_id}")
+                                    except Exception as link_err:
+                                        logger.debug(f"Could not link span to parent trace: {link_err}")
+
+                                # Use the same RAG pipeline as chat with same retrieval depth as main analysis
+                                relevant_chunks = retrieve_relevant_chunks_for_chat(
+                                    prompt=followup_question,
+                                    top_k_per_doc=RAG_TOP_K,
+                                    embedding_model=embedding_model,
+                                    reranker_model=reranker_model,
+                                    preprocessed_data=st.session_state.get("preprocessed_data", {})
+                                )
+
+                                # Generate response using the same analyzer
+                                # The generate_chat_response function now has its own generation span
+                                analyzer = DocumentAnalyzer()
+                                raw_response = run_async(
+                                    generate_chat_response(
+                                        analyzer,
+                                        followup_question,
+                                        relevant_chunks
+                                    )
+                                )
+
+                                # Process response for citations
+                                processed_text, citation_details = process_chat_response_for_numbered_citations(raw_response)
+
+                                # Refresh PDF highlighting to reflect the new RAG chunks
+                                try:
+                                    regenerate_annotated_pdfs_from_chat_chunks(relevant_chunks)
+                                except Exception as _e:
+                                    logger.warning(f"Could not refresh PDF highlights for follow-up: {_e}")
+
+                                # Store the Q&A pair with relevant chunks for score information
+                                qa_pair = {
+                                    "question": followup_question,
+                                    "answer": raw_response,
+                                    "processed_text": processed_text,
+                                    "citation_details": citation_details,
+                                    "relevant_chunks": relevant_chunks,  # Store chunks for score information
+                                    "timestamp": datetime.now().isoformat()
+                                }
+
+                                # Record span output
+                                set_span_output(
+                                    followup_span,
+                                    output={"answer_length": len(raw_response), "num_citations": len(citation_details)},
+                                    metadata={"num_chunks_used": len(relevant_chunks)},
+                                )
+
+                                # Ensure followup_qa exists before appending
+                                if "followup_qa" not in st.session_state:
+                                    st.session_state.followup_qa = []
+                                st.session_state.followup_qa.append(qa_pair)
+                                logger.info("Follow-up question processed successfully")
+
+                            except Exception as span_err:
+                                logger.error(f"Error in follow-up span: {span_err}", exc_info=True)
+                                if followup_span:
+                                    record_span_error(followup_span, span_err)
+                                raise
 
                         # Clear the input and rerun to show the new Q&A
                         st.rerun()

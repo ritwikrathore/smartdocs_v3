@@ -99,8 +99,10 @@ def log_rag_parameters(
     sub_prompt: str,
     bm25_weight: float,
     semantic_weight: float,
+    *,
     reasoning: str,
-    source: str = "decomposition"
+    source: str = "decomposition",
+    bm25_terms: Optional[List[str]] = None,
 ) -> None:
     """
     Log RAG parameter selection for a sub-prompt.
@@ -112,6 +114,7 @@ def log_rag_parameters(
         semantic_weight: Semantic weight used
         reasoning: Reasoning for the weight selection
         source: Source of the parameters (e.g., "decomposition", "retry_agent", "default")
+        bm25_terms: Ordered list of lexical phrases supplied to BM25
     """
     if not INTERACTION_LOGGING_ENABLED:
         return
@@ -127,6 +130,9 @@ def log_rag_parameters(
             "semantic_weight": semantic_weight,
             "reasoning": reasoning
         }
+
+        if bm25_terms:
+            log_entry["bm25_terms"] = bm25_terms
 
         interaction_logger.info(f"RAG_PARAMETERS: {json.dumps(log_entry, indent=2)}")
     except Exception as e:

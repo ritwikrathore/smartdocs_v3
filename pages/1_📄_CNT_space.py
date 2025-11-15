@@ -13,6 +13,7 @@ from pathlib import Path
 import threading
 import streamlit_pills as stp
 import streamlit.components.v1 as components
+from typing import List
 
 # Note: Page-level `set_page_config` removed to ensure the main app
 # calls `st.set_page_config()` exactly once and as the first Streamlit
@@ -506,6 +507,36 @@ def process_rag_requests(results: list[dict[str, any]]) -> tuple[list[dict[str, 
                             query = section_key.replace('_', ' ')
                         query = query[:256]
 
+                        # Derive seed retrieval parameters from prior run when available
+                        seed_bm25_terms: List[str] = []
+                        seed_hyde_phrases: List[str] = []
+                        rag_params = None
+                        if isinstance(result_meta, dict):
+                            sub_prompt_results = result_meta.get("sub_prompt_results") or []
+                            if isinstance(sub_prompt_results, list):
+                                for entry in sub_prompt_results:
+                                    if isinstance(entry, dict) and entry.get("section_key") == section_key:
+                                        rag_params = entry.get("rag_params")
+                                        break
+                        if isinstance(rag_params, dict):
+                            raw_terms = rag_params.get("bm25_terms")
+                            if isinstance(raw_terms, (list, tuple)):
+                                for term in raw_terms:
+                                    if isinstance(term, str):
+                                        cleaned = term.strip()
+                                        if cleaned:
+                                            seed_bm25_terms.append(cleaned)
+                            raw_hyde = rag_params.get("hyde")
+                            if isinstance(raw_hyde, (list, tuple)):
+                                for phrase in raw_hyde:
+                                    if isinstance(phrase, str):
+                                        cleaned_phrase = phrase.strip()
+                                        if cleaned_phrase:
+                                            seed_hyde_phrases.append(cleaned_phrase)
+
+                        if not seed_bm25_terms and query:
+                            seed_bm25_terms = [query]
+
                         if guided_prompt_override:
                             logger.info(
                                 "RAG retry for %s (%s) using guided prompt override: %s",
@@ -536,6 +567,8 @@ def process_rag_requests(results: list[dict[str, any]]) -> tuple[list[dict[str, 
                                 reranker_model=reranker_model,
                                 bm25_weight=0.5,
                                 semantic_weight=0.5,
+                                bm25_terms=seed_bm25_terms or None,
+                                alternate_hyde_queries=seed_hyde_phrases or None,
                             )
                         )
 
@@ -551,6 +584,8 @@ def process_rag_requests(results: list[dict[str, any]]) -> tuple[list[dict[str, 
                             bm25_weight=0.5,
                             semantic_weight=0.5,
                             top_k=10,
+                            bm25_terms=seed_bm25_terms,
+                            hyde_phrases=seed_hyde_phrases,
                         )
 
                         # Run retry with optimization

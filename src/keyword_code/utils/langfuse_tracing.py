@@ -295,8 +295,8 @@ def optional_context(manager):
     """Return a context manager when provided, otherwise a nullcontext."""
 
     if manager is None:
-        with nullcontext():
-            yield None
+        with nullcontext() as ctx:
+            yield ctx
     else:
-        with manager:
-            yield manager
+        with manager as ctx:
+            yield ctx

@@ -27,6 +27,8 @@ class RAGContext(BaseModel):
     bm25_weight: float = 0.5
     semantic_weight: float = 0.5
     top_k: int = 10
+    bm25_terms: List[str] = Field(default_factory=list)
+    hyde_phrases: List[str] = Field(default_factory=list)
 
 
 class RAGAnalysis(BaseModel):
@@ -37,6 +39,8 @@ class RAGAnalysis(BaseModel):
     recommended_bm25_weight: float = Field(description="Recommended BM25 weight (0-1)")
     recommended_semantic_weight: float = Field(description="Recommended semantic weight (0-1)")
     recommended_top_k: int = Field(description="Recommended number of results to retrieve")
+    recommended_bm25_terms: List[str] = Field(default_factory=list, description="Lexical terms to supply to BM25 in the retry")
+    recommended_hyde_phrases: List[str] = Field(default_factory=list, description="Speculative HYDE prompts to seed semantic retrieval")
     reasoning: str = Field(description="Explanation of the recommendations")
 
 
@@ -64,21 +68,23 @@ class RAGOptimizationAgent:
             model=self.model,
             result_type=RAGAnalysis,
             system_prompt="""You are an expert RAG (Retrieval-Augmented Generation) optimization agent.
-            
-Your job is to analyze queries and current RAG results to recommend optimal retrieval parameters.
 
-Key guidelines:
-1. For Keyword based queries: Prefer BM25 (weight ~0.7-0.8) over semantic search due to specific terminology
-2. For general legal queries: Balanced approach (BM25 ~0.5, semantic ~0.5)
-3. For financial terms: Slightly favor BM25 (weight ~0.6) for precise terminology
-4. For conceptual queries: Favor semantic search (weight ~0.6-0.7)
+    Your job is to analyze queries and current RAG results to recommend optimal retrieval parameters.
 
-Analyze the query type, current results quality, and recommend:
-- Optimal BM25/semantic weights
-- Appropriate top_k value
-- Clear reasoning for recommendations
+    Key guidelines:
+    1. For keyword-dense queries: Prefer BM25 (weight ~0.7-0.8) and supply explicit lexical terms the search system should OR together.
+    2. For general legal queries: Balanced approach (BM25 ~0.5, semantic ~0.5).
+    3. For financial terms: Slightly favor BM25 (weight ~0.6) for precise terminology.
+    4. For conceptual queries: Favor semantic search (weight ~0.6-0.7) and provide HYDE-style speculative sentences to seed semantic retrieval.
 
-Be concise but thorough in your analysis."""
+    Always return:
+    - Recommended BM25 / semantic weights that sum to ~1.0.
+    - A top_k value aligned with query breadth (default 10 unless you have a strong reason).
+    - `recommended_bm25_terms`: ordered list of literal phrases to hand to BM25 (use [] if no change is needed).
+    - `recommended_hyde_phrases`: at most 2 concise sentences that sound like excerpts from the document and should guide semantic recall (use [] when not helpful).
+    - Clear reasoning that justifies the adjustments referencing current retrieval quality.
+
+    Be concise but thorough in your analysis."""
         )
     
     def _create_databricks_model(self):
@@ -112,6 +118,8 @@ Be concise but thorough in your analysis."""
         try:
             # Prepare analysis prompt
             current_results_summary = self._summarize_results(context.current_results)
+            current_terms = ", ".join(context.bm25_terms) if context.bm25_terms else "<none>"
+            current_hyde = "; ".join(context.hyde_phrases) if context.hyde_phrases else "<none>"
             
             prompt = f"""
             Analyze this RAG retrieval scenario:
@@ -120,6 +128,8 @@ Be concise but thorough in your analysis."""
             Current BM25 weight: {context.bm25_weight}
             Current semantic weight: {context.semantic_weight}
             Current top_k: {context.top_k}
+            Current BM25 terms: {current_terms}
+            Current HYDE phrases: {current_hyde}
             
             Current results summary:
             {current_results_summary}
@@ -141,6 +151,8 @@ Be concise but thorough in your analysis."""
                 recommended_bm25_weight=0.5,
                 recommended_semantic_weight=0.5,
                 recommended_top_k=context.top_k,
+                recommended_bm25_terms=context.bm25_terms,
+                recommended_hyde_phrases=context.hyde_phrases,
                 reasoning="Default parameters due to analysis error"
             )
     
@@ -188,6 +200,10 @@ class RAGRetryTool:
             logger.info(f"RAG optimization analysis: {analysis.reasoning}")
             logger.info(f"Recommended weights - BM25: {analysis.recommended_bm25_weight:.2f}, Semantic: {analysis.recommended_semantic_weight:.2f}")
             logger.info(f"Query type identified: {analysis.query_type}")
+            if analysis.recommended_bm25_terms:
+                logger.info(f"Recommended BM25 terms: {analysis.recommended_bm25_terms}")
+            if analysis.recommended_hyde_phrases:
+                logger.info(f"Recommended HYDE phrases: {analysis.recommended_hyde_phrases}")
 
             # Log RAG parameters from retry agent
             log_rag_parameters(
@@ -195,6 +211,7 @@ class RAGRetryTool:
                 sub_prompt=context.query,
                 bm25_weight=analysis.recommended_bm25_weight,
                 semantic_weight=analysis.recommended_semantic_weight,
+                bm25_terms=analysis.recommended_bm25_terms or context.bm25_terms,
                 reasoning=analysis.reasoning,
                 source="retry_agent"
             )
@@ -204,6 +221,10 @@ class RAGRetryTool:
             optimized_context.bm25_weight = analysis.recommended_bm25_weight
             optimized_context.semantic_weight = analysis.recommended_semantic_weight
             optimized_context.top_k = analysis.recommended_top_k
+            if analysis.recommended_bm25_terms:
+                optimized_context.bm25_terms = analysis.recommended_bm25_terms
+            if analysis.recommended_hyde_phrases:
+                optimized_context.hyde_phrases = analysis.recommended_hyde_phrases
 
             # Retry RAG with optimized parameters
             new_results = await self._retrieve_with_weights(optimized_context)
@@ -221,6 +242,8 @@ class RAGRetryTool:
                 recommended_bm25_weight=context.bm25_weight,
                 recommended_semantic_weight=context.semantic_weight,
                 recommended_top_k=context.top_k,
+                recommended_bm25_terms=context.bm25_terms,
+                recommended_hyde_phrases=context.hyde_phrases,
                 reasoning="Retry failed, keeping original parameters"
             )
     
@@ -237,7 +260,9 @@ class RAGRetryTool:
             valid_chunk_indices=context.valid_chunk_indices,
             reranker_model=context.reranker_model,
             bm25_weight=context.bm25_weight,
-            semantic_weight=context.semantic_weight
+            semantic_weight=context.semantic_weight,
+            bm25_terms=context.bm25_terms,
+            alternate_hyde_queries=context.hyde_phrases,
         )
 
         return results

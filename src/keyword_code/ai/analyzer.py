@@ -5,7 +5,7 @@ Document analyzer functionality.
 import json
 import re
 import threading
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, Set
 from ..config import logger, ANALYSIS_MODEL_NAME, USE_DATABRICKS_LLM, LLM_MAX_RETRIES
 
 # Import Databricks LLM client
@@ -14,8 +14,95 @@ from .databricks_llm import get_databricks_llm
 # Import interaction logger
 from ..utils.interaction_logger import log_llm_interaction
 
+# Import Langfuse tracing
+from ..utils.langfuse_tracing import (
+    optional_context,
+    record_generation_error,
+    set_generation_output,
+    set_span_output,
+    start_generation,
+    start_span,
+)
+
 
 _thread_local = threading.local()
+
+_TRACE_METADATA_SKIP_KEYS = {"tokens", "embedding", "bbox", "bboxes"}
+
+
+def _truncate_for_trace(value: str, limit: int = 400) -> str:
+    if not value:
+        return ""
+    if len(value) <= limit:
+        return value
+    return value[:limit] + "..."
+
+
+def _coerce_trace_value(value: Any, *, max_length: int = 200, max_items: int = 10) -> Any:
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        if isinstance(value, str) and len(value) > max_length:
+            return value[:max_length] + "..."
+        return value
+    if isinstance(value, list):
+        sanitized_list = [
+            _coerce_trace_value(item, max_length=max_length, max_items=max_items)
+            for item in value[:max_items]
+        ]
+        if len(value) > max_items:
+            sanitized_list.append("...")
+        return sanitized_list
+    if isinstance(value, dict):
+        sanitized_dict: Dict[str, Any] = {}
+        for idx, (key, val) in enumerate(value.items()):
+            if idx >= max_items:
+                sanitized_dict["..."] = f"{len(value) - max_items} more keys"
+                break
+            sanitized_dict[str(key)] = _coerce_trace_value(val, max_length=max_length, max_items=max_items)
+        return sanitized_dict
+    if isinstance(value, set):
+        truncated = list(value)[:max_items]
+        sanitized = [
+            _coerce_trace_value(item, max_length=max_length, max_items=max_items)
+            for item in truncated
+        ]
+        if len(value) > max_items:
+            sanitized.append("...")
+        return sanitized
+    value_str = str(value)
+    if len(value_str) > max_length:
+        return value_str[:max_length] + "..."
+    return value_str
+
+
+def _summarize_relevant_chunk(chunk: Dict[str, Any], *, rank: int, fallback_index: int) -> Dict[str, Any]:
+    summary: Dict[str, Any] = {
+        "rank": rank,
+        "chunk_id": chunk.get("chunk_id"),
+        "chunk_index": chunk.get("chunk_index", fallback_index),
+        "retrieval_method": chunk.get("retrieval_method"),
+        "page_num": chunk.get("page_num"),
+        "page_label": chunk.get("page_label"),
+        "text_preview": _truncate_for_trace(chunk.get("text", ""), limit=300),
+    }
+
+    score_value = chunk.get("score")
+    if score_value is not None:
+        try:
+            summary["score"] = float(score_value)
+        except (TypeError, ValueError):
+            summary["score"] = score_value
+
+    metadata = chunk.get("metadata")
+    if isinstance(metadata, dict):
+        sanitized_metadata: Dict[str, Any] = {}
+        for key, value in metadata.items():
+            if key in _TRACE_METADATA_SKIP_KEYS:
+                continue
+            sanitized_metadata[key] = _coerce_trace_value(value)
+        if sanitized_metadata:
+            summary["metadata"] = sanitized_metadata
+
+    return summary
 
 
 def _sanitize_unescaped_control_chars(json_str: str) -> Tuple[str, bool]:
@@ -89,6 +176,379 @@ class DocumentAnalyzer:
             return {"client": self.databricks_client, "model_name": model_name, "type": "databricks"}
         else:
             raise ValueError("No LLM client available - Databricks LLM client failed to initialize")
+
+    def _normalize_metadata_key(self, value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            value_str = str(value)
+        else:
+            value_str = str(value).strip()
+        if not value_str:
+            return None
+        return value_str.lower()
+
+    def _register_index_entry(self, index_map: Dict[str, List[int]], key: Any, chunk_index: int) -> None:
+        normalized = self._normalize_metadata_key(key)
+        if not normalized:
+            return
+        bucket = index_map.setdefault(normalized, [])
+        if chunk_index not in bucket:
+            bucket.append(chunk_index)
+
+    def _resolve_chunk_index(self, chunk: Dict[str, Any], fallback_index: int) -> int:
+        index = chunk.get("chunk_index")
+        if isinstance(index, int):
+            return index
+        metadata = chunk.get("metadata")
+        if isinstance(metadata, dict):
+            meta_index = metadata.get("chunk_index")
+            if isinstance(meta_index, int):
+                return meta_index
+        return fallback_index
+
+    def _format_chunk_excerpt(self, chunk: Dict[str, Any], chunk_index: int) -> str:
+        metadata = chunk.get("metadata") or {}
+        location_parts: List[str] = []
+        article_number = metadata.get("article_number")
+        if article_number:
+            article_type = metadata.get("article_type", "Article")
+            location_parts.append(f"{article_type} {article_number}")
+            if metadata.get("article_title"):
+                location_parts.append(str(metadata["article_title"]))
+        section_number = metadata.get("section_number")
+        if section_number:
+            location_parts.append(str(section_number))
+            if metadata.get("section_title"):
+                location_parts.append(str(metadata["section_title"]))
+        if metadata.get("subsection_label"):
+            location_parts.append(f"Subsection ({metadata['subsection_label']})")
+        location_label = " - ".join(part for part in location_parts if part)
+        page_label = chunk.get("page_label")
+        page_num = chunk.get("page_num")
+        lines = [f"CHUNK_INDEX: {chunk_index}"]
+        chunk_id = chunk.get("chunk_id")
+        if chunk_id:
+            lines.append(f"CHUNK_ID: {chunk_id}")
+        if location_label:
+            lines.append(f"LOCATION: {location_label}")
+        if page_label is not None:
+            lines.append(f"PAGE_LABEL: {page_label}")
+        elif isinstance(page_num, int) and page_num >= 0:
+            lines.append(f"PAGE_NUMBER: {page_num + 1}")
+        lines.append("TEXT:")
+        lines.append(chunk.get("text", ""))
+        return "\n".join(lines)
+
+    def _parse_context_request_payload(self, payload: Any) -> Tuple[bool, List[Dict[str, Any]]]:
+        if not isinstance(payload, dict):
+            return False, []
+
+        needs_context = bool(payload.get("needs_additional_context"))
+        if not needs_context:
+            return False, []
+
+        raw_requests = payload.get("context_requests")
+        if raw_requests is None:
+            raw_requests = payload.get("requested_context")
+        if raw_requests is None:
+            raw_requests = payload.get("additional_context_requests")
+
+        if raw_requests is None:
+            return True, []
+
+        if isinstance(raw_requests, dict):
+            raw_requests = [raw_requests]
+
+        normalized_requests: List[Dict[str, Any]] = []
+        if not isinstance(raw_requests, list):
+            return True, []
+
+        def _collect_values(raw_value: Any) -> List[str]:
+            values: List[str] = []
+            if raw_value is None:
+                return values
+            items: List[Any]
+            if isinstance(raw_value, (list, tuple, set)):
+                items = list(raw_value)
+            else:
+                items = [raw_value]
+            for entry in items:
+                if entry is None:
+                    continue
+                if isinstance(entry, str):
+                    candidate = entry.strip()
+                    if candidate:
+                        values.append(candidate)
+                else:
+                    values.append(str(entry))
+            return values
+
+        def _extract_list(source: Dict[str, Any], keys: Tuple[str, ...]) -> List[str]:
+            seen: Set[str] = set()
+            result: List[str] = []
+            for key in keys:
+                if key not in source:
+                    continue
+                for value in _collect_values(source.get(key)):
+                    if value not in seen:
+                        seen.add(value)
+                        result.append(value)
+            return result
+
+        for item in raw_requests:
+            if not isinstance(item, dict):
+                continue
+
+            raw_index = item.get("sub_prompt_index")
+            if raw_index is None:
+                raw_index = item.get("sub_prompt")
+            if raw_index is None:
+                raw_index = item.get("index")
+
+            try:
+                sub_prompt_index = int(raw_index)
+            except (TypeError, ValueError):
+                continue
+
+            raw_chunks = item.get("chunk_indices")
+            if raw_chunks is None:
+                raw_chunks = item.get("chunks")
+            if raw_chunks is None:
+                raw_chunks = item.get("requested_chunks")
+
+            chunk_indices: List[int] = []
+            if isinstance(raw_chunks, list):
+                for elem in raw_chunks:
+                    try:
+                        chunk_indices.append(int(elem))
+                    except (TypeError, ValueError):
+                        continue
+            elif raw_chunks is not None:
+                try:
+                    chunk_indices.append(int(raw_chunks))
+                except (TypeError, ValueError):
+                    pass
+
+            article_numbers = _extract_list(
+                item,
+                ("article_numbers", "article_number", "articles", "article"),
+            )
+            section_numbers = _extract_list(
+                item,
+                ("section_numbers", "section_number", "sections", "section"),
+            )
+            section_titles = _extract_list(
+                item,
+                ("section_titles", "section_title", "section_names", "section_name"),
+            )
+
+            normalized_requests.append({
+                "sub_prompt_index": sub_prompt_index,
+                "chunk_indices": chunk_indices,
+                "reason": item.get("reason"),
+                "direction": item.get("direction"),
+                "article_numbers": article_numbers,
+                "section_numbers": section_numbers,
+                "section_titles": section_titles,
+            })
+
+        return True, normalized_requests
+
+    def _build_additional_context_response(
+        self,
+        requests: List[Dict[str, Any]],
+        sub_prompts_with_contexts: List[Dict[str, Any]],
+        chunk_lookup: Dict[int, Dict[str, Any]],
+        provided_chunk_indices: Dict[int, Set[int]],
+        metadata_index_maps: Dict[str, Dict[str, List[int]]],
+        max_new_chunks: int = 12,
+    ) -> Tuple[str, List[Dict[str, Any]]]:
+        response_lines: List[str] = []
+        details: List[Dict[str, Any]] = []
+
+        for request in requests:
+            sub_index = request.get("sub_prompt_index")
+            if not isinstance(sub_index, int) or sub_index < 1:
+                continue
+
+            title = ""
+            if 0 <= sub_index - 1 < len(sub_prompts_with_contexts):
+                title = sub_prompts_with_contexts[sub_index - 1].get("title", "")
+
+            already_provided: List[int] = []
+            missing_indices: List[int] = []
+            provided_now: List[int] = []
+            excerpts: List[str] = []
+            truncated_due_to_limit = False
+
+            requested_chunk_indices = request.get("chunk_indices") or []
+            requested_chunk_indices = [int(idx) for idx in requested_chunk_indices if isinstance(idx, int)]
+
+            article_numbers = request.get("article_numbers") or []
+            section_numbers = request.get("section_numbers") or []
+            section_titles = request.get("section_titles") or []
+
+            metadata_requests = {
+                "article_numbers": article_numbers,
+                "section_numbers": section_numbers,
+                "section_titles": section_titles,
+            }
+
+            metadata_hits: Dict[str, List[int]] = {key: [] for key in metadata_requests}
+            metadata_missing: Dict[str, List[str]] = {}
+
+            index_bucket = provided_chunk_indices.setdefault(sub_index, set())
+
+            candidate_indices: List[int] = []
+            candidate_origin: Dict[int, Set[str]] = {}
+
+            def _register_candidate(candidate_idx: int, origin_key: str) -> None:
+                origin_bucket = candidate_origin.setdefault(candidate_idx, set())
+                origin_bucket.add(origin_key)
+                if candidate_idx not in candidate_indices:
+                    candidate_indices.append(candidate_idx)
+
+            for chunk_idx in requested_chunk_indices:
+                _register_candidate(chunk_idx, "chunk_indices")
+
+            for map_key, values in metadata_requests.items():
+                if not values:
+                    continue
+                index_map = metadata_index_maps.get(map_key) or {}
+                hits_for_key: List[int] = []
+                missing_for_key: List[str] = []
+                for value in values:
+                    normalized = self._normalize_metadata_key(value)
+                    if not normalized:
+                        missing_for_key.append(str(value))
+                        continue
+                    indices = index_map.get(normalized)
+                    if not indices:
+                        missing_for_key.append(str(value))
+                        continue
+                    hits_for_key.extend(indices)
+                if hits_for_key:
+                    dedup_hits_for_key: List[int] = []
+                    for hit in hits_for_key:
+                        if hit not in dedup_hits_for_key:
+                            dedup_hits_for_key.append(hit)
+                        _register_candidate(hit, map_key)
+                    metadata_hits[map_key] = dedup_hits_for_key
+                if missing_for_key:
+                    metadata_missing[map_key] = missing_for_key
+
+            # Remove duplicates while preserving order
+            seen_indices: Set[int] = set()
+            ordered_candidates: List[int] = []
+            for candidate in candidate_indices:
+                if candidate not in seen_indices:
+                    ordered_candidates.append(candidate)
+                    seen_indices.add(candidate)
+
+            for chunk_idx in ordered_candidates:
+                if len(provided_now) >= max_new_chunks:
+                    truncated_due_to_limit = True
+                    break
+
+                if chunk_idx in index_bucket:
+                    already_provided.append(chunk_idx)
+                    continue
+
+                chunk = chunk_lookup.get(chunk_idx)
+                if not chunk:
+                    missing_indices.append(chunk_idx)
+                    continue
+
+                index_bucket.add(chunk_idx)
+                provided_now.append(chunk_idx)
+                excerpts.append(self._format_chunk_excerpt(chunk, chunk_idx))
+
+            if article_numbers or section_numbers or section_titles:
+                descriptor_parts: List[str] = []
+                if article_numbers:
+                    descriptor_parts.append("articles " + ", ".join(article_numbers))
+                if section_numbers:
+                    descriptor_parts.append("sections " + ", ".join(section_numbers))
+                if section_titles:
+                    descriptor_parts.append("section titles " + ", ".join(section_titles))
+                response_lines.append(
+                    f"Metadata-based request for sub-prompt {sub_index}: " + "; ".join(descriptor_parts)
+                )
+
+            if provided_now:
+                header = f"Additional context for sub-prompt {sub_index}"
+                if title:
+                    header += f" ({title})"
+                response_lines.append(header + ":")
+                response_lines.extend(excerpts)
+
+            if truncated_due_to_limit:
+                response_lines.append(
+                    f"Context delivery truncated to {max_new_chunks} chunk(s). Request a narrower portion if more detail is still needed."
+                )
+
+            if already_provided and not provided_now:
+                response_lines.append(
+                    f"Requested material already supplied for sub-prompt {sub_index}: {already_provided}."
+                )
+            elif already_provided:
+                response_lines.append(
+                    f"Note: previously supplied chunk indices for sub-prompt {sub_index}: {already_provided}."
+                )
+
+            if missing_indices:
+                response_lines.append(
+                    f"Unable to locate requested chunk indices for sub-prompt {sub_index}: {missing_indices}."
+                )
+
+            if metadata_missing:
+                for map_key, missing_values in metadata_missing.items():
+                    if not missing_values:
+                        continue
+                    label = map_key.replace("_", " ")
+                    response_lines.append(
+                        f"Could not resolve {label} {missing_values} for sub-prompt {sub_index}."
+                    )
+
+            provided_origin_map: Dict[str, List[int]] = {}
+            already_origin_map: Dict[str, List[int]] = {}
+            for idx in provided_now:
+                origins = candidate_origin.get(idx, {"chunk_indices"})
+                for origin in origins:
+                    provided_origin_map.setdefault(origin, []).append(idx)
+            for idx in already_provided:
+                origins = candidate_origin.get(idx, {"chunk_indices"})
+                for origin in origins:
+                    already_origin_map.setdefault(origin, []).append(idx)
+
+            details.append({
+                "sub_prompt_index": sub_index,
+                "requested_indices": ordered_candidates,
+                "provided_indices": provided_now,
+                "already_provided": already_provided,
+                "missing_indices": missing_indices,
+                "reason": request.get("reason"),
+                "direction": request.get("direction"),
+                "article_numbers": article_numbers,
+                "section_numbers": section_numbers,
+                "section_titles": section_titles,
+                "provided_from": provided_origin_map,
+                "already_from": already_origin_map,
+                "metadata_hits": metadata_hits,
+                "metadata_missing": metadata_missing,
+                "truncated": truncated_due_to_limit,
+            })
+
+        message = "\n\n".join(line for line in response_lines if line.strip())
+        if message:
+            message += "\n\nContinue the analysis with these excerpts."
+        else:
+            message = (
+                "No additional excerpts could be supplied for the requested indices. Please proceed using the existing context."
+            )
+
+        return message, details
 
     async def _get_completion(
         self,
@@ -309,8 +769,45 @@ class DocumentAnalyzer:
                         toc_context = "\n".join(toc_lines)
                         logger.info(f"Extracted {len(toc_entries_list)} TOC entries for analyzer context")
 
+            # Build lookup for on-demand context expansion
+            chunk_lookup: Dict[int, Dict[str, Any]] = {}
+            metadata_index_maps: Dict[str, Dict[str, List[int]]] = {
+                "article_numbers": {},
+                "section_numbers": {},
+                "section_titles": {},
+            }
+            if all_chunks:
+                for idx, chunk in enumerate(all_chunks):
+                    resolved_index = chunk.get("chunk_index")
+                    if not isinstance(resolved_index, int):
+                        resolved_index = idx
+                    if resolved_index not in chunk_lookup:
+                        chunk_lookup[resolved_index] = chunk
+                    metadata = chunk.get("metadata") or {}
+                    article_number = metadata.get("article_number")
+                    if article_number is not None:
+                        self._register_index_entry(metadata_index_maps["article_numbers"], article_number, resolved_index)
+                        article_type = metadata.get("article_type")
+                        if article_type:
+                            composite = f"{article_type} {article_number}"
+                            self._register_index_entry(metadata_index_maps["article_numbers"], composite, resolved_index)
+                    section_number = metadata.get("section_number")
+                    if section_number is not None:
+                        self._register_index_entry(metadata_index_maps["section_numbers"], section_number, resolved_index)
+                    section_title = metadata.get("section_title")
+                    if section_title:
+                        self._register_index_entry(metadata_index_maps["section_titles"], section_title, resolved_index)
+                    section_path = metadata.get("section_path")
+                    if isinstance(section_path, list):
+                        for segment in section_path:
+                            self._register_index_entry(metadata_index_maps["section_titles"], segment, resolved_index)
+                    elif section_path:
+                        self._register_index_entry(metadata_index_maps["section_titles"], section_path, resolved_index)
+
             # Format all sub-prompts and their contexts
             formatted_sub_prompts = []
+            trace_sub_prompts_payload: List[Dict[str, Any]] = []
+            provided_chunk_indices: Dict[int, Set[int]] = {}
             for i, item in enumerate(sub_prompts_with_contexts):
                 sub_prompt = item.get('sub_prompt', '')
                 title = item.get('title', f'Sub-prompt {i+1}')
@@ -319,43 +816,42 @@ class DocumentAnalyzer:
                 if not relevant_chunks:
                     logger.warning(f"No relevant chunks for sub-prompt '{title}' in {filename}")
                     formatted_context = "No relevant text found for this sub-prompt."
+                    trace_chunks: List[Dict[str, Any]] = []
                 else:
                     # Format relevant chunks for this sub-prompt
                     # Include metadata to help the model understand document structure
                     formatted_chunks = []
-                    for chunk in relevant_chunks:
-                        metadata = chunk.get('metadata', {})
-                        location_parts = []
-                        
-                        # Build location description from metadata
-                        if metadata.get('article_number'):
-                            location_parts.append(f"{metadata.get('article_type', 'Article')} {metadata['article_number']}")
-                            if metadata.get('article_title'):
-                                location_parts.append(metadata['article_title'])
-                        
-                        if metadata.get('section_number'):
-                            location_parts.append(metadata['section_number'])
-                            if metadata.get('section_title'):
-                                location_parts.append(metadata['section_title'])
-                        
-                        if metadata.get('subsection_label'):
-                            location_parts.append(f"Subsection ({metadata['subsection_label']})")
-                        
-                        # Fallback to page number if no metadata
-                        location = ' - '.join(location_parts) if location_parts else f"Page {chunk.get('page_num', -1) + 1}"
-                        
-                        formatted_chunks.append(
-                            f"LOCATION: {location}\n"
-                            f"TEXT: {chunk.get('text', '')}"
+                    trace_chunks = []
+                    for chunk_position, chunk in enumerate(relevant_chunks):
+                        resolved_index = self._resolve_chunk_index(chunk, chunk_position)
+                        provided_chunk_indices.setdefault(i + 1, set()).add(resolved_index)
+                        formatted_chunks.append(self._format_chunk_excerpt(chunk, resolved_index))
+                        trace_chunks.append(
+                            _summarize_relevant_chunk(
+                                chunk,
+                                rank=len(trace_chunks) + 1,
+                                fallback_index=resolved_index,
+                            )
                         )
                     
                     formatted_context = "\n\n---\n\n".join(formatted_chunks)
+                if (i + 1) not in provided_chunk_indices:
+                    provided_chunk_indices[i + 1] = set()
 
                 formatted_sub_prompts.append({
                     "index": i + 1,
                     "title": title,
                     "sub_prompt": sub_prompt,
                     "context": formatted_context
+                })
+
+                trace_sub_prompts_payload.append({
+                    "index": i + 1,
+                    "title": title,
+                    "sub_prompt": sub_prompt,
+                    "context_preview": _truncate_for_trace(formatted_context, limit=600),
+                    "num_relevant_chunks": len(relevant_chunks),
+                    "chunk_summaries": trace_chunks,
                 })
 
             # Create the system prompt for the comprehensive analysis
@@ -383,6 +879,26 @@ DO NOT use any of the following:
 - Code blocks (```) - not applicable for document analysis
 - Tables unless the relevant context clearly contains tabular data as described above
 - Other complex Markdown elements
+
+### Requesting Additional Context:
+- Each excerpt lists a `CHUNK_INDEX`. Treat this as the anchor for neighbouring text.
+- You may also request excerpts by citing specific article numbers or section identifiers when the provided context skips critical passages.
+- If you require more context, return a JSON payload of the form:
+    {
+        "needs_additional_context": true,
+        "context_requests": [
+            {
+                "sub_prompt_index": <number>,
+                "chunk_indices": [<contiguous chunk indices you need>],
+                "article_numbers": ["Article 5"],
+                "section_numbers": ["5.2"],
+                "section_titles": ["Payment Terms"],
+                "reason": "Short explanation."
+            }
+        ]
+    }
+- Request only contiguous indices that extend the same passage or precise sections that directly satisfy the question. Do not ask for unrelated sections or retry retrieval.
+- You have at most **3** additional context rounds. If told that no more context can be supplied, finalise your analysis with the available excerpts.
 
 ### JSON Output Schema:
 ```json
@@ -432,6 +948,7 @@ Main Prompt:
 {main_prompt}{toc_section}
 
 Sub-prompts and their contexts:
+Each excerpt includes a CHUNK_INDEX line so you can reference neighbouring text when absolutely necessary.
 """
 
             # Add each sub-prompt and its context
@@ -456,27 +973,239 @@ Generate a structured analysis for EACH sub-prompt, strictly following the JSON 
             ]
 
             logger.info(f"Sending comprehensive analysis request for {len(formatted_sub_prompts)} sub-prompts in {filename} to AI")
-            try:
-                parsed_json = await self._get_json_with_retries(
-                    messages=messages,
-                    model_name=ANALYSIS_MODEL_NAME,
-                    context=f"comprehensive analysis for {filename}",
+            
+            max_context_iterations = 3
+            additional_context_rounds = 0
+            context_request_history: List[Dict[str, Any]] = []
+            conversation_previews: List[str] = []
+            forced_completion_issued = False
+            total_iterations = 0
+            max_total_iterations = max_context_iterations + 4
+
+            with optional_context(
+                start_generation(
+                    name="analyzer.comprehensive_analysis",
+                    input_data={
+                        "filename": filename,
+                        "num_sub_prompts": len(formatted_sub_prompts),
+                        "sub_prompt_titles": [item["title"] for item in formatted_sub_prompts],
+                        "main_prompt": main_prompt,
+                        "sub_prompts": trace_sub_prompts_payload,
+                        "toc_context_preview": _truncate_for_trace(toc_context, limit=600) if toc_context else "",
+                    },
+                    metadata={
+                        "operation": "document_analysis.comprehensive",
+                        "num_sub_prompts": len(formatted_sub_prompts),
+                    },
+                    model=ANALYSIS_MODEL_NAME,
                 )
-                logger.info(f"Received comprehensive AI analysis response for {filename}")
-            except json.JSONDecodeError as json_err:
-                logger.error(
-                    "Failed to parse comprehensive AI analysis response as JSON after %d attempt(s): %s",
-                    LLM_MAX_RETRIES,
-                    json_err,
-                )
-                return self._create_fallback_analyses(sub_prompts_with_contexts)
-            except Exception as e:
-                logger.error(
-                    "Error retrieving comprehensive AI analysis response: %s",
-                    e,
-                    exc_info=True,
-                )
-                return self._create_fallback_analyses(sub_prompts_with_contexts)
+            ) as generation:
+                try:
+                    parsed_json: Optional[Dict[str, Any]] = None
+                    final_raw_response: Optional[str] = None
+
+                    while True:
+                        if total_iterations >= max_total_iterations:
+                            logger.warning(
+                                "Maximum analyzer iterations reached (%d) for %s. Proceeding with available context.",
+                                max_total_iterations,
+                                filename,
+                            )
+                            break
+                        total_iterations += 1
+
+                        call_result = await self._get_json_with_retries(
+                            messages=messages,
+                            model_name=ANALYSIS_MODEL_NAME,
+                            context=f"comprehensive analysis for {filename}",
+                            return_raw=True,
+                        )
+
+                        if isinstance(call_result, tuple) and len(call_result) == 2:
+                            current_parsed, raw_response = call_result
+                        else:
+                            current_parsed = call_result
+                            raw_response = None
+
+                        if isinstance(raw_response, str):
+                            response_text = raw_response
+                        else:
+                            response_text = json.dumps(current_parsed, indent=2)
+
+                        messages.append({"role": "assistant", "content": response_text})
+                        conversation_previews.append(_truncate_for_trace(response_text, limit=600))
+
+                        needs_more, context_requests = self._parse_context_request_payload(current_parsed)
+
+                        if needs_more:
+                            logger.info(
+                                "LLM requested additional context on iteration %d for %s.",
+                                len(context_request_history) + 1,
+                                filename,
+                            )
+
+                            if forced_completion_issued and (
+                                additional_context_rounds >= max_context_iterations or not chunk_lookup
+                            ):
+                                logger.warning(
+                                    "Additional context request ignored after limit for %s; using current payload.",
+                                    filename,
+                                )
+                                parsed_json = current_parsed
+                                final_raw_response = response_text
+                                break
+
+                            if not context_requests:
+                                forced_completion_issued = True
+                                clarification_message = (
+                                    "No specific chunk indices were provided. Please finalise the analysis with the existing excerpts."
+                                )
+                                messages.append({"role": "user", "content": clarification_message})
+                                context_request_history.append({
+                                    "iteration": len(context_request_history) + 1,
+                                    "status": "unspecified",
+                                    "requests": [],
+                                })
+                                continue
+
+                            context_message, request_details = self._build_additional_context_response(
+                                context_requests,
+                                sub_prompts_with_contexts,
+                                chunk_lookup,
+                                provided_chunk_indices,
+                                metadata_index_maps,
+                            )
+                            provided_any = any(detail.get("provided_indices") for detail in request_details)
+
+                            history_entry: Dict[str, Any] = {
+                                "iteration": len(context_request_history) + 1,
+                                "status": "pending",
+                                "requests": context_requests,
+                                "details": request_details,
+                            }
+
+                            with optional_context(
+                                start_span(
+                                    name="analyzer.additional_context_request",
+                                    input_data={
+                                        "iteration": history_entry["iteration"],
+                                        "requests": context_requests,
+                                    },
+                                    metadata={
+                                        "operation": "document_analysis.context_request",
+                                        "num_requests": len(context_requests),
+                                    },
+                                )
+                            ) as context_span:
+                                set_span_output(
+                                    context_span,
+                                    output={
+                                        "provided_any": provided_any,
+                                        "details": request_details,
+                                        "message_preview": _truncate_for_trace(context_message, limit=300),
+                                    },
+                                    metadata={"provided_any": provided_any},
+                                )
+
+                            if additional_context_rounds >= max_context_iterations:
+                                history_entry["status"] = "limit_reached"
+                                context_request_history.append(history_entry)
+                                forced_completion_issued = True
+                                limit_message = (
+                                    "Maximum additional context rounds (3) reached. Please finalise the analysis with the excerpts already supplied."
+                                )
+                                messages.append({"role": "user", "content": limit_message})
+                                continue
+
+                            if not provided_any:
+                                history_entry["status"] = "unavailable"
+                                context_request_history.append(history_entry)
+                                forced_completion_issued = True
+                                messages.append({"role": "user", "content": context_message})
+                                continue
+
+                            additional_context_rounds += 1
+                            history_entry["status"] = "provided"
+                            context_request_history.append(history_entry)
+                            forced_completion_issued = False
+                            messages.append({"role": "user", "content": context_message})
+                            continue
+
+                        parsed_json = current_parsed
+                        final_raw_response = response_text
+                        break
+
+                    if parsed_json is None:
+                        raise RuntimeError("Failed to obtain final analysis response from the LLM.")
+
+                    logger.info(
+                        "Received comprehensive AI analysis response for %s after %d iteration(s) with %d additional context rounds.",
+                        filename,
+                        total_iterations,
+                        additional_context_rounds,
+                    )
+
+                    response_preview = (
+                        final_raw_response[:500] if isinstance(final_raw_response, str) else None
+                    )
+                    context_request_metadata = [
+                        {
+                            "iteration": entry.get("iteration"),
+                            "status": entry.get("status"),
+                            "details": [
+                                {
+                                    "sub_prompt_index": detail.get("sub_prompt_index"),
+                                    "requested_indices": detail.get("requested_indices"),
+                                    "provided_indices": detail.get("provided_indices"),
+                                    "missing_indices": detail.get("missing_indices"),
+                                    "article_numbers": detail.get("article_numbers"),
+                                    "section_numbers": detail.get("section_numbers"),
+                                    "section_titles": detail.get("section_titles"),
+                                    "provided_from": detail.get("provided_from"),
+                                    "already_from": detail.get("already_from"),
+                                    "metadata_missing": detail.get("metadata_missing"),
+                                    "truncated": detail.get("truncated"),
+                                }
+                                for detail in entry.get("details", [])
+                            ],
+                        }
+                        for entry in context_request_history
+                    ]
+                    set_generation_output(
+                        generation,
+                        output=parsed_json,
+                        metadata={
+                            "raw_response_preview": response_preview,
+                            "context_request_rounds": additional_context_rounds,
+                            "context_request_history": context_request_metadata,
+                            "conversation_response_previews": conversation_previews,
+                        },
+                    )
+
+                except json.JSONDecodeError as json_err:
+                    logger.error(
+                        "Failed to parse comprehensive AI analysis response as JSON after %d attempt(s): %s",
+                        LLM_MAX_RETRIES,
+                        json_err,
+                    )
+                    record_generation_error(
+                        generation,
+                        json_err,
+                        metadata={"stage": "analyzer.comprehensive_analysis_parsing"},
+                    )
+                    return self._create_fallback_analyses(sub_prompts_with_contexts)
+                except Exception as e:
+                    logger.error(
+                        "Error retrieving comprehensive AI analysis response: %s",
+                        e,
+                        exc_info=True,
+                    )
+                    record_generation_error(
+                        generation,
+                        e,
+                        metadata={"stage": "analyzer.comprehensive_analysis"},
+                    )
+                    return self._create_fallback_analyses(sub_prompts_with_contexts)
 
             # Validate the response structure
             if not isinstance(parsed_json, dict) or "analyses" not in parsed_json:

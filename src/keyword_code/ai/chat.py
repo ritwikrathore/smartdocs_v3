@@ -5,6 +5,13 @@ Chat functionality.
 from typing import Any, Dict, List
 from ..config import logger, ANALYSIS_MODEL_NAME, USE_DATABRICKS_LLM
 
+# Import Langfuse tracing
+from ..utils.langfuse_tracing import (
+    start_generation,
+    set_generation_output,
+    record_generation_error,
+)
+
 
 async def generate_chat_response(
     analyzer, user_prompt: str, relevant_chunks: List[Dict[str, Any]]
@@ -80,17 +87,50 @@ Please answer the user's question based *only* on these excerpts and cite your s
         {"role": "user", "content": human_prompt},
     ]
 
-    try:
-        logger.info(f"Sending chat request for prompt '{user_prompt[:50]}...' to AI ({ANALYSIS_MODEL_NAME}). Context length: {len(context_str)} chars.")
-        response_content = await analyzer._get_completion(messages, model_name=ANALYSIS_MODEL_NAME)
-        logger.info(f"Received chat response for prompt '{user_prompt[:50]}...'.")
-        # Basic cleaning (optional)
-        response_content = response_content.strip()
-        return response_content
+    # Wrap the LLM call in a Langfuse generation span
+    generation_metadata = {
+        "user_prompt_length": len(user_prompt),
+        "context_length": len(context_str),
+        "num_chunks": len(relevant_chunks),
+        "model": ANALYSIS_MODEL_NAME,
+    }
 
-    except TimeoutError:
-        logger.error(f"Chat request timed out for prompt '{user_prompt[:50]}...'.")
-        return "I apologize, but the request timed out while generating a response. Please try again."
-    except Exception as e:
-        logger.error(f"Error during chat AI call for prompt '{user_prompt[:50]}...': {str(e)}", exc_info=True)
-        return f"Sorry, I encountered an error while trying to generate a response: {str(e)}"
+    generation_input = {
+        "user_prompt": user_prompt,
+        "num_context_chunks": len(relevant_chunks),
+        "messages": messages,
+    }
+
+    with start_generation(
+        name="follow-up-chat-generation",
+        input_data=generation_input,
+        metadata=generation_metadata,
+        model=ANALYSIS_MODEL_NAME,
+    ) as generation:
+        try:
+            logger.info(f"Sending chat request for prompt '{user_prompt[:50]}...' to AI ({ANALYSIS_MODEL_NAME}). Context length: {len(context_str)} chars.")
+            response_content = await analyzer._get_completion(messages, model_name=ANALYSIS_MODEL_NAME)
+            logger.info(f"Received chat response for prompt '{user_prompt[:50]}...'.")
+            
+            # Basic cleaning (optional)
+            response_content = response_content.strip()
+            
+            # Record successful generation output
+            set_generation_output(
+                generation,
+                output=response_content,
+                metadata={"response_length": len(response_content)},
+            )
+            
+            return response_content
+
+        except TimeoutError as e:
+            logger.error(f"Chat request timed out for prompt '{user_prompt[:50]}...'.")
+            if generation:
+                record_generation_error(generation, e)
+            return "I apologize, but the request timed out while generating a response. Please try again."
+        except Exception as e:
+            logger.error(f"Error during chat AI call for prompt '{user_prompt[:50]}...': {str(e)}", exc_info=True)
+            if generation:
+                record_generation_error(generation, e)
+            return f"Sorry, I encountered an error while trying to generate a response: {str(e)}"

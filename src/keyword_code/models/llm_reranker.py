@@ -10,6 +10,12 @@ import numpy as np
 from typing import List, Tuple
 from ..config import logger
 from ..ai.databricks_llm import get_databricks_llm_client
+from ..utils.langfuse_tracing import (
+    optional_context,
+    record_generation_error,
+    set_generation_output,
+    start_generation,
+)
 
 
 class LLMRerankerModel:
@@ -99,7 +105,7 @@ class LLMRerankerModel:
         truncated_doc = self._truncate_text(document)
         
         # Create a prompt for the LLM to score relevance
-        prompt = f"""You are a relevance scoring system. Given a query and a document, score how relevant the document is to answering the query.
+        prompt = f"""You are a relevance scoring system. Given a query and a chunk of text, score how relevant the chunk is to answering the query, take the metadata into account.
 
 Query: {query}
 
@@ -117,29 +123,53 @@ Respond with ONLY a single number between 0.0 and 1.0, nothing else."""
             {"role": "user", "content": prompt}
         ]
 
-        try:
-            response = self.client.chat.completions.create(
-                messages=messages,
+        with optional_context(
+            start_generation(
+                name="reranker.llm.score_single",
+                input_data={"query": query, "document_preview": truncated_doc[:200]},
+                metadata={"operation": "llm_reranker.single_pair"},
                 model=self.model_name,
-                max_tokens=10,
-                temperature=0.0  # Use deterministic scoring
             )
-            
-            score_text = response.choices[0].message.content.strip()
-            
-            # Extract the numeric score
+        ) as generation:
             try:
-                score = float(score_text)
-                # Clamp score to [0, 1] range
-                score = max(0.0, min(1.0, score))
-                return score
-            except ValueError:
-                logger.warning(f"LLM reranker returned non-numeric score: {score_text}, using 0.5")
-                return 0.5
+                response = self.client.chat.completions.create(
+                    messages=messages,
+                    model=self.model_name,
+                    max_tokens=10,
+                    temperature=0.0  # Use deterministic scoring
+                )
                 
-        except Exception as e:
-            logger.error(f"Error scoring pair with LLM: {e}")
-            return 0.5  # Return neutral score on error
+                score_text = response.choices[0].message.content.strip()
+                
+                # Extract the numeric score
+                try:
+                    score = float(score_text)
+                    # Clamp score to [0, 1] range
+                    score = max(0.0, min(1.0, score))
+                    
+                    set_generation_output(
+                        generation,
+                        output={"score": score, "raw_response": score_text},
+                        metadata={"score": score},
+                    )
+                    return score
+                except ValueError:
+                    logger.warning(f"LLM reranker returned non-numeric score: {score_text}, using 0.5")
+                    set_generation_output(
+                        generation,
+                        output={"score": 0.5, "raw_response": score_text, "parse_error": True},
+                        metadata={"score": 0.5, "error": "non_numeric_response"},
+                    )
+                    return 0.5
+                    
+            except Exception as e:
+                logger.error(f"Error scoring pair with LLM: {e}")
+                record_generation_error(
+                    generation,
+                    e,
+                    metadata={"stage": "llm_reranker.single_pair"},
+                )
+                return 0.5  # Return neutral score on error
 
     def _score_batch_optimized(self, sentence_pairs: List[List[str]]) -> np.ndarray:
         """
@@ -206,64 +236,103 @@ Respond with ONLY the scores, one per line, in order. Example format:
             logger.debug(batch_prompt)
             logger.debug("=" * 80)
 
-            response = self.client.chat.completions.create(
-                messages=messages,
-                model=self.model_name,
-                max_tokens=max_tokens,
-                temperature=0.0
-            )
-
-            score_text = response.choices[0].message.content.strip()
-
-            # Log the full response in DEBUG mode
-            logger.debug("=" * 80)
-            logger.debug("LLM RERANKER API RESPONSE")
-            logger.debug("=" * 80)
-            logger.debug(f"Response Length: {len(score_text)} characters")
-            logger.debug("Response Content:")
-            logger.debug(score_text)
-            logger.debug("=" * 80)
-
-            lines = score_text.split('\n')
-
-            scores = []
-            for line_num, line in enumerate(lines, 1):
-                line = line.strip()
-                if not line:
-                    continue
-
+            with optional_context(
+                start_generation(
+                    name="reranker.llm.batch_score",
+                    input_data={
+                        "num_pairs": len(sentence_pairs),
+                        "queries_preview": [pair[0][:100] for pair in sentence_pairs[:3]],
+                    },
+                    metadata={
+                        "operation": "llm_reranker.batch",
+                        "batch_size": len(sentence_pairs),
+                    },
+                    model=self.model_name,
+                )
+            ) as generation:
                 try:
-                    # Try to extract just the number (handle cases like "1. 0.85" or "Score: 0.85")
-                    # First try direct float conversion
-                    score = float(line)
-                    scores.append(max(0.0, min(1.0, score)))
-                except ValueError:
-                    # Try to extract number from text
-                    import re
-                    numbers = re.findall(r'0?\.\d+|[01]\.?\d*', line)
-                    if numbers:
-                        try:
-                            score = float(numbers[0])
-                            scores.append(max(0.0, min(1.0, score)))
-                            logger.debug(f"Extracted score {score} from line: {line}")
-                        except ValueError:
-                            logger.warning(f"Could not parse score from line {line_num}: {line}")
-                            continue
-                    else:
-                        logger.warning(f"No number found in line {line_num}: {line}")
-                        continue
+                    response = self.client.chat.completions.create(
+                        messages=messages,
+                        model=self.model_name,
+                        max_tokens=max_tokens,
+                        temperature=0.0
+                    )
 
-            # If we got the right number of scores, return them
-            if len(scores) == len(sentence_pairs):
-                logger.info(f"✓ LLM reranker: Successfully scored {len(scores)} pairs in ONE batch call")
-                return np.array(scores)
-            else:
-                logger.warning(f"✗ LLM batch scoring returned {len(scores)} scores, expected {len(sentence_pairs)}")
-                logger.warning(f"Response was: {score_text[:200]}...")
-                logger.warning(f"Falling back to individual scoring for {len(sentence_pairs)} pairs")
+                    score_text = response.choices[0].message.content.strip()
+
+                    # Log the full response in DEBUG mode
+                    logger.debug("=" * 80)
+                    logger.debug("LLM RERANKER API RESPONSE")
+                    logger.debug("=" * 80)
+                    logger.debug(f"Response Length: {len(score_text)} characters")
+                    logger.debug("Response Content:")
+                    logger.debug(score_text)
+                    logger.debug("=" * 80)
+
+                    lines = score_text.split('\n')
+
+                    scores = []
+                    for line_num, line in enumerate(lines, 1):
+                        line = line.strip()
+                        if not line:
+                            continue
+
+                        try:
+                            # Try to extract just the number (handle cases like "1. 0.85" or "Score: 0.85")
+                            # First try direct float conversion
+                            score = float(line)
+                            scores.append(max(0.0, min(1.0, score)))
+                        except ValueError:
+                            # Try to extract number from text
+                            import re
+                            numbers = re.findall(r'0?\.\d+|[01]\.?\d*', line)
+                            if numbers:
+                                try:
+                                    score = float(numbers[0])
+                                    scores.append(max(0.0, min(1.0, score)))
+                                    logger.debug(f"Extracted score {score} from line: {line}")
+                                except ValueError:
+                                    logger.warning(f"Could not parse score from line {line_num}: {line}")
+                                    continue
+                            else:
+                                logger.warning(f"No number found in line {line_num}: {line}")
+                                continue
+
+                    # If we got the right number of scores, return them
+                    if len(scores) == len(sentence_pairs):
+                        logger.info(f"✓ LLM reranker: Successfully scored {len(scores)} pairs in ONE batch call")
+                        set_generation_output(
+                            generation,
+                            output={"scores": scores, "mean_score": float(np.mean(scores))},
+                            metadata={
+                                "num_scores": len(scores),
+                                "mean_score": float(np.mean(scores)),
+                                "min_score": float(np.min(scores)),
+                                "max_score": float(np.max(scores)),
+                            },
+                        )
+                        return np.array(scores)
+                    else:
+                        logger.warning(f"✗ LLM batch scoring returned {len(scores)} scores, expected {len(sentence_pairs)}")
+                        logger.warning(f"Response was: {score_text[:200]}...")
+                        logger.warning(f"Falling back to individual scoring for {len(sentence_pairs)} pairs")
+                        record_generation_error(
+                            generation,
+                            ValueError(f"Expected {len(sentence_pairs)} scores, got {len(scores)}"),
+                            metadata={"expected": len(sentence_pairs), "actual": len(scores)},
+                        )
+
+                except Exception as e:
+                    logger.error(f"✗ Error in batch scoring: {e}")
+                    logger.error(f"Falling back to individual scoring for {len(sentence_pairs)} pairs", exc_info=True)
+                    record_generation_error(
+                        generation,
+                        e,
+                        metadata={"stage": "llm_reranker.batch_scoring"},
+                    )
 
         except Exception as e:
-            logger.error(f"✗ Error in batch scoring: {e}")
+            logger.error(f"✗ Error setting up batch scoring: {e}")
             logger.error(f"Falling back to individual scoring for {len(sentence_pairs)} pairs", exc_info=True)
 
         # Fallback: score each pair individually (only if batch fails)
@@ -315,31 +384,8 @@ def load_llm_reranker_model():
     try:
         logger.info("Loading LLM-based fallback reranker model")
         model = LLMRerankerModel()
-        
-        # Test the model with a simple input
-        test_pairs = [
-            ["What is the capital of France?", "Paris is the capital and largest city of France."],
-            ["What is the capital of France?", "The Eiffel Tower is a famous landmark."]
-        ]
-        
-        try:
-            test_scores = model.predict(test_pairs)
-            
-            if isinstance(test_scores, np.ndarray) and len(test_scores) == 2:
-                logger.info(f"LLM fallback reranker loaded successfully. Test scores: {test_scores}")
-                # Verify that the first score is higher (more relevant)
-                if test_scores[0] > test_scores[1]:
-                    logger.info("LLM fallback reranker test passed: correctly ranked relevant document higher")
-                else:
-                    logger.warning(f"LLM fallback reranker test warning: expected first score > second score, got {test_scores}")
-                return model
-            else:
-                logger.error(f"LLM fallback reranker test failed: Invalid score format")
-                return None
-                
-        except Exception as e:
-            logger.error(f"LLM fallback reranker test failed: {e}")
-            return None
+        logger.info("LLM fallback reranker loaded successfully")
+        return model
             
     except Exception as e:
         logger.error(f"Error loading LLM fallback reranker: {e}")

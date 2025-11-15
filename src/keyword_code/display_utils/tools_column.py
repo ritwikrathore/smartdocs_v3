@@ -23,6 +23,12 @@ from .citation_utils import (
     display_chat_message_with_citations
 )
 from .export_utils import export_to_word
+from ..utils.langfuse_tracing import (
+    start_span,
+    set_span_output,
+    record_span_error,
+    get_langfuse_client_cached,
+)
 
 def _get_embedding_model():
     """Lazily retrieve the shared embedding model."""
@@ -80,39 +86,84 @@ def display_tools_column(results_with_real_analysis: List, tools_col):
                         processed_chat_text = "Error: Could not generate response."
                         chat_citation_details = []
                         raw_ai_response_content = ""
-                        try:
-                            with st.spinner("Thinking..."):
-                                logger.info(f"Chat RAG started for: {prompt[:50]}...")
-                                # Use same retrieval depth as main analysis for consistency
-                                relevant_chunks = retrieve_relevant_chunks_for_chat(
-                                    prompt=prompt,
-                                    top_k_per_doc=RAG_TOP_K,
-                                    embedding_model=embedding_model,
-                                    reranker_model=reranker_model,  # Use local reranker model
-                                    preprocessed_data=st.session_state.get("preprocessed_data", {})
-                                )
-                                analyzer = DocumentAnalyzer()
-                                logger.info(f"Generating chat response for: {prompt[:50]}...")
-                                raw_ai_response_content = run_async(
-                                    generate_chat_response(
-                                        analyzer,
-                                        prompt,
-                                        relevant_chunks
+                        
+                        # Get trace_id from the first available result to link chat to parent trace
+                        parent_trace_id = None
+                        for result, _ in results_with_real_analysis:
+                            if isinstance(result, dict):
+                                parent_trace_id = result.get("trace_id")
+                                if parent_trace_id:
+                                    logger.debug(f"Using parent trace_id for SmartChat: {parent_trace_id}")
+                                    break
+
+                        # Create trace_context for linking to parent trace
+                        trace_context_dict = None
+                        if parent_trace_id:
+                            trace_context_dict = {"trace_id": parent_trace_id}
+
+                        # Wrap chat processing in a span linked to the parent trace
+                        span_metadata = {
+                            "question_length": len(prompt),
+                            "parent_trace_id": parent_trace_id,
+                        }
+
+                        with start_span(
+                            name="smartchat-question",
+                            input_data={"question": prompt},
+                            metadata=span_metadata,
+                        ) as chat_span:
+                            try:
+                                # If we have a parent trace, log the linkage
+                                if trace_context_dict and chat_span:
+                                    try:
+                                        langfuse_client = get_langfuse_client_cached()
+                                        if langfuse_client:
+                                            logger.debug(f"SmartChat span created, intended parent trace: {parent_trace_id}")
+                                    except Exception as link_err:
+                                        logger.debug(f"Could not link span to parent trace: {link_err}")
+
+                                with st.spinner("Thinking..."):
+                                    logger.info(f"Chat RAG started for: {prompt[:50]}...")
+                                    # Use same retrieval depth as main analysis for consistency
+                                    relevant_chunks = retrieve_relevant_chunks_for_chat(
+                                        prompt=prompt,
+                                        top_k_per_doc=RAG_TOP_K,
+                                        embedding_model=embedding_model,
+                                        reranker_model=reranker_model,  # Use local reranker model
+                                        preprocessed_data=st.session_state.get("preprocessed_data", {})
                                     )
+                                    analyzer = DocumentAnalyzer()
+                                    logger.info(f"Generating chat response for: {prompt[:50]}...")
+                                    raw_ai_response_content = run_async(
+                                        generate_chat_response(
+                                            analyzer,
+                                            prompt,
+                                            relevant_chunks
+                                        )
+                                    )
+                                    logger.info("Chat response generated.")
+                                    processed_chat_text, chat_citation_details = process_chat_response_for_numbered_citations(raw_ai_response_content)
+
+                                    # Refresh PDF highlighting to reflect the new RAG chunks
+                                    try:
+                                        regenerate_annotated_pdfs_from_chat_chunks(relevant_chunks)
+                                    except Exception as _e:
+                                        logger.warning(f"Could not refresh PDF highlights for chat: {_e}")
+
+                                # Record span output
+                                set_span_output(
+                                    chat_span,
+                                    output={"answer_length": len(raw_ai_response_content), "num_citations": len(chat_citation_details)},
+                                    metadata={"num_chunks_used": len(relevant_chunks)},
                                 )
-                                logger.info("Chat response generated.")
-                                processed_chat_text, chat_citation_details = process_chat_response_for_numbered_citations(raw_ai_response_content)
 
-                                # Refresh PDF highlighting to reflect the new RAG chunks
-                                try:
-                                    regenerate_annotated_pdfs_from_chat_chunks(relevant_chunks)
-                                except Exception as _e:
-                                    logger.warning(f"Could not refresh PDF highlights for chat: {_e}")
-
-                        except Exception as chat_err:
-                            logger.error(f"Error during chat processing: {chat_err}", exc_info=True)
-                            processed_chat_text = f"Sorry, an error occurred while processing your request: {str(chat_err)}"
-                            chat_citation_details = []
+                            except Exception as chat_err:
+                                logger.error(f"Error during chat processing: {chat_err}", exc_info=True)
+                                processed_chat_text = f"Sorry, an error occurred while processing your request: {str(chat_err)}"
+                                chat_citation_details = []
+                                if chat_span:
+                                    record_span_error(chat_span, chat_err)
+                        
                         st.session_state.chat_messages.append({
                             "role": "assistant",
                             "content": raw_ai_response_content,

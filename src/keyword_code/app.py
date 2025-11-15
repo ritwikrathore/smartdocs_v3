@@ -64,7 +64,15 @@ from .utils.interaction_logger import (
     setup_interaction_logging, disable_interaction_logging, INTERACTION_LOGGING_ENABLED,
     log_rag_parameters
 )
-from .utils.langfuse_tracing import start_trace, update_current_trace, update_current_span
+from .utils.langfuse_tracing import (
+    optional_context,
+    set_span_output,
+    start_span,
+    start_trace,
+    update_current_trace,
+    update_current_span,
+    get_langfuse_client_cached,
+)
 from .models.embedding import load_embedding_model, load_reranker_model
 from .processors.pdf_processor import PDFProcessor
 from .processors.word_processor import WordProcessor
@@ -102,6 +110,161 @@ def ensure_interaction_logging():
     if ENABLE_INTERACTION_LOGGING:
         enable_interaction_logging()
         _interaction_logging_initialized = True
+
+
+_CHUNK_TRACE_SKIP_METADATA_KEYS = {
+    "embedding",
+    "chunk_embedding",
+    "tokens",
+    "raw_text",
+}
+
+
+def _truncate_chunk_text(text: Optional[str]) -> str:
+    return text if isinstance(text, str) else ""
+
+
+def _coerce_chunk_metadata_value(value: Any, *, max_length: int = 500, max_items: int = 25) -> Any:
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        if isinstance(value, str) and len(value) > max_length:
+            return value[:max_length] + "..."
+        return value
+
+    if isinstance(value, list):
+        items = [
+            _coerce_chunk_metadata_value(item, max_length=max_length, max_items=max_items)
+            for item in value[:max_items]
+        ]
+        if len(value) > max_items:
+            items.append("...")
+        return items
+
+    if isinstance(value, tuple):
+        items = [
+            _coerce_chunk_metadata_value(item, max_length=max_length, max_items=max_items)
+            for item in value[:max_items]
+        ]
+        if len(value) > max_items:
+            items.append("...")
+        return items
+
+    if isinstance(value, set):
+        items = list(value)[:max_items]
+        coerced = [
+            _coerce_chunk_metadata_value(item, max_length=max_length, max_items=max_items)
+            for item in items
+        ]
+        if len(value) > max_items:
+            coerced.append("...")
+        return coerced
+
+    if isinstance(value, dict):
+        sanitized: Dict[str, Any] = {}
+        for idx, (key, val) in enumerate(value.items()):
+            if idx >= max_items:
+                sanitized["..."] = f"{len(value) - max_items} more keys"
+                break
+            sanitized[str(key)] = _coerce_chunk_metadata_value(
+                val,
+                max_length=max_length,
+                max_items=max_items,
+            )
+        return sanitized
+
+    value_str = str(value)
+    if len(value_str) > max_length:
+        return value_str[:max_length] + "..."
+    return value_str
+
+
+def _build_chunk_trace_payload(chunks: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    payload: List[Dict[str, Any]] = []
+    for index, chunk in enumerate(chunks):
+        text = chunk.get("text", "")
+        metadata = chunk.get("metadata")
+
+        chunk_entry: Dict[str, Any] = {
+            "index": index,
+            "chunk_id": chunk.get("chunk_id"),
+            "chunk_type": chunk.get("chunk_type"),
+            "page_num": chunk.get("page_num"),
+            "page_label": chunk.get("page_label"),
+            "char_count": len(text) if isinstance(text, str) else None,
+            "text": _truncate_chunk_text(text),
+        }
+
+        if isinstance(metadata, dict):
+            sanitized_metadata: Dict[str, Any] = {}
+            for key, value in metadata.items():
+                if key in _CHUNK_TRACE_SKIP_METADATA_KEYS:
+                    continue
+                sanitized_metadata[str(key)] = _coerce_chunk_metadata_value(value)
+            if sanitized_metadata:
+                chunk_entry["metadata"] = sanitized_metadata
+
+        payload.append(chunk_entry)
+
+    return payload
+
+
+def _record_chunking_trace(
+    *,
+    chunks: Sequence[Dict[str, Any]],
+    source: str,
+    chunk_embeddings: Any = None,
+    valid_chunk_indices: Optional[Sequence[int]] = None,
+):
+    span_cm = start_span(
+        name="preprocessing.chunking",
+        input_data={
+            "chunk_source": source,
+            "num_chunks": len(chunks),
+            "has_embeddings": chunk_embeddings is not None,
+            "has_valid_indices": valid_chunk_indices is not None,
+        },
+        metadata={
+            "operation": "preprocessing.chunking",
+            "chunk_source": source,
+        },
+    )
+
+    with optional_context(span_cm) as chunk_span:
+        if chunk_span is None:
+            return
+
+        try:
+            chunk_payload = _build_chunk_trace_payload(chunks)
+            embedding_shape: Optional[List[int]] = None
+            if chunk_embeddings is not None:
+                if hasattr(chunk_embeddings, "shape"):
+                    embedding_shape = list(chunk_embeddings.shape)
+                elif isinstance(chunk_embeddings, (list, tuple)):
+                    embedding_shape = [len(chunk_embeddings)]
+
+            valid_indices_list = (
+                list(valid_chunk_indices) if valid_chunk_indices is not None else None
+            )
+
+            set_span_output(
+                chunk_span,
+                output={
+                    "chunk_source": source,
+                    "num_chunks": len(chunks),
+                    "chunks": chunk_payload,
+                    "valid_chunk_indices": valid_indices_list,
+                    "chunk_embedding_shape": embedding_shape,
+                },
+                metadata={
+                    "chunk_source": source,
+                    "num_chunks": len(chunks),
+                },
+            )
+        except Exception as err:  # pragma: no cover - defensive logging
+            logger.debug("Unable to record chunking trace output: %s", err)
+            try:
+                chunk_span.update(level="ERROR", status_message=str(err))
+            except Exception:
+                pass
 
 # --- OpenAI client for Databricks API ---
 # The OpenAI client is configured in the Databricks LLM client
@@ -325,6 +488,25 @@ def process_file_wrapper(args):
         logger.error(f"Skipping processing for {filename}: Embedding model not loaded.")
         return {"filename": filename, "error": "Embedding model failed to load.", "annotated_pdf": None, "verification_results": {}, "phrase_locations": {}, "ai_analysis": json.dumps({"error": "Embedding model failed to load."})}
 
+    try:
+        current_session_id = get_session_id()
+    except Exception as session_err:
+        logger.debug("Unable to determine session id for Langfuse trace: %s", session_err)
+        current_session_id = None
+
+    if mode == 'review':
+        logger.info(f"Review mode: Skipping preprocessing, RAG, and analysis for {filename}")
+        return {
+            "filename": filename,
+            "mode": "review",
+            "message": "Review mode: Validation handled separately",
+            "annotated_pdf": None,
+            "verification_results": {},
+            "phrase_locations": {},
+            "ai_analysis": json.dumps({"message": "Review mode: Validation handled separately"})
+        }
+
+    # Start analysis-level trace before preprocessing so chunking is captured
     trace_input = {
         "filename": filename,
         "prompt": user_prompt,
@@ -335,17 +517,12 @@ def process_file_wrapper(args):
         "use_advanced_extraction": bool(use_advanced_extraction),
         "preprocessed_available": bool(preprocessed_data_for_file),
         "memory_before_bytes": memory_before.get("used"),
+        "num_chunks": 0,
     }
-    trace_tags = [f"mode:{mode}"]
-
-    try:
-        current_session_id = get_session_id()
-    except Exception as session_err:
-        logger.debug("Unable to determine session id for Langfuse trace: %s", session_err)
-        current_session_id = None
+    trace_tags = [f"mode:{mode}", f"file:{filename}"]
 
     trace_context = start_trace(
-        name="document.process",
+        name="analysis.run",
         input_data=trace_input,
         metadata=trace_metadata,
         session_id=current_session_id,
@@ -357,7 +534,7 @@ def process_file_wrapper(args):
             trace_context.__enter__()
             trace_entered = True
     except Exception as trace_err:
-        logger.debug("Unable to start Langfuse trace: %s", trace_err)
+        logger.debug("Unable to start Langfuse analysis trace: %s", trace_err)
         trace_context = None
 
     exc_type = exc_value = exc_tb = None
@@ -366,13 +543,16 @@ def process_file_wrapper(args):
         logger.info(f"Starting processing for {filename}")
         file_extension = Path(filename).suffix.lower()
 
-        # --- Step 1: Use preprocessed data if available, otherwise process file ---
-        preprocessed_data = None
-        original_pdf_bytes_for_annotation = None
+        preprocessed_data: Optional[Dict[str, Any]] = None
+        original_pdf_bytes_for_annotation: Optional[bytes] = None
+        chunks: List[Dict[str, Any]] = []
+        chunk_embeddings: Optional[Any] = None
+        valid_chunk_indices: Optional[Sequence[int]] = None
+        chunk_source: str = "unknown"
 
         if preprocessed_data_for_file and isinstance(preprocessed_data_for_file, dict):
             logger.info(f"Using preprocessed data for {filename}")
-            chunks = preprocessed_data_for_file.get("chunks")
+            chunks = preprocessed_data_for_file.get("chunks") or []
             chunk_embeddings = preprocessed_data_for_file.get("chunk_embeddings")
             valid_chunk_indices = preprocessed_data_for_file.get("valid_chunk_indices")
             original_pdf_bytes_for_annotation = preprocessed_data_for_file.get("original_bytes")
@@ -381,16 +561,33 @@ def process_file_wrapper(args):
                 preprocessed_data = {
                     "chunks": chunks,
                     "chunk_embeddings": chunk_embeddings,
-                    "valid_chunk_indices": valid_chunk_indices
+                    "valid_chunk_indices": valid_chunk_indices,
                 }
-                logger.info(f"Successfully loaded preprocessed data for {filename} with {len(chunks)} chunks")
+                chunk_source = "preprocessed_cache"
+                logger.info(
+                    "Successfully loaded preprocessed data for %s with %d chunks",
+                    filename,
+                    len(chunks),
+                )
+                _record_chunking_trace(
+                    chunks=chunks,
+                    source=chunk_source,
+                    chunk_embeddings=chunk_embeddings,
+                    valid_chunk_indices=valid_chunk_indices,
+                )
             else:
-                logger.warning(f"Preprocessed data for {filename} is incomplete, will reprocess")
+                logger.warning(
+                    "Preprocessed data for %s is incomplete, will reprocess",
+                    filename,
+                )
                 preprocessed_data = None
+                chunks = []
+                chunk_embeddings = None
+                valid_chunk_indices = None
 
-        # If no valid preprocessed data, process the file
         if not preprocessed_data:
             logger.info(f"No valid preprocessed data for {filename}, processing from scratch")
+            processor: Optional[PDFProcessor] = None
 
             if file_extension == ".pdf":
                 processor = PDFProcessor(uploaded_file_data)
@@ -407,40 +604,113 @@ def process_file_wrapper(args):
             else:
                 raise ValueError(f"Unsupported file type: {file_extension}")
 
-        # --- CONDITIONAL EXECUTION BASED ON MODE ---
-        # Review mode: Skip decomposition and RAG, return minimal result
-        # Ask mode (default): Full RAG workflow with decomposition, retrieval, and analysis
+            chunk_source = "fresh_extraction"
+            _record_chunking_trace(
+                chunks=chunks,
+                source=chunk_source,
+            )
 
-        if mode == 'review':
-            logger.info(f"Review mode: Skipping decomposition and RAG for {filename}")
-            # Review mode validation is handled separately by run_auto_review_update()
-            # This function should not be called for review mode in normal flow
-            # Return a minimal result indicating review mode processing
-            update_current_trace(output={
-                "status": "skipped",
-                "mode": "review",
-            })
-            return {
-                "filename": filename,
-                "mode": "review",
-                "message": "Review mode: Validation handled separately",
-                "annotated_pdf": None,
-                "verification_results": {},
-                "phrase_locations": {},
-                "ai_analysis": json.dumps({"message": "Review mode: Validation handled separately"})
-            }
+        update_current_trace(
+            metadata={
+                "num_chunks": len(chunks),
+                "chunk_source": chunk_source,
+                "preprocessed_used": bool(preprocessed_data),
+            },
+            output={
+                "preprocessing": {
+                    "chunk_source": chunk_source,
+                    "num_chunks": len(chunks),
+                }
+            },
+        )
 
         analyzer = DocumentAnalyzer()
         from src.keyword_code.ai.decomposition import decompose_ask_mode_prompt
 
-        decomposition_output = run_async(decompose_ask_mode_prompt(analyzer, user_prompt))
+        active_chunks = preprocessed_data["chunks"] if preprocessed_data else chunks
+
+        first_page_preview = ""
+        document_index_preview = ""
+
+        if active_chunks:
+            first_page_number: Optional[int] = None
+            for chunk_meta in active_chunks:
+                page_num = chunk_meta.get("page_num")
+                if isinstance(page_num, int):
+                    if first_page_number is None or page_num < first_page_number:
+                        first_page_number = page_num
+
+            if first_page_number is not None:
+                first_page_texts = [
+                    chunk_meta.get("text", "")
+                    for chunk_meta in active_chunks
+                    if chunk_meta.get("page_num") == first_page_number and isinstance(chunk_meta.get("text"), str)
+                ]
+                combined_first_page = " ".join(first_page_texts).strip()
+                if combined_first_page:
+                    if len(combined_first_page) > 1800:
+                        first_page_preview = combined_first_page[:1800].rstrip() + " ..."
+                    else:
+                        first_page_preview = combined_first_page
+
+            for chunk_meta in active_chunks:
+                metadata = chunk_meta.get("metadata")
+                if not isinstance(metadata, dict):
+                    continue
+                if metadata.get("document_scope") != "table_of_contents":
+                    continue
+                toc_entries = metadata.get("toc_entries")
+                if not isinstance(toc_entries, list):
+                    continue
+                formatted_entries: List[str] = []
+                seen_entries: Set[str] = set()
+                for entry in toc_entries:
+                    entry_label: Optional[str] = None
+                    entry_page: Optional[int] = None
+                    if isinstance(entry, dict):
+                        entry_label_raw = entry.get("entry") or entry.get("title") or entry.get("heading")
+                        if isinstance(entry_label_raw, str):
+                            entry_label = entry_label_raw.strip()
+                        page_val = entry.get("page_number")
+                        if isinstance(page_val, int):
+                            entry_page = page_val
+                    elif isinstance(entry, str):
+                        entry_label = entry.strip()
+
+                    if not entry_label:
+                        continue
+
+                    entry_text = entry_label
+                    if entry_page is not None:
+                        entry_text = f"{entry_text} (p.{entry_page})"
+
+                    lowered = entry_text.lower()
+                    if lowered in seen_entries:
+                        continue
+                    seen_entries.add(lowered)
+                    formatted_entries.append(entry_text)
+
+                    if len(formatted_entries) >= 20:
+                        break
+
+                if formatted_entries:
+                    document_index_preview = "\n".join(formatted_entries)
+                break
+
+            if document_index_preview and len(document_index_preview) > 2000:
+                document_index_preview = document_index_preview[:2000].rstrip() + "\n..."
+
+        decomposition_output = run_async(
+            decompose_ask_mode_prompt(
+                analyzer,
+                user_prompt,
+                first_page_preview=first_page_preview,
+                document_index_preview=document_index_preview,
+            )
+        )
 
         if isinstance(decomposition_output, dict):
             sub_prompts = decomposition_output.get("decomposition", []) or []
-            keyword_mode_flag = bool(decomposition_output.get("keyword_mode"))
-            detected_keywords = decomposition_output.get("keywords", []) or []
-            keyword_reasoning = decomposition_output.get("keyword_reasoning")
-            keyword_groups = decomposition_output.get("keyword_groups", []) or []
             user_request_context = decomposition_output.get("user_request_context", "")
             if not isinstance(user_request_context, str):
                 user_request_context = ""
@@ -448,322 +718,13 @@ def process_file_wrapper(args):
                 user_request_context = user_request_context.strip()
         else:
             sub_prompts = decomposition_output or []
-            keyword_mode_flag = False
-            detected_keywords = []
-            keyword_reasoning = None
-            keyword_groups = []
             user_request_context = ""
 
-        keyword_only_sub_prompts: List[Dict[str, Any]] = []
-        rag_enabled_sub_prompts: List[Dict[str, Any]] = []
-        for sub_prompt_entry in sub_prompts:
-            if not isinstance(sub_prompt_entry, dict):
-                continue
-            rag_params_entry = sub_prompt_entry.get("rag_params", {}) or {}
-            retrieval_mode_entry = rag_params_entry.get("retrieval_mode", "")
-            if isinstance(retrieval_mode_entry, str) and retrieval_mode_entry.lower() == "keyword":
-                keyword_only_sub_prompts.append(sub_prompt_entry)
-            else:
-                rag_enabled_sub_prompts.append(sub_prompt_entry)
+        # All sub-prompts use hybrid RAG with BM25 as one component
+        rag_enabled_sub_prompts = [entry for entry in sub_prompts if isinstance(entry, dict)]
 
-        keyword_context: Optional[Dict[str, Any]] = None
-        keyword_result_payload: Optional[Dict[str, Any]] = None
-
-        def run_keyword_sidecar(keywords_to_use: Sequence[str]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-            keyword_mode_service = get_keyword_mode_service()
-            keyword_chunks = preprocessed_data["chunks"] if preprocessed_data else chunks
-            if not keyword_chunks:
-                raise ValueError("Keyword mode requires chunked document text.")
-
-            pdf_bytes_for_keyword = original_pdf_bytes_for_annotation or uploaded_file_data
-            keyword_result_local = keyword_mode_service.run(
-                filename=filename,
-                keywords=keywords_to_use,
-                chunks=keyword_chunks,
-                original_pdf_bytes=pdf_bytes_for_keyword,
-            )
-
-            keyword_groups_data_local: List[Dict[str, Any]] = []
-            variant_to_group_key: Dict[str, str] = {}
-            if keyword_groups:
-                for idx, group in enumerate(keyword_groups, start=1):
-                    sanitized_variants: List[str] = []
-                    seen_variants: Set[str] = set()
-                    candidates = group if isinstance(group, (list, tuple, set)) else [group]
-                    for candidate in candidates:
-                        if not isinstance(candidate, str):
-                            continue
-                        cleaned_candidate = re.sub(r"\s+", " ", candidate.strip())
-                        if not cleaned_candidate:
-                            continue
-                        lowered_candidate = cleaned_candidate.lower()
-                        if lowered_candidate in seen_variants:
-                            continue
-                        seen_variants.add(lowered_candidate)
-                        sanitized_variants.append(cleaned_candidate)
-                    if not sanitized_variants:
-                        continue
-                    group_label = " / ".join(sanitized_variants)
-                    group_key = f"group_{idx}_{slugify_keyword_label(group_label)}"
-                    keyword_groups_data_local.append({
-                        "key": group_key,
-                        "label": group_label,
-                        "variants": sanitized_variants,
-                    })
-                    for variant in sanitized_variants:
-                        variant_to_group_key[variant.lower()] = group_key
-
-            raw_keyword_sections = keyword_result_local.get("keyword_mode_sections", {}) or {}
-            original_verifications = keyword_result_local.get("verification_results", {}) or {}
-            original_locations = keyword_result_local.get("phrase_locations", {}) or {}
-
-            aggregated_sections: Dict[str, Dict[str, Any]] = {}
-            occurrence_ids_by_section: Dict[str, Set[str]] = {}
-
-            if keyword_groups_data_local:
-                for meta in keyword_groups_data_local:
-                    aggregated_sections[meta["key"]] = {
-                        "keyword": meta["label"],
-                        "variant_keywords": meta["variants"],
-                        "occurrences": [],
-                    }
-                    occurrence_ids_by_section[meta["key"]] = set()
-
-            for section_key, section_data in raw_keyword_sections.items():
-                if not isinstance(section_data, dict):
-                    continue
-                variant_keyword = (section_data.get("keyword") or "").strip()
-                normalized_variant = variant_keyword.lower()
-                target_key = variant_to_group_key.get(normalized_variant)
-                if not target_key:
-                    target_key = section_key
-                    if target_key not in aggregated_sections:
-                        aggregated_sections[target_key] = {
-                            "keyword": variant_keyword or "Keyword",
-                            "variant_keywords": [variant_keyword] if variant_keyword else [],
-                            "occurrences": [],
-                        }
-                        occurrence_ids_by_section[target_key] = set()
-                id_set = occurrence_ids_by_section.setdefault(target_key, set())
-                for occ in section_data.get("occurrences", []) or []:
-                    if not isinstance(occ, dict):
-                        continue
-                    occ_id = occ.get("id")
-                    if occ_id and occ_id in id_set:
-                        continue
-                    if occ_id:
-                        id_set.add(occ_id)
-                    aggregated_sections[target_key]["occurrences"].append(occ)
-
-            if aggregated_sections:
-                effective_keyword_sections = aggregated_sections
-            else:
-                effective_keyword_sections = {}
-                for section_key, section_data in raw_keyword_sections.items():
-                    if not isinstance(section_data, dict):
-                        continue
-                    variant_keywords = section_data.get("variant_keywords")
-                    if not isinstance(variant_keywords, list):
-                        variant_list = [section_data.get("keyword")] if section_data.get("keyword") else []
-                    else:
-                        variant_list = variant_keywords
-                    effective_keyword_sections[section_key] = {
-                        "keyword": section_data.get("keyword"),
-                        "variant_keywords": variant_list,
-                        "occurrences": section_data.get("occurrences", []) or [],
-                    }
-
-            aggregated_total_occurrences = sum(len(section.get("occurrences", [])) for section in effective_keyword_sections.values())
-
-            keyword_analysis_local = run_async(
-                analyzer.analyze_keyword_occurrences(
-                    filename=filename,
-                    main_prompt=user_prompt,
-                    keyword_sections=effective_keyword_sections,
-                    total_occurrences=aggregated_total_occurrences,
-                    keyword_reasoning=keyword_reasoning,
-                    user_request_context=user_request_context,
-                )
-            )
-
-            verification_results_by_phrase: Dict[str, Dict[str, Any]] = {}
-            phrase_locations_by_phrase: Dict[str, Any] = {}
-            sanitized_keyword_sections: Dict[str, Dict[str, Any]] = {}
-
-            aggregated_analysis_local = {
-                "title": f"Keyword Analysis of {filename}",
-                "analysis_sections": {},
-            }
-
-            for entry in keyword_analysis_local.get("keywords", []):
-                section_key = entry.get("section_key") or f"section_keyword_{len(aggregated_analysis_local['analysis_sections']) + 1}"
-                keyword_label = entry.get("keyword") or "Keyword"
-                analysis_summary = entry.get("analysis_summary") or f"No analysis available for '{keyword_label}'."
-                phrase_counts: Dict[str, int] = {}
-                supporting_phrases: List[str] = []
-                sanitized_citations: List[Dict[str, Any]] = []
-
-                for citation in entry.get("occurrence_citations", []) or []:
-                    occurrence_id = citation.get("occurrence_id")
-                    base_phrase = (citation.get("citation_text") or citation.get("snippet") or "").strip()
-                    if not base_phrase:
-                        base_phrase = f"{keyword_label} occurrence {len(sanitized_citations) + 1}"
-
-                    phrase_index = phrase_counts.get(base_phrase, 0)
-                    phrase_counts[base_phrase] = phrase_index + 1
-                    phrase_key = base_phrase if phrase_index == 0 else f"{base_phrase} ({phrase_index + 1})"
-
-                    supporting_phrases.append(phrase_key)
-                    sanitized_citation = {
-                        **citation,
-                        "display_phrase": phrase_key,
-                    }
-                    sanitized_citations.append(sanitized_citation)
-
-                    if occurrence_id:
-                        verification_source = original_verifications.get(occurrence_id, {})
-                        score_value = citation.get("match_score")
-                        method_value = "keyword_mode_bm25"
-                        verified_flag = True
-
-                        if isinstance(verification_source, dict):
-                            verified_flag = verification_source.get("verified", True)
-                            method_value = verification_source.get("method", method_value)
-                            if score_value is None and verification_source.get("score") is not None:
-                                score_value = verification_source.get("score")
-                        elif isinstance(verification_source, bool):
-                            verified_flag = verification_source
-
-                        verification_results_by_phrase[phrase_key] = {
-                            "verified": bool(verified_flag),
-                            "score": score_value,
-                            "method": method_value,
-                            "occurrence_id": occurrence_id,
-                            "page_label": citation.get("page_label"),
-                        }
-
-                        location_payload = original_locations.get(occurrence_id)
-                        if location_payload is not None:
-                            phrase_locations_by_phrase[phrase_key] = location_payload
-
-                if not supporting_phrases:
-                    supporting_phrases = ["No relevant phrase found."]
-
-                total_matches = len(sanitized_citations)
-                base_section = effective_keyword_sections.get(section_key, {}) if isinstance(effective_keyword_sections, dict) else {}
-                variant_keywords = base_section.get("variant_keywords", []) if isinstance(base_section, dict) else []
-                context_message = f"Keyword mode analysis for '{keyword_label}'. Total occurrences: {total_matches}."
-                if variant_keywords:
-                    context_message += f" Variants: {', '.join(variant_keywords)}."
-
-                aggregated_analysis_local["analysis_sections"][section_key] = {
-                    "Analysis": analysis_summary,
-                    "Supporting_Phrases": supporting_phrases,
-                    "Context": context_message,
-                }
-
-                sanitized_keyword_sections[section_key] = {
-                    "keyword": keyword_label,
-                    "analysis_summary": analysis_summary,
-                    "total_occurrences": total_matches,
-                    "occurrence_citations": sanitized_citations,
-                    "original_occurrences": base_section.get("occurrences", []) if isinstance(base_section, dict) else [],
-                    "variant_keywords": variant_keywords,
-                }
-
-            aggregated_ai_analysis_json_str_local = json.dumps(aggregated_analysis_local, indent=2)
-
-            ordered_sections = [entry.get("section_key") or f"section_keyword_{idx + 1}" for idx, entry in enumerate(keyword_analysis_local.get("keywords", []))]
-            sub_prompt_results_local: List[Dict[str, Any]] = []
-            for idx, order_key in enumerate(ordered_sections):
-                section_details = sanitized_keyword_sections.get(order_key)
-                if not section_details:
-                    continue
-                keyword_label = section_details.get("keyword", "Keyword")
-                sub_prompt_payload = {
-                    "keyword": keyword_label,
-                    "analysis_summary": section_details.get("analysis_summary"),
-                    "occurrence_citations": section_details.get("occurrence_citations", []),
-                    "total_occurrences": section_details.get("total_occurrences", 0),
-                    "variant_keywords": section_details.get("variant_keywords", []),
-                }
-                sub_prompt_results_local.append(
-                    {
-                        "title": f"Keyword Group: {keyword_label}",
-                        "sub_prompt": f"Occurrences of '{keyword_label}'",
-                        "analysis_json": json.dumps(sub_prompt_payload, indent=2),
-                        "section_key": order_key,
-                    }
-                )
-
-            keyword_context_local = {
-                "aggregated_analysis": aggregated_analysis_local,
-                "analysis_json": aggregated_ai_analysis_json_str_local,
-                "verification_results": verification_results_by_phrase,
-                "phrase_locations": phrase_locations_by_phrase,
-                "keyword_mode_sections": sanitized_keyword_sections,
-                "keyword_analysis": keyword_analysis_local,
-                "keyword_groups_data": keyword_groups_data_local,
-                "keywords_display": [meta["label"] for meta in keyword_groups_data_local] if keyword_groups_data_local else keyword_result_local.get("keywords", list(keywords_to_use)),
-                "total_occurrences": aggregated_total_occurrences,
-                "sub_prompt_results": sub_prompt_results_local,
-                "raw_keyword_sections": raw_keyword_sections,
-            }
-            return keyword_result_local, keyword_context_local
-
-        should_force_keyword_only = bool(keyword_mode_flag and detected_keywords and not rag_enabled_sub_prompts)
-
-        if detected_keywords:
-            logger.info(
-                "Keyword mode requested for %s with keywords: %s",
-                filename,
-                detected_keywords,
-            )
-            keyword_result_payload, keyword_context = run_keyword_sidecar(detected_keywords)
-
-            if should_force_keyword_only and keyword_context is not None and keyword_result_payload is not None:
-                memory_after_keyword = get_memory_usage()
-                memory_used_keyword = memory_after_keyword['used'] - memory_before['used']
-                logger.debug(
-                    f"Keyword mode memory usage: {format_bytes(memory_after_keyword['used'])} used, "
-                    f"{memory_after_keyword['percent']}% of total (delta {format_bytes(memory_used_keyword)})"
-                )
-
-                if memory_after_keyword['percent'] > 75:
-                    logger.warning(
-                        f"High memory usage after keyword mode processing {filename}: {memory_after_keyword['percent']}%"
-                    )
-                    cleanup_result = cleanup_memory(force=True)
-                    logger.info(
-                        f"Memory cleanup performed post keyword mode: {cleanup_result.get('freed_formatted', '0 B')} freed"
-                    )
-
-                keyword_response = {
-                    "filename": filename,
-                    "annotated_pdf": keyword_result_payload.get("annotated_pdf"),
-                    "verification_results": keyword_context["verification_results"],
-                    "phrase_locations": keyword_context["phrase_locations"],
-                    "ai_analysis": keyword_context["analysis_json"],
-                    "sub_prompt_results": keyword_context["sub_prompt_results"],
-                    "keyword_mode": True,
-                    "keyword_mode_sections": keyword_context["keyword_mode_sections"],
-                    "keyword_analysis": keyword_context["keyword_analysis"],
-                    "keywords": keyword_context["keywords_display"],
-                    "keyword_groups": keyword_groups,
-                    "keyword_group_metadata": keyword_context["keyword_groups_data"],
-                    "total_occurrences": keyword_context["total_occurrences"],
-                    "keyword_reasoning": keyword_reasoning,
-                    "user_request_context": user_request_context,
-                    "raw_keyword_occurrences": keyword_context["raw_keyword_sections"],
-                }
-                keyword_sections_count = len(keyword_context.get("aggregated_analysis", {}).get("analysis_sections", {})) if keyword_context else 0
-                update_current_trace(output={
-                    "status": "success",
-                    "keyword_mode": True,
-                    "keyword_sections": keyword_sections_count,
-                    "total_occurrences": keyword_context.get("total_occurrences", 0) if keyword_context else 0,
-                })
-                return keyword_response
+        # Keyword mode is disabled - all queries now use hybrid RAG workflow
+        # BM25 keywords from decomposition are used within the RAG retrieval
 
         logger.info(f"Ask mode: Starting decomposition and RAG workflow for {filename}")
         logger.info(f"Decomposed prompt into {len(sub_prompts)} sub-prompts for {filename}")
@@ -786,10 +747,50 @@ def process_file_wrapper(args):
             bm25_weight = rag_params.get("bm25_weight", 0.5)
             semantic_weight = rag_params.get("semantic_weight", 0.5)
             rag_reasoning = rag_params.get("reasoning", "No reasoning provided")
+            raw_bm25_terms = rag_params.get("bm25_terms", [])
+            if isinstance(raw_bm25_terms, str):
+                raw_bm25_terms = [raw_bm25_terms]
+            elif isinstance(raw_bm25_terms, (tuple, set)):
+                raw_bm25_terms = list(raw_bm25_terms)
+            elif not isinstance(raw_bm25_terms, list):
+                raw_bm25_terms = []
+
+            bm25_terms: List[str] = []
+            seen_terms_local: Set[str] = set()
+            for term in raw_bm25_terms:
+                if not isinstance(term, str):
+                    continue
+                cleaned = term.strip()
+                if not cleaned:
+                    continue
+                lowered = cleaned.lower()
+                if lowered in seen_terms_local:
+                    continue
+                seen_terms_local.add(lowered)
+                bm25_terms.append(cleaned)
+
+            rag_params["bm25_terms"] = bm25_terms
+
+            hyde_queries: List[str] = []
+            raw_hyde = sub_prompt_data.get("hyde")
+            if isinstance(raw_hyde, str):
+                raw_hyde = [raw_hyde]
+            if isinstance(raw_hyde, (list, tuple)):
+                for candidate in raw_hyde:
+                    if not isinstance(candidate, str):
+                        continue
+                    cleaned_candidate = candidate.strip()
+                    if cleaned_candidate:
+                        hyde_queries.append(cleaned_candidate)
+            rag_params["hyde"] = hyde_queries
+            if hyde_queries:
+                logger.info(f"HYDE semantic prompts for '{sub_prompt_title}': {hyde_queries}")
 
             logger.info(f"Retrieving relevant chunks for sub-prompt '{sub_prompt_title}' for {filename}")
             logger.info(f"Using RAG weights - BM25: {bm25_weight:.2f}, Semantic: {semantic_weight:.2f}")
             logger.info(f"RAG weight reasoning: {rag_reasoning}")
+            if bm25_terms:
+                logger.info(f"BM25 lexical terms: {bm25_terms}")
 
             # Log RAG parameters to interaction logger
             log_rag_parameters(
@@ -797,6 +798,7 @@ def process_file_wrapper(args):
                 sub_prompt=sub_prompt,
                 bm25_weight=bm25_weight,
                 semantic_weight=semantic_weight,
+                bm25_terms=bm25_terms,
                 reasoning=rag_reasoning,
                 source="decomposition"
             )
@@ -814,7 +816,9 @@ def process_file_wrapper(args):
                     valid_chunk_indices=preprocessed_data["valid_chunk_indices"],
                     reranker_model=reranker_model,  # Use local reranker model
                     bm25_weight=bm25_weight,  # Use optimized weight from decomposition
-                    semantic_weight=semantic_weight  # Use optimized weight from decomposition
+                    semantic_weight=semantic_weight,  # Use optimized weight from decomposition
+                    bm25_terms=bm25_terms,
+                    alternate_hyde_queries=hyde_queries,
                 )
             else:
                 relevant_chunks = retrieve_relevant_chunks(
@@ -824,7 +828,9 @@ def process_file_wrapper(args):
                     top_k=RAG_TOP_K,
                     reranker_model=reranker_model,  # Use local reranker model
                     bm25_weight=bm25_weight,  # Use optimized weight from decomposition
-                    semantic_weight=semantic_weight  # Use optimized weight from decomposition
+                    semantic_weight=semantic_weight,  # Use optimized weight from decomposition
+                    bm25_terms=bm25_terms,
+                    alternate_hyde_queries=hyde_queries,
                 )
 
             # Store sub-prompt data with its relevant chunks and RAG params
@@ -832,7 +838,8 @@ def process_file_wrapper(args):
                 "title": sub_prompt_title,
                 "sub_prompt": sub_prompt,
                 "relevant_chunks": relevant_chunks,
-                "rag_params": rag_params  # Store for potential retry use
+                "rag_params": rag_params,  # Store for potential retry use
+                "hyde": hyde_queries,
             })
 
             logger.info(f"Retrieved {len(relevant_chunks)} chunks for sub-prompt '{sub_prompt_title}' in {filename} using optimized RAG weights")
@@ -862,10 +869,12 @@ def process_file_wrapper(args):
 
             if matching_context:
                 result["relevant_chunks"] = matching_context["relevant_chunks"]
+                result["rag_params"] = matching_context.get("rag_params", {})
             else:
                 # Fallback if no match found
                 logger.warning(f"No matching context found for sub-prompt: {result['sub_prompt'][:50]}...")
                 result["relevant_chunks"] = []
+                result["rag_params"] = {}
 
         logger.info(f"Completed analysis for all sub-prompts in {filename}")
 
@@ -951,41 +960,12 @@ def process_file_wrapper(args):
             logger.error(f"Error during verification: {verify_err}", exc_info=True)
             verification_results, phrase_locations = {}, {}
 
-        if keyword_context:
-            keyword_sections = keyword_context.get("aggregated_analysis", {}).get("analysis_sections", {})
-            if keyword_sections:
-                aggregated_analysis["analysis_sections"].update(keyword_sections)
-                logger.info(
-                    "Merged %d keyword section(s) into analysis for %s",
-                    len(keyword_sections),
-                    filename,
-                )
-            keyword_sub_prompts = keyword_context.get("sub_prompt_results", [])
-            if keyword_sub_prompts:
-                all_sub_prompt_results.extend(keyword_sub_prompts)
-            keyword_verifications = keyword_context.get("verification_results", {})
-            for phrase_key, verification_payload in keyword_verifications.items():
-                if phrase_key in verification_results:
-                    logger.debug(
-                        "Overwriting existing verification entry for phrase '%s' with keyword mode data.",
-                        phrase_key,
-                    )
-                verification_results[phrase_key] = verification_payload
-            keyword_locations = keyword_context.get("phrase_locations", {})
-            for phrase_key, location_payload in keyword_locations.items():
-                if phrase_key in phrase_locations:
-                    logger.debug(
-                        "Overwriting existing phrase location for '%s' with keyword mode coordinates.",
-                        phrase_key,
-                    )
-                phrase_locations[phrase_key] = location_payload
-
+        # Keyword mode is disabled - no separate keyword context to merge
         aggregated_ai_analysis_json_str = json.dumps(aggregated_analysis, indent=2)
         logger.info(
-            "Final analysis for %s contains %d section(s)%s",
+            "Final analysis for %s contains %d section(s)",
             filename,
             len(aggregated_analysis.get("analysis_sections", {})),
-            " (includes keyword highlights)" if keyword_context else "",
         )
 
         # Add annotations to the PDF
@@ -1013,6 +993,16 @@ def process_file_wrapper(args):
             logger.info(f"Memory cleanup performed: {cleanup_result.get('freed_formatted', '0 B')} freed")
 
         # --- Step 6: Return the results ---
+        # Get the trace_id to store for future follow-up questions
+        current_trace_id = None
+        try:
+            langfuse_client = get_langfuse_client_cached()
+            if langfuse_client is not None:
+                current_trace_id = langfuse_client.get_current_trace_id()
+                logger.debug(f"Captured trace_id for {filename}: {current_trace_id}")
+        except Exception as trace_id_err:
+            logger.debug(f"Could not capture trace_id: {trace_id_err}")
+
         result_payload = {
             "filename": filename,
             "annotated_pdf": annotated_pdf_base64,
@@ -1020,27 +1010,15 @@ def process_file_wrapper(args):
             "phrase_locations": phrase_locations,
             "ai_analysis": aggregated_ai_analysis_json_str,
             "sub_prompt_results": all_sub_prompt_results,
-            "extracted_facts": extracted_facts
+            "extracted_facts": extracted_facts,
+            "trace_id": current_trace_id,  # Store trace_id for follow-up questions
+            "keyword_mode": False,  # Keyword mode is disabled
         }
-
-        if keyword_context:
-            result_payload.update({
-                "keyword_mode": False,
-                "keyword_mode_sections": keyword_context.get("keyword_mode_sections", {}),
-                "keyword_analysis": keyword_context.get("keyword_analysis"),
-                "keywords": keyword_context.get("keywords_display", []),
-                "keyword_groups": keyword_groups,
-                "keyword_group_metadata": keyword_context.get("keyword_groups_data", []),
-                "total_occurrences": keyword_context.get("total_occurrences", 0),
-                "keyword_reasoning": keyword_reasoning,
-                "user_request_context": user_request_context,
-                "raw_keyword_occurrences": keyword_context.get("raw_keyword_sections", {}),
-            })
 
         analysis_sections_count = len(aggregated_analysis.get("analysis_sections", {}))
         update_current_trace(output={
             "status": "success",
-            "keyword_mode": bool(keyword_context),
+            "keyword_mode": False,
             "analysis_sections": analysis_sections_count,
             "sub_prompts_processed": len(all_sub_prompt_results),
         })

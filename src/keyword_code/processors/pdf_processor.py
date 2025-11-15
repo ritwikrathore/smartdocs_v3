@@ -31,6 +31,13 @@ class DocumentStructureTracker:
     _RECITAL_PATTERN = re.compile(r"^RECITALS?\s*(?:\((?P<label>[A-Z])\))?(?P<rest>.*)", re.IGNORECASE)
     _SUBSECTION_PATTERN = re.compile(r"^\((?P<label>[A-Za-z0-9ivxIVX]+)\)\s*(?P<rest>.*)")
     _PAGE_MARKER_PATTERN = re.compile(r"^\s*[-–—]?\s*(?P<marker>(?:[ivxlcdmIVXLCDM]+|\d+))\s*[-–—]?\s*$")
+    _NBSP_CHARACTERS = ("\u00a0", "\u202f", "\u2007", "\u2009")
+    _ZERO_WIDTH_PATTERN = re.compile(r"[\u200b\u200c\u200d\u2060]")
+    _INLINE_TITLE_PATTERN = re.compile(
+        r"^\s*[-–—]*\s*(?P<title>[A-Za-z][\w\s,&'/-]{0,80}?)(?:[.:;])\s*(?P<rest>.*)",
+        re.DOTALL,
+    )
+
     _HEADING_BOUNDARY_PATTERN = re.compile(
         r"\b(?:Section\s+\d|ARTICLE\s+[IVXLCDM\d]+|ANNEX\s+[A-Z0-9]+|SCHEDULE\s+[A-Z0-9]+|RECITALS?\s*\(|RECITAL\s*\(|ANNEX\s+|SCHEDULE\s+)",
         re.IGNORECASE,
@@ -54,6 +61,10 @@ class DocumentStructureTracker:
         self.pending_section_title: bool = False
         self.toc_entries: List[Dict[str, Any]] = []
 
+        self._leading_page_marker_pattern = re.compile(
+            r"^\s*[-–—]?\s*(?:[ivxlcdmIVXLCDM]+|\d+)\s*[-–—]?\s+"
+        )
+
     def process_chunk(self, text: str, page_num: Optional[int]) -> Dict[str, Any]:
         """Analyze chunk text and return metadata dictionary"""
         working_text = (text or "").strip()
@@ -63,6 +74,8 @@ class DocumentStructureTracker:
 
         if self._is_page_marker(working_text):
             return self._build_metadata(scope_override="page_marker")
+
+        working_text = self._strip_leading_page_marker(working_text)
 
         if self._is_table_of_contents(working_text, page_num):
             self.within_table_of_contents = True
@@ -77,16 +90,16 @@ class DocumentStructureTracker:
             return self._build_metadata()
 
         if self.within_table_of_contents:
-            # Extract TOC entries while in TOC region
-            self._extract_toc_entries(working_text)
-            # Continue processing - still in TOC
-            return self._build_metadata()
-
-        # Check if we're leaving TOC (detected non-TOC content)
-        if self.within_table_of_contents and not self._looks_like_toc_content(working_text):
-            self.within_table_of_contents = False
-            self._reset_for_new_top_level()
-            self.scope = "preamble"
+            if not self._looks_like_toc_content(working_text):
+                # First non-TOC chunk after the table of contents – reset state and continue normally
+                self.within_table_of_contents = False
+                self._reset_for_new_top_level()
+                self.scope = "preamble"
+            else:
+                # Extract TOC entries while in TOC region
+                self._extract_toc_entries(working_text)
+                # Continue processing - still in TOC
+                return self._build_metadata()
 
         # Handle pending titles (article/annex/schedule) that may be on this chunk
         working_text = self._maybe_capture_pending_top_level_title(working_text)
@@ -137,6 +150,8 @@ class DocumentStructureTracker:
 
         if pattern is self._ANNEX_PATTERN:
             label = match.group("label").strip()
+            if label.upper() != label and not label.isdigit():
+                return original_text
             title, trailing = self._split_heading_title(rest)
             self.scope = "annex"
             self.article_type = "Annex"
@@ -148,6 +163,8 @@ class DocumentStructureTracker:
 
         if pattern is self._SCHEDULE_PATTERN:
             label = match.group("label").strip()
+            if label.upper() != label and not label.isdigit():
+                return original_text
             title, trailing = self._split_heading_title(rest)
             self.scope = "schedule"
             self.article_type = "Schedule"
@@ -243,34 +260,97 @@ class DocumentStructureTracker:
             self.section_title = title
             self.pending_section_title = False
             return remainder
+
+        normalized = text or ""
+        for special in self._NBSP_CHARACTERS:
+            normalized = normalized.replace(special, " ")
+        normalized = self._ZERO_WIDTH_PATTERN.sub("", normalized)
+        normalized = normalized.lstrip()
+
+        inline_match = self._INLINE_TITLE_PATTERN.match(normalized)
+        if inline_match:
+            candidate = self._clean_heading_fragment(inline_match.group("title"))
+            if candidate:
+                self.section_title = candidate
+                self.pending_section_title = False
+                return text
         return text
+
+    def _strip_leading_page_marker(self, text: str) -> str:
+        match = self._leading_page_marker_pattern.match(text)
+        if not match:
+            return text
+        stripped = text[match.end():]
+        return stripped.lstrip()
 
     def _split_heading_title(self, text: str) -> Tuple[Optional[str], str]:
         if not text:
             return None, ""
 
-        cleaned = text.lstrip(" .:-–—")
+        normalized = text
+        for special in self._NBSP_CHARACTERS:
+            normalized = normalized.replace(special, " ")
+        normalized = self._ZERO_WIDTH_PATTERN.sub("", normalized)
+
+        cleaned = normalized.lstrip()
+        cleaned = cleaned.lstrip(".:-–—_")
+        cleaned = cleaned.replace("\r", " ").replace("\n", " ")
         if not cleaned:
             return None, ""
 
         boundary_match = self._HEADING_BOUNDARY_PATTERN.search(cleaned)
+        while boundary_match:
+            prefix = cleaned[: boundary_match.start()].rstrip()
+            if boundary_match.start() == 0 or not prefix:
+                break
+
+            last_char = prefix[-1]
+            if last_char in ".;:-–—_()[]{}" or last_char.isspace():
+                break
+
+            boundary_match = self._HEADING_BOUNDARY_PATTERN.search(cleaned, boundary_match.start() + 1)
+
         if boundary_match:
-            title = cleaned[: boundary_match.start()].strip(" .:-–—")
+            title = cleaned[: boundary_match.start()].strip(" .:-–—_")
             remainder = cleaned[boundary_match.start():]
-            return (title or None), remainder
+            return (self._clean_heading_fragment(title), remainder)
+
+        inline_match = self._INLINE_TITLE_PATTERN.match(cleaned)
+        if inline_match:
+            title = inline_match.group("title")
+            remainder = inline_match.group("rest")
+            return (self._clean_heading_fragment(title), remainder)
+
+        clause_match = re.match(r"^(?P<title>[^.;:\n]{1,80})[.;:](?P<rest>.*)", cleaned)
+        if clause_match:
+            title = clause_match.group("title")
+            remainder = clause_match.group("rest")
+            return (self._clean_heading_fragment(title), remainder)
 
         # If no explicit boundary, attempt to cut at first sentence break to avoid capturing entire chunk
-        sentence_break = re.search(r"(?<=[.;:])\s{2,}|(?<=[.;:])\s(?=[A-Z])", cleaned)
+        sentence_break = re.search(r"(?<=[.;:])\s{1,}(?=[A-Z])", cleaned)
         if sentence_break:
-            title = cleaned[: sentence_break.start()].strip(" .:-–—")
+            title = cleaned[: sentence_break.start()].strip(" .:-–—_")
             remainder = cleaned[sentence_break.start():]
-            return (title or None), remainder
+            return (self._clean_heading_fragment(title), remainder)
 
         # Fallback: if cleaned text is short, treat it as title; otherwise keep for body content
         if len(cleaned) <= 80:
-            return cleaned.strip(" .:-–—") or None, ""
+            return self._clean_heading_fragment(cleaned) or None, ""
 
         return None, text
+
+    def _clean_heading_fragment(self, fragment: str) -> Optional[str]:
+        fragment = fragment.replace("\r", " ").replace("\n", " ")
+        cleaned = fragment.strip()
+        if not cleaned:
+            return None
+
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        cleaned = cleaned.rstrip(" .:-–—_")
+        cleaned = cleaned.lstrip("-–—")
+
+        return cleaned or None
 
     def _reset_for_new_top_level(self) -> None:
         self.article_type = None
@@ -585,7 +665,6 @@ class PDFProcessor:
 
                     # Fallback: If no match found, try fuzzy matching on first 50 chars
                     if not chunk_sentences and page_sentences:
-                        from fuzzywuzzy import fuzz
                         chunk_start = chunk_text_normalized[:50]
                         best_match_idx = -1
                         best_score = 0
