@@ -786,6 +786,249 @@ def process_rag_requests(results: list[dict[str, any]]) -> tuple[list[dict[str, 
                         logger.error(f"Error in RAG retry for section {section_key}: {e}", exc_info=True)
                         st.session_state.rag_retry_requests[section_key]["status"] = "error"
 
+        # Process context request approvals
+        if hasattr(st.session_state, 'context_request_approvals'):
+            from src.keyword_code.rag.retrieval import retrieve_relevant_chunks_async
+            from src.keyword_code.models.embedding import load_embedding_model, load_reranker_model
+            from src.keyword_code.ai.analyzer import DocumentAnalyzer
+            from src.keyword_code.processors.pdf_processor import PDFProcessor
+            from src.keyword_code.display_utils.pdf_utils import restore_original_bytes_if_needed
+            from src.keyword_code.services.fact_extraction_service import FactExtractionService
+
+            for section_key, approval_data in st.session_state.context_request_approvals.items():
+                if approval_data.get("status") == "approved":
+                    requests_processed = True
+                    try:
+                        context_request = approval_data.get("context_request", {})
+                        section_data = approval_data.get("section_data", {})
+                        result_meta = approval_data.get("result", {})
+                        
+                        filename = result_meta.get("filename")
+                        preprocessed_doc = st.session_state.get("preprocessed_data", {}).get(filename, {})
+                        
+                        if not preprocessed_doc:
+                            logger.error(f"No preprocessed data for {filename}")
+                            st.session_state.context_request_approvals[section_key]["status"] = "error"
+                            continue
+
+                        chunks = preprocessed_doc.get("chunks", [])
+                        
+                        # Build chunk lookup for retrieving requested chunks
+                        chunk_lookup = {}
+                        for idx, chunk in enumerate(chunks):
+                            if isinstance(chunk, dict):
+                                chunk_idx = chunk.get("chunk_index", idx)
+                                chunk_lookup[chunk_idx] = chunk
+
+                        # Extract requested chunk indices and also check for article/section metadata requests
+                        requested_indices = context_request.get("chunk_indices", [])
+                        article_numbers = context_request.get("article_numbers", [])
+                        section_numbers = context_request.get("section_numbers", [])
+                        section_titles = context_request.get("section_titles", [])
+                        
+                        additional_chunks = []
+                        found_by_metadata = []
+                        
+                        # First, try to get chunks by indices
+                        for chunk_idx in requested_indices:
+                            if chunk_idx in chunk_lookup:
+                                additional_chunks.append(chunk_lookup[chunk_idx])
+                        
+                        # If no chunks found by indices but we have metadata requests, try those
+                        if not additional_chunks and (article_numbers or section_numbers or section_titles):
+                            metadata_index_maps = preprocessed_doc.get("metadata_index_maps", {})
+                            
+                            for article_num in article_numbers:
+                                matching_indices = metadata_index_maps.get("article_numbers", {}).get(article_num, [])
+                                for idx in matching_indices[:10]:  # Limit to first 10 chunks per article
+                                    if idx in chunk_lookup and chunk_lookup[idx] not in additional_chunks:
+                                        additional_chunks.append(chunk_lookup[idx])
+                                        found_by_metadata.append(f"article {article_num}")
+                            
+                            for section_num in section_numbers:
+                                matching_indices = metadata_index_maps.get("section_numbers", {}).get(section_num, [])
+                                for idx in matching_indices[:10]:
+                                    if idx in chunk_lookup and chunk_lookup[idx] not in additional_chunks:
+                                        additional_chunks.append(chunk_lookup[idx])
+                                        found_by_metadata.append(f"section {section_num}")
+                            
+                            for section_title in section_titles:
+                                matching_indices = metadata_index_maps.get("section_titles", {}).get(section_title, [])
+                                for idx in matching_indices[:10]:
+                                    if idx in chunk_lookup and chunk_lookup[idx] not in additional_chunks:
+                                        additional_chunks.append(chunk_lookup[idx])
+                                        found_by_metadata.append(f"section '{section_title}'")
+                        
+                        if found_by_metadata:
+                            logger.info(
+                                f"Context request for section {section_key}: found {len(additional_chunks)} chunks by metadata: {', '.join(set(found_by_metadata))}"
+                            )
+                        
+                        logger.info(
+                            f"Context request for section {section_key}: retrieving {len(additional_chunks)} additional chunks (requested {len(requested_indices)} indices)"
+                        )
+
+                        if not additional_chunks:
+                            logger.warning(
+                                f"No additional chunks found for context request in section {section_key}. "
+                                f"Requested indices: {requested_indices[:5]}{'...' if len(requested_indices) > 5 else ''}, "
+                                f"articles: {article_numbers}, sections: {section_numbers}, titles: {section_titles}"
+                            )
+                            st.session_state.context_request_approvals[section_key]["status"] = "no_chunks"
+                            continue
+
+                        # Get the original sub-prompt for re-analysis
+                        sub_prompt_results = result_meta.get("sub_prompt_results", [])
+                        original_sub_prompt = None
+                        original_title = None
+                        
+                        for sp_result in sub_prompt_results:
+                            if sp_result.get("section_key") == section_key:
+                                original_sub_prompt = sp_result.get("sub_prompt")
+                                original_title = sp_result.get("title")
+                                break
+                        
+                        if not original_sub_prompt:
+                            # Try to extract from section_data
+                            try:
+                                analysis_json_str = section_data.get("analysis_json", "{}")
+                                if isinstance(analysis_json_str, str):
+                                    analysis_obj = json.loads(analysis_json_str)
+                                    original_sub_prompt = analysis_obj.get("sub_prompt_analyzed", "")
+                                    original_title = analysis_obj.get("title", "")
+                            except:
+                                pass
+                        
+                        if not original_sub_prompt:
+                            logger.error(f"Could not find original sub-prompt for section {section_key}")
+                            st.session_state.context_request_approvals[section_key]["status"] = "error"
+                            continue
+
+                        # Combine original chunks with additional chunks
+                        # We need to get the original chunks used for this sub-prompt
+                        # For now, we'll just use the additional chunks as the new context
+                        combined_chunks = additional_chunks
+                        
+                        # Re-analyze with enhanced context
+                        analyzer = DocumentAnalyzer()
+                        
+                        # Format sub-prompts for re-analysis
+                        sub_prompts_for_analysis = [{
+                            "sub_prompt": original_sub_prompt,
+                            "title": original_title or section_key,
+                            "relevant_chunks": combined_chunks,
+                            "section_key": section_key,
+                        }]
+                        
+                        # Run comprehensive analysis with enhanced context
+                        enhanced_results = run_async(
+                            analyzer.analyze_document_with_all_contexts(
+                                filename=filename,
+                                main_prompt=original_sub_prompt,
+                                sub_prompts_with_contexts=sub_prompts_for_analysis,
+                                all_chunks=chunks,
+                            )
+                        )
+                        
+                        if enhanced_results and len(enhanced_results) > 0:
+                            enhanced_result = enhanced_results[0]
+                            
+                            # Extract the enhanced analysis
+                            try:
+                                enhanced_analysis_json = json.loads(enhanced_result.get("analysis_json", "{}"))
+                                
+                                # Build enhanced section data
+                                supporting_quotes = enhanced_analysis_json.get("supporting_quotes", [])
+                                if not isinstance(supporting_quotes, list):
+                                    supporting_quotes = [str(supporting_quotes)]
+                                
+                                enhanced_section = {
+                                    "Analysis": enhanced_analysis_json.get("analysis_summary", ""),
+                                    "Context": enhanced_analysis_json.get("analysis_context", ""),
+                                    "Supporting_Phrases": supporting_quotes,
+                                }
+                                
+                                # Verify and extract relevant chunks for PDF annotation
+                                verification_results, phrase_locations = {}, {}
+                                try:
+                                    pdf_bytes = restore_original_bytes_if_needed(filename)
+                                    if pdf_bytes:
+                                        processor = PDFProcessor(pdf_bytes)
+                                        mini_aggregated = {
+                                            "title": f"Analysis of {filename} (context request)",
+                                            "analysis_sections": {section_key: enhanced_section},
+                                        }
+                                        aggregated_str = json.dumps(mini_aggregated, indent=2)
+                                        verification_results, phrase_locations = processor.verify_and_locate_phrases(aggregated_str)
+                                    else:
+                                        logger.warning("Original PDF bytes not found; skipping verification for context request.")
+                                except Exception as ver_err:
+                                    logger.error(f"Verification error for context request section {section_key}: {ver_err}")
+                                
+                                # Update main results with enhanced analysis
+                                target_result = None
+                                for res_item in results:
+                                    if isinstance(res_item, dict) and res_item.get("filename") == filename:
+                                        target_result = res_item
+                                        break
+
+                                if target_result:
+                                    # Update aggregated analysis JSON
+                                    try:
+                                        agg_str = target_result.get("ai_analysis", "{}")
+                                        agg = json.loads(agg_str) if isinstance(agg_str, str) else (agg_str or {})
+                                    except:
+                                        agg = {"title": f"Analysis of {filename}", "analysis_sections": {}}
+                                    
+                                    if "analysis_sections" not in agg:
+                                        agg["analysis_sections"] = {}
+                                    
+                                    # Update the section with enhanced data including analysis_json
+                                    enhanced_section["analysis_json"] = enhanced_result.get("analysis_json", "{}")
+                                    agg["analysis_sections"][section_key] = enhanced_section
+                                    target_result["ai_analysis"] = json.dumps(agg, indent=2)
+
+                                    # Merge verification and locations
+                                    existing_ver = target_result.get("verification_results", {}) or {}
+                                    existing_ver.update(verification_results or {})
+                                    target_result["verification_results"] = existing_ver
+
+                                    existing_locs = target_result.get("phrase_locations", {}) or {}
+                                    for k, v in (phrase_locations or {}).items():
+                                        existing_locs[k] = v
+                                    target_result["phrase_locations"] = existing_locs
+
+                                    # Regenerate annotated PDF
+                                    try:
+                                        orig_bytes = restore_original_bytes_if_needed(filename)
+                                        if orig_bytes:
+                                            processor_for_update = PDFProcessor(orig_bytes)
+                                            updated_pdf_bytes = processor_for_update.add_annotations(existing_locs)
+                                            target_result["annotated_pdf"] = base64.b64encode(updated_pdf_bytes).decode("utf-8")
+                                    except Exception as ann_err:
+                                        logger.warning(f"Could not regenerate annotated PDF for {filename}: {ann_err}")
+
+                                    # Persist back to session
+                                    if isinstance(st.session_state.get("analysis_results"), list):
+                                        for idx, sess_item in enumerate(st.session_state.analysis_results):
+                                            if isinstance(sess_item, dict) and sess_item.get("filename") == filename:
+                                                st.session_state.analysis_results[idx] = target_result
+                                                break
+
+                                logger.info(f"Context request completed for section {section_key}")
+                                st.session_state.context_request_approvals[section_key]["status"] = "completed"
+                                
+                            except Exception as analysis_err:
+                                logger.error(f"Error processing enhanced analysis for {section_key}: {analysis_err}", exc_info=True)
+                                st.session_state.context_request_approvals[section_key]["status"] = "error"
+                        else:
+                            logger.error(f"No enhanced results returned for section {section_key}")
+                            st.session_state.context_request_approvals[section_key]["status"] = "error"
+
+                    except Exception as e:
+                        logger.error(f"Error processing context request for section {section_key}: {e}", exc_info=True)
+                        st.session_state.context_request_approvals[section_key]["status"] = "error"
+
     except Exception as e:
         logger.error(f"Error processing RAG requests: {e}", exc_info=True)
 

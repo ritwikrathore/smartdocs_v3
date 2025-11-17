@@ -15,8 +15,77 @@ import logging
 
 def apply_ui_styling():
     """Apply CSS styling for the app UI"""
+    # Get the base64-encoded font data for local Material Icons
+    import os
+    import base64
+    
+    font_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "assets", "fonts", "MaterialIcons-Regular.woff2")
+    font_outlined_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "assets", "fonts", "MaterialIconsOutlined-Regular.woff2")
+    
+    logger.info(f"Attempting to load Material Icons font from: {font_path}")
+    logger.info(f"Attempting to load Material Icons Outlined font from: {font_outlined_path}")
+    
+    material_icons_css = ""
+    if os.path.exists(font_path):
+        try:
+            with open(font_path, "rb") as f:
+                font_data = base64.b64encode(f.read()).decode()
+            font_size_kb = len(font_data) / 1024
+            logger.info(f"Successfully loaded Material Icons font ({font_size_kb:.1f} KB encoded)")
+            material_icons_css = f"""
+        /* Local Material Icons Font */
+        @font-face {{
+            font-family: 'Material Icons';
+            font-style: normal;
+            font-weight: 400;
+            src: url(data:font/woff2;base64,{font_data}) format('woff2');
+        }}
+        
+        /* Force Material Icons for Streamlit icons */
+        .st-emotion-cache-qqe4ge, [data-testid="stIconMaterial"] {{
+            font-family: 'Material Icons' !important;
+            font-weight: normal;
+            font-style: normal;
+            font-size: 24px;
+            line-height: 1;
+            letter-spacing: normal;
+            text-transform: none;
+            display: inline-block;
+            white-space: nowrap;
+            word-wrap: normal;
+            direction: ltr;
+            -webkit-font-feature-settings: 'liga';
+            -webkit-font-smoothing: antialiased;
+        }}
+            """
+        except Exception as e:
+            logger.warning(f"Failed to load local Material Icons font: {e}")
+    else:
+        logger.warning(f"Material Icons font file not found at: {font_path}")
+    
+    if os.path.exists(font_outlined_path):
+        try:
+            with open(font_outlined_path, "rb") as f:
+                font_outlined_data = base64.b64encode(f.read()).decode()
+            font_outlined_size_kb = len(font_outlined_data) / 1024
+            logger.info(f"Successfully loaded Material Icons Outlined font ({font_outlined_size_kb:.1f} KB encoded)")
+            material_icons_css += f"""
+        @font-face {{
+            font-family: 'Material Icons Outlined';
+            font-style: normal;
+            font-weight: 400;
+            src: url(data:font/woff2;base64,{font_outlined_data}) format('woff2');
+        }}
+            """
+        except Exception as e:
+            logger.warning(f"Failed to load local Material Icons Outlined font: {e}")
+    else:
+        logger.warning(f"Material Icons Outlined font file not found at: {font_outlined_path}")
+    
     st.markdown(f"""
     <style>
+        {material_icons_css}
+        
         /* Base Styling */
         .stApp {{ background-color: white; }}
         h1, h2, h3, h4, h5, h6 {{ color: {DARK_BLUE}; }}

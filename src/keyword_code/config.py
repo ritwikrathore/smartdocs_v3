@@ -48,6 +48,10 @@ if databricks_token:
 else:
     logger.error("DATABRICKS_API_KEY not found in environment variables after load_dotenv()")
 
+# --- Langfuse Tracing Configuration ---
+# Set to False to disable Langfuse tracing (useful for prod environments without Langfuse)
+ENABLE_LANGFUSE_TRACING = os.environ.get("ENABLE_LANGFUSE_TRACING", "true").lower() == "true"
+
 # --- Worker Configuration ---
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", 3))
 ENABLE_PARALLEL = os.environ.get("ENABLE_PARALLEL", "true").lower() == "true"
@@ -62,6 +66,17 @@ RAG_WORKERS = 3  # Number of workers for parallel RAG processing
 # Sentence chunker parameters
 SENTENCES_PER_CHUNK = 6  # Number of sentences per chunk
 MIN_CHUNK_CHAR_LENGTH = 50  # Minimum character length for a chunk to be valid
+
+# Toggle for new adaptive chunker (default: true)
+# Set to false in environment to use legacy sentence chunker
+USE_ADAPTIVE_SENTENCE_CHUNKER = os.environ.get("USE_ADAPTIVE_SENTENCE_CHUNKER", "true").lower() == "true"
+
+# Adaptive chunker parameters (bounds aim for ~150-300 tokens)
+ADAPTIVE_CHUNK_MIN_CHARS = int(os.environ.get("ADAPTIVE_CHUNK_MIN_CHARS", 450))
+ADAPTIVE_CHUNK_MAX_CHARS = int(os.environ.get("ADAPTIVE_CHUNK_MAX_CHARS", 900))
+ADAPTIVE_CHUNK_MIN_SENTENCES = int(os.environ.get("ADAPTIVE_CHUNK_MIN_SENTENCES", 3))
+ADAPTIVE_CHUNK_MAX_SENTENCES = int(os.environ.get("ADAPTIVE_CHUNK_MAX_SENTENCES", 8))
+ADAPTIVE_CHUNK_OVERLAP_SENTENCES = int(os.environ.get("ADAPTIVE_CHUNK_OVERLAP_SENTENCES", 2))
 
 # --- Model Paths ---
 # Using Databricks for all models, no local models needed

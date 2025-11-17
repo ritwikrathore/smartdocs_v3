@@ -27,6 +27,15 @@ The helper module centralises interactions with the Langfuse SDK:
 
 All helper functions degrade safely when tracing is unavailable, ensuring no user-visible regressions.
 
+## Thread-Safe Context Propagation (`src/keyword_code/utils/async_utils.py`)
+The `run_async()` helper automatically propagates Langfuse trace context across thread boundaries:
+
+- **Context Capture**: Before spawning a new thread, the current trace ID is captured using `langfuse_context.get_current_trace_id()`.
+- **Context Restoration**: In the new thread, the trace ID is restored using `langfuse_context.set_trace_id()` before running the async coroutine.
+- **Graceful Degradation**: If Langfuse is not available or context capture fails, the function continues without context propagation.
+
+This ensures that nested traces created within async operations (like `analyzer.comprehensive_analysis`) are correctly parented under the `analysis.run` trace, even when crossing thread boundaries via `ThreadPoolExecutor`.
+
 ## Session Tracking Flow
 `process_file_wrapper` now resolves the Streamlit session identifier via `get_session_id()` and passes it to `start_trace()`.
 

@@ -7,15 +7,7 @@ import re
 import threading
 from typing import List, Optional
 
-
-def normalize_text(text: Optional[str]) -> str:
-    """Normalize text for comparison: lowercase, strip, whitespace."""
-    if not text:
-        return ""
-    text = str(text)
-    text = text.lower()  # Case-insensitive matching
-    text = re.sub(r"\s+", " ", text)  # Normalize whitespace
-    return text.strip()
+from ..text_utils import normalize_text
 
 
 def remove_markdown_formatting(text: Optional[str]) -> str:
@@ -44,6 +36,7 @@ def render_limited_markdown(text: Optional[str]) -> str:
     Supports:
     - Bullet points (unordered lists using *, -, or +)
     - Numbered lists (ordered lists using 1., 2., etc.)
+    - Alphabetical lists (ordered lists using a., b., c., etc.)
     - Bold text (**text** or __text__)
     - Italic text (*text* or _text_)
     - Tables (Markdown tables that include header and alignment rows)
@@ -228,6 +221,21 @@ def render_limited_markdown(text: Optional[str]) -> str:
                 processed_lines.append('</ul>')
                 in_ul = False
             list_content = process_inline_formatting(ol_match.group(2))
+            processed_lines.append(f'<li>{list_content}</li>')
+            i += 1
+            continue
+
+        # Alphabetical lists (a., b., c., etc.)
+        alpha_match = re.match(r'^([a-z])\.\s+(.+)$', stripped)
+        if alpha_match:
+            if not in_ol:
+                close_lists()
+                processed_lines.append('<ol type="a" style="margin: 0.5rem 0; padding-left: 1.5rem;">')
+                in_ol = True
+            if in_ul:
+                processed_lines.append('</ul>')
+                in_ul = False
+            list_content = process_inline_formatting(alpha_match.group(2))
             processed_lines.append(f'<li>{list_content}</li>')
             i += 1
             continue

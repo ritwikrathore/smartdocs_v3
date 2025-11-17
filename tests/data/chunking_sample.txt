@@ -1,0 +1,25 @@
+Executive Overview:
+- Funding commitments finalized.
+- Hedging strategy locked.
+- Drawdown notice drafted.
+- Audit scope confirmed.
+- Board consent filed.
+- Post-closing checklist circulated.
+
+After the concise headline items, the narrative section stretches into dense prose so the baseline chunker will have to work harder to keep things readable. The lender may accelerate repayment if covenants are breached and a cure period lapses while parallel consents are still pending, creating a single sentence that sprawls linearly across the page with multiple commas to inflate its length on purpose for this test harness.
+Each borrower shall deliver quarterly reporting packages with management commentary that discusses performance drivers, macro headwinds, mitigation levers, and the key variances across revenue, cost of goods sold, and operating cash flow so that just one sentence resembles a mini paragraph.
+The facility may be drawn in multiple tranches provided rating thresholds are maintained and the agent confirms allocation preferences, which usually requires an annex full of numbers and relative weights.
+Any voluntary prepayment requires ten business days' notice to the agent, but if the notice is delivered after noon New York time the window slips by one additional day, a nuance that belongs in the sample because it lengthens the sentence dramatically beyond natural speech.
+Each disbursement bears interest at Term SOFR plus a contractual margin with a 0.10% floor, and the base rate may be replaced if benchmark reform events cascade through consecutive observation periods.
+Collateral substitutions are permitted with advance written consent from the majority lenders so long as appraisals are refreshed, coverage tests stay satisfied, and replacement collateral is free of prior liens.
+Failure to perfect security interests constitutes an immediate event of default unless the borrower cures the defect within thirty days after written notice from the agent, which again strings multiple clauses into one intentionally long sentence.
+Market disruption clauses allow the lender to quote an alternate base rate and shift to cost-plus pricing if liquidity in the primary benchmark evaporates, generating another intentionally verbose line.
+The borrower must maintain a minimum debt service coverage ratio of 1.25 to 1.00, a consolidated leverage cap of 3.5x, and a current ratio above 1.0; the sample keeps these in one sentence to keep the text chunky.
+Indemnities cover environmental, tax, anti-corruption, and data security liabilities, and they survive termination of the agreement until all claims expire, which again prolongs the sentence purposely.
+Borrower representations span know-your-customer, anti-money laundering, sanctions policies, anti-bribery commitments, and cybersecurity controls, again in a single sentence to extend the chunk.
+Sustainability-linked adjustments apply if greenhouse gas targets are exceeded for two consecutive years, thereby raising the margin by ten basis points and funding a remediation pool.
+Reporting annex details escalation paths when remediation plans fall behind schedule, with enumerated deadlines, responsible officers, and pre-cleared consultants all combined into one complex sentence.
+Allocation mechanics describe how principal prepayments cascade across the tranches, touching the delayed draw facility, the revolving line, and the synthetic term loan all at once inside a single sentence for testing.
+The hedging annex describes fallback language for benchmark replacements in plain English but still folds optional parentheticals, subordinate clauses, and example payouts into one long sentence.
+Borrower covenants specify disclosure deadlines for ESG audits and community outreach milestones, and this sentence also tacks on a reminder about bilingual reporting just to ensure extra length.
+Each schedule summary closes with a short conclusion sentence so the adaptive chunker still sees a small amount of text at the tail to determine whether to merge with the prior unit.

@@ -9,7 +9,7 @@ from typing import Dict, List, Any, Optional, Union
 from enum import Enum
 from pydantic import BaseModel, Field, field_validator, ValidationError
 from pydantic_ai import Agent, RunContext
-from pydantic_ai.models.openai import OpenAIModel
+from pydantic_ai.models.openai import OpenAIChatModel
 import os
 import re
 
@@ -222,7 +222,7 @@ Analyze the query and identify the expected fact types."""
 
             # Use OpenAIModel without structured output constraints
             # Databricks doesn't support all JSON schema features
-            return OpenAIModel(
+            return OpenAIChatModel(
                 model_name=DATABRICKS_LLM_MODEL,
                 base_url=DATABRICKS_BASE_URL,
                 api_key=api_key
@@ -368,7 +368,7 @@ Be thorough and accurate in your extractions."""
             if not api_key:
                 raise RuntimeError("DATABRICKS_API_KEY is not set in environment variables")
             
-            return OpenAIModel(
+            return OpenAIChatModel(
                 model_name=DATABRICKS_LLM_MODEL,
                 base_url=DATABRICKS_BASE_URL,
                 api_key=api_key

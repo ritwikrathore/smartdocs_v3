@@ -909,7 +909,8 @@ def process_file_wrapper(args):
                     aggregated_analysis["analysis_sections"][section_key] = {
                         "Analysis": sub_analysis["analysis_summary"],
                         "Supporting_Phrases": supporting_quotes,
-                        "Context": sub_analysis.get("analysis_context", f"From sub-prompt: {result['sub_prompt']}")
+                        "Context": sub_analysis.get("analysis_context", f"From sub-prompt: {result['sub_prompt']}"),
+                        "analysis_json": result.get("analysis_json", json.dumps(sub_analysis))
                     }
                 else:
                     # Handle unexpected format
@@ -917,7 +918,8 @@ def process_file_wrapper(args):
                     aggregated_analysis["analysis_sections"][section_key] = {
                         "Analysis": f"Error parsing analysis for '{result['title']}'",
                         "Supporting_Phrases": ["No relevant phrase found."],
-                        "Context": f"Error in sub-prompt: {result['sub_prompt']}"
+                        "Context": f"Error in sub-prompt: {result['sub_prompt']}",
+                        "analysis_json": result.get("analysis_json", "{}")
                     }
             except Exception as e:
                 logger.error(f"Error aggregating results for sub-prompt '{result['title']}' in {filename}: {e}")

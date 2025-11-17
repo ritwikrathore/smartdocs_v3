@@ -274,15 +274,51 @@ def display_analysis_results(results: List[Dict[str, Any]]):
                                         """, unsafe_allow_html=True)
 
                                 with rag_col:
-                                    # Add RAG retry button in the header - aligned with text input
-                                    display_rag_retry_button_header(
-                                        section_key,
-                                        result,
-                                        section_data,
-                                        guided_prompt=user_prompt_value,
-                                        default_prompt=default_prompt_for_section,
-                                        prompt_changed=guided_prompt_changed,
-                                    )
+                                    # Check if this section has a context request
+                                    try:
+                                        analysis_json_str = section_data.get("analysis_json", "{}")
+                                        if isinstance(analysis_json_str, str):
+                                            analysis_obj = json.loads(analysis_json_str)
+                                            context_request = analysis_obj.get("context_request")
+                                            if isinstance(context_request, dict) and context_request.get("needs_more_context"):
+                                                # Show context request approval button
+                                                display_context_request_button(
+                                                    section_key,
+                                                    result,
+                                                    section_data,
+                                                    context_request,
+                                                )
+                                            else:
+                                                # Show regular RAG retry button
+                                                display_rag_retry_button_header(
+                                                    section_key,
+                                                    result,
+                                                    section_data,
+                                                    guided_prompt=user_prompt_value,
+                                                    default_prompt=default_prompt_for_section,
+                                                    prompt_changed=guided_prompt_changed,
+                                                )
+                                        else:
+                                            # Fallback to regular retry button
+                                            display_rag_retry_button_header(
+                                                section_key,
+                                                result,
+                                                section_data,
+                                                guided_prompt=user_prompt_value,
+                                                default_prompt=default_prompt_for_section,
+                                                prompt_changed=guided_prompt_changed,
+                                            )
+                                    except Exception as e:
+                                        logger.error(f"Error checking for context request in section {section_key}: {e}")
+                                        # Fallback to regular retry button
+                                        display_rag_retry_button_header(
+                                            section_key,
+                                            result,
+                                            section_data,
+                                            guided_prompt=user_prompt_value,
+                                            default_prompt=default_prompt_for_section,
+                                            prompt_changed=guided_prompt_changed,
+                                        )
 
                             # Display RAG analysis and retry results if available (below the header)
                             # Retry results are integrated into the main view; no separate section
@@ -301,6 +337,49 @@ def display_analysis_results(results: List[Dict[str, Any]]):
                                         f"<h4 style='color: #1e88e5; font-size: 1.1rem;'>{display_section_name}</h4>",
                                         f"<div style='color: #424242; line-height: 1.6;'>{rendered_analysis}"
                                     ]
+                                    
+                                    # Check if this section has a context request and display it
+                                    try:
+                                        analysis_json_str = section_data.get("analysis_json", "{}")
+                                        if isinstance(analysis_json_str, str):
+                                            analysis_obj = json.loads(analysis_json_str)
+                                            context_request = analysis_obj.get("context_request")
+                                            if isinstance(context_request, dict) and context_request.get("needs_more_context"):
+                                                request_reason = context_request.get("reason", "")
+                                                chunk_indices = context_request.get("chunk_indices", [])
+                                                
+                                                # Build a description of what's being requested
+                                                request_details = []
+                                                if chunk_indices:
+                                                    if len(chunk_indices) > 3:
+                                                        request_details.append(f"Chunks {chunk_indices[0]}-{chunk_indices[-1]} ({len(chunk_indices)} chunks)")
+                                                    else:
+                                                        request_details.append(f"Chunks {', '.join(map(str, chunk_indices))}")
+                                                
+                                                articles = context_request.get("article_numbers", [])
+                                                if articles:
+                                                    request_details.append(f"Articles: {', '.join(articles[:3])}")
+                                                
+                                                sections = context_request.get("section_numbers", [])
+                                                if sections:
+                                                    request_details.append(f"Sections: {', '.join(sections[:3])}")
+                                                
+                                                titles = context_request.get("section_titles", [])
+                                                if titles:
+                                                    request_details.append(f"'{titles[0]}'")
+                                                
+                                                request_summary = " | ".join(request_details) if request_details else "Additional context"
+                                                
+                                                if request_reason:
+                                                    analysis_html_parts.extend([
+                                                        f"<div style='margin-top: 0.8rem; border-top: 1px solid #ffa726; padding-top: 0.8rem; background-color: #fff3e0; padding: 0.6rem; border-radius: 0.3rem;'>",
+                                                        f"<span style='color: #e65100; font-size: 0.85rem; font-weight: 600;'>🔍 Context Request ({request_summary}):</span> ",
+                                                        f"<span style='color: #424242; font-size: 0.9rem; line-height: 1.4;'>{request_reason}</span>",
+                                                        f"</div>"
+                                                    ])
+                                    except Exception as e:
+                                        logger.debug(f"Could not extract context request for section {section_key}: {e}")
+                                    
                                     if context_content:
                                         # Context is NOT rendered with Markdown - keep as plain text
                                         analysis_html_parts.extend([
@@ -727,6 +806,38 @@ def display_rag_retry_button_header(
             request_payload["guided_prompt_changed"] = False
 
         st.session_state.rag_retry_requests[section_key] = request_payload
+        st.rerun()
+
+
+def display_context_request_button(
+    section_key: str,
+    result: Dict[str, Any],
+    section_data: Dict[str, Any],
+    context_request: Dict[str, Any],
+):
+    """
+    Display button for user to approve context request from LLM.
+
+    Args:
+        section_key: The section identifier
+        result: Result dictionary containing analysis data
+        section_data: The specific section data
+        context_request: The context request details from the LLM
+    """
+    # Create a unique key for this section's context approval button
+    context_key = f"context_req_{section_key}_{result.get('filename', 'unknown')}"
+
+    if st.button("✔️", key=f"approve_{context_key}", help="Approve Context Request", use_container_width=True):
+        # Store the context request approval in session state
+        if "context_request_approvals" not in st.session_state:
+            st.session_state.context_request_approvals = {}
+
+        st.session_state.context_request_approvals[section_key] = {
+            "status": "approved",
+            "context_request": context_request,
+            "section_data": section_data,
+            "result": result,
+        }
         st.rerun()
 
 

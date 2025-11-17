@@ -864,50 +864,28 @@ class DocumentAnalyzer:
                 })
 
             # Create the system prompt for the comprehensive analysis
+            # NOTE: Context request feature is currently DISABLED for testing
+            # See commented section below to re-enable the feature
             system_prompt = """You are an intelligent document analyzer specializing in legal and financial documents. You will be given a main prompt, multiple sub-prompts derived from it, and relevant document excerpts for each sub-prompt. Your task is to analyze each sub-prompt using its specific context and provide a structured response.
 
 ### IMPORTANT Core Instructions:
-1. **Analyze Each Sub-prompt Separately:** For each sub-prompt, provide a detailed analysis using ONLY the context provided for that specific sub-prompt.
-2. **Structured Response:** Your response must follow the JSON structure specified below, with an analysis for each sub-prompt.
-3. **Direct Answers:** For each sub-prompt, provide a comprehensive analysis that directly answers the question. If the question is not answerable, clearly state this in the analysis.
-4. **Exact Supporting Quotes:** For each sub-prompt, include direct, verbatim quotes from its context that support your analysis.
-5. **No Cross-Referencing:** Do not use context from one sub-prompt to answer another sub-prompt, even if they seem related.
-6. **No Information Found:** If the context for a sub-prompt does not contain information to answer it, clearly state this in the analysis.
-7. **Natural Section References:** When referring to where information is found in the document, use natural language references to document sections (e.g., "Section 9 of the Loan Agreement", "Definitions Section", "Article 5", "Schedule A") based on the content of the text excerpts. Do NOT mention chunk IDs or technical identifiers.
+1. **Structured Response:** Your response must follow the JSON structure specified below, with an analysis for each sub-prompt.
+2. **Direct Answers:** For each sub-prompt, provide a comprehensive analysis that directly answers the question. If the question is not answerable, clearly state this in the analysis.
+3. **Exact Supporting Quotes:** For each sub-prompt, include direct, verbatim quotes from its context that support your analysis.
+4. **No Information Found:** If the context for a sub-prompt does not contain information to answer it, clearly state this in the analysis.
+5. **Natural Section References:** When referring to where information is found in the document, use natural language references to document sections (e.g., "Section 9 of the Loan Agreement", "Definitions Section", "Article 5", "Schedule A") based on the content of the text excerpts. Do NOT mention chunk IDs or technical identifiers.
 
 ### IMPORTANT Formatting Guidelines:
 *YOU MUST ALWAYS USE MARKDOWN* in your analysis_summary to improve readability. Apply the following options **only inside the analysis_summary field**; other JSON fields such as supporting_quotes must remain plain strings without Markdown tables or list scaffolding:
 - **Bullet points** (using *, -, or +) for concise lists of up to 10 items (e.g., schedule of dates, list of violations, enumerated findings)
-- **Numbered lists** (using 1., 2., etc.) for sequential or ordered information such as repayment schedules, payment terms, or fee structures and tables
+- **Numbered lists or Alphabetical lists** (using 1., 2., or a., b., etc.) for sequential or ordered information such as repayment schedules, payment terms, or fee structures
 - **Bold text** (using **text**) to emphasize important information like dates, percentages, amounts, facts, or key definitions
-- **Italic text** (using *text*) for subtle emphasis or document references
-- **Tables** (Markdown table syntax) only when the provided excerpts contain inherently tabular information that benefits from a structured layout. Keep tables concise (no more than 12 columns or 20 rows), reuse the source column labels when available, never fabricate tables when list formats suffice, and do not place tables in supporting_quotes or other JSON properties.
+- **Tables** (Markdown table syntax) When the provided excerpts contain inherently tabular information that benefits from a structured layout. Keep tables concise (no more than 4 columns or 20 rows), reuse the source column labels when available, never fabricate tables when list formats suffice, and do not place tables in supporting_quotes or other JSON properties.
 
 DO NOT use any of the following:
 - Headers (#, ##, etc.) - the UI provides its own section headers
 - Code blocks (```) - not applicable for document analysis
-- Tables unless the relevant context clearly contains tabular data as described above
 - Other complex Markdown elements
-
-### Requesting Additional Context:
-- Each excerpt lists a `CHUNK_INDEX`. Treat this as the anchor for neighbouring text.
-- You may also request excerpts by citing specific article numbers or section identifiers when the provided context skips critical passages.
-- If you require more context, return a JSON payload of the form:
-    {
-        "needs_additional_context": true,
-        "context_requests": [
-            {
-                "sub_prompt_index": <number>,
-                "chunk_indices": [<contiguous chunk indices you need>],
-                "article_numbers": ["Article 5"],
-                "section_numbers": ["5.2"],
-                "section_titles": ["Payment Terms"],
-                "reason": "Short explanation."
-            }
-        ]
-    }
-- Request only contiguous indices that extend the same passage or precise sections that directly satisfy the question. Do not ask for unrelated sections or retry retrieval.
-- You have at most **3** additional context rounds. If told that no more context can be supplied, finalise your analysis with the available excerpts.
 
 ### JSON Output Schema:
 ```json
@@ -957,9 +935,7 @@ Main Prompt:
 {main_prompt}{toc_section}
 
 Sub-prompts and their contexts:
-Each excerpt includes a CHUNK_INDEX line so you can reference neighbouring text when absolutely necessary.
 """
-
             # Add each sub-prompt and its context
             for item in formatted_sub_prompts:
                 human_prompt += f"""
@@ -1093,19 +1069,18 @@ Generate a structured analysis for EACH sub-prompt, strictly following the JSON 
                                 "details": request_details,
                             }
 
-                            with optional_context(
-                                start_span(
-                                    name="analyzer.additional_context_request",
-                                    input_data={
-                                        "iteration": history_entry["iteration"],
-                                        "requests": context_requests,
-                                    },
-                                    metadata={
-                                        "operation": "document_analysis.context_request",
-                                        "num_requests": len(context_requests),
-                                    },
-                                )
-                            ) as context_span:
+                            context_span = start_span(
+                                name="analyzer.additional_context_request",
+                                input_data={
+                                    "iteration": history_entry["iteration"],
+                                    "requests": context_requests,
+                                },
+                                metadata={
+                                    "operation": "document_analysis.context_request",
+                                    "num_requests": len(context_requests),
+                                },
+                            )
+                            if context_span:
                                 set_span_output(
                                     context_span,
                                     output={
@@ -1264,6 +1239,25 @@ Generate a structured analysis for EACH sub-prompt, strictly following the JSON 
                 # Ensure supporting_quotes is a list
                 if not isinstance(result["supporting_quotes"], list):
                     result["supporting_quotes"] = [str(result["supporting_quotes"])]
+
+                # Extract per-subprompt context request if present
+                context_request = analysis.get("context_request")
+                if isinstance(context_request, dict) and context_request.get("needs_more_context"):
+                    result["context_request"] = {
+                        "needs_more_context": True,
+                        "chunk_indices": context_request.get("chunk_indices", []),
+                        "article_numbers": context_request.get("article_numbers", []),
+                        "section_numbers": context_request.get("section_numbers", []),
+                        "section_titles": context_request.get("section_titles", []),
+                        "reason": context_request.get("reason", ""),
+                        "sub_prompt_index": sub_prompt_index
+                    }
+                    logger.info(
+                        "Sub-prompt %d (%s) requested additional context: %s",
+                        sub_prompt_index,
+                        result["title"],
+                        result["context_request"]["reason"]
+                    )
 
                 # Convert to JSON string for compatibility with existing code
                 results.append({

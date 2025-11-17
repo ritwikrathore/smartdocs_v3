@@ -15,7 +15,7 @@ from ..config import (
 )
 from ..utils.helpers import normalize_text, remove_markdown_formatting
 from ..utils.spacy_utils import ensure_spacy_model
-from ..rag.chunking import SentenceChunker, create_chunks_from_text
+from ..rag.chunking import build_default_chunker, create_chunks_from_text
 
 
 class DocumentStructureTracker:
@@ -580,11 +580,7 @@ class PDFProcessor:
         doc = None
 
         # Create a sentence chunker with configuration from config.py
-        chunker = SentenceChunker(
-            sentences_per_chunk=SENTENCES_PER_CHUNK,
-            min_chunk_char_length=MIN_CHUNK_CHAR_LENGTH,
-            nlp=self._nlp
-        )
+        chunker = build_default_chunker(nlp=self._nlp)
 
         if not self._nlp:
             logger.error("spaCy model not loaded. Cannot perform sentence-based chunking.")

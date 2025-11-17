@@ -33,12 +33,24 @@ def _is_truthy(value: Optional[str]) -> bool:
 
 def is_tracing_enabled() -> bool:
     """Return True when Langfuse tracing should be active."""
+    
+    # First check if tracing is enabled in config
+    try:
+        from ..config import ENABLE_LANGFUSE_TRACING
+        if not ENABLE_LANGFUSE_TRACING:
+            logger.debug("Langfuse tracing disabled in config (ENABLE_LANGFUSE_TRACING=False)")
+            return False
+    except ImportError:
+        # If config import fails, fall back to environment variable
+        if not _is_truthy(os.getenv("ENABLE_LANGFUSE_TRACING", "true")):
+            return False
 
     if get_client is None:
         if _LANGFUSE_IMPORT_ERROR and logger.isEnabledFor(logging.DEBUG):
             logger.debug("Langfuse SDK import failed: %s", _LANGFUSE_IMPORT_ERROR)
         return False
 
+    # Also respect the environment variable for runtime override
     if not _is_truthy(os.getenv("LANGFUSE_TRACING_ENABLED", "true")):
         return False
 

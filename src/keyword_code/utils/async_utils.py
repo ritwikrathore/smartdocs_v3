@@ -7,15 +7,45 @@ import concurrent.futures
 from typing import List, Callable, Any
 from ..config import logger
 
+# Import Langfuse context propagation
+try:
+    from langfuse.decorators import langfuse_context
+    _LANGFUSE_AVAILABLE = True
+except ImportError:
+    _LANGFUSE_AVAILABLE = False
+    langfuse_context = None
+
 
 def run_async(coro):
-    """Helper function to run async code in a thread-safe manner."""
+    """Helper function to run async code in a thread-safe manner.
+    
+    Captures and propagates Langfuse trace context across thread boundaries.
+    """
+    # Capture the current Langfuse context before crossing thread boundary
+    trace_id = None
+    if _LANGFUSE_AVAILABLE and langfuse_context is not None:
+        try:
+            trace_id = langfuse_context.get_current_trace_id()
+        except Exception as ctx_err:
+            logger.debug(f"Could not capture Langfuse trace context: {ctx_err}")
+    
+    def _run_with_context():
+        """Run the coroutine and set the Langfuse context if available."""
+        # Set the trace context in the new thread if we captured it
+        if trace_id and _LANGFUSE_AVAILABLE and langfuse_context is not None:
+            try:
+                langfuse_context.set_trace_id(trace_id)
+            except Exception as ctx_err:
+                logger.debug(f"Could not set Langfuse trace context in thread: {ctx_err}")
+        
+        return asyncio.run(coro)
+    
     try:
         loop = asyncio.get_event_loop_policy().get_event_loop()
         if loop.is_running():
-            # If a loop is running, create a future and run in executor
+            # If a loop is running, create a future and run in executor with context
             with concurrent.futures.ThreadPoolExecutor() as pool:
-                future = pool.submit(asyncio.run, coro)
+                future = pool.submit(_run_with_context)
                 return future.result()
         else:
             return loop.run_until_complete(coro)
