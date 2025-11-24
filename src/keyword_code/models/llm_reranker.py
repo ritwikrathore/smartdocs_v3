@@ -10,6 +10,7 @@ import numpy as np
 from typing import List, Tuple
 from ..config import logger
 from ..ai.databricks_llm import get_databricks_llm_client
+from ..text_utils import clean_and_parse_json
 from ..utils.langfuse_tracing import (
     optional_context,
     record_generation_error,
@@ -208,19 +209,24 @@ Respond with ONLY a single number between 0.0 and 1.0, nothing else."""
                 batch_prompt += f"Pair {i+1}:\nQuery: {query}\nDocument: {doc_text}\n\n"
 
             batch_prompt += f"""For each of the {len(sentence_pairs)} pairs above, provide a relevance score between 0.0 and 1.0.
-Respond with ONLY the scores, one per line, in order. Example format:
-0.8
-0.3
-0.9"""
+Respond with ONLY a JSON object containing a list of scores. The JSON should have this structure:
+{{
+  "scores": [
+    {{"index": 1, "score": 0.8}},
+    {{"index": 2, "score": 0.3}},
+    ...
+  ]
+}}
+Ensure you include all {len(sentence_pairs)} pairs."""
 
             messages = [
-                {"role": "system", "content": "You are a precise relevance scoring system. Respond only with numbers, one per line."},
+                {"role": "system", "content": "You are a precise relevance scoring system. Respond only with valid JSON."},
                 {"role": "user", "content": batch_prompt}
             ]
 
             # Calculate appropriate max_tokens based on number of pairs
-            # Each score is ~4 tokens (e.g., "0.85\n"), so we need ~4 * num_pairs tokens
-            max_tokens = min(4 * len(sentence_pairs) + 20, 500)
+            # Each score object {"index": 12, "score": 0.85} is ~15 tokens
+            max_tokens = min(20 * len(sentence_pairs) + 100, 2000)
 
             # Log the full request in DEBUG mode
             logger.debug("=" * 80)
@@ -290,37 +296,87 @@ Respond with ONLY the scores, one per line, in order. Example format:
                     logger.debug(score_text)
                     logger.debug("=" * 80)
 
-                    lines = score_text.split('\n')
-
-                    scores = []
-                    for line_num, line in enumerate(lines, 1):
-                        line = line.strip()
-                        if not line:
-                            continue
-
-                        try:
-                            # Try to extract just the number (handle cases like "1. 0.85" or "Score: 0.85")
-                            # First try direct float conversion
-                            score = float(line)
-                            scores.append(max(0.0, min(1.0, score)))
-                        except ValueError:
-                            # Try to extract number from text
-                            import re
-                            numbers = re.findall(r'0?\.\d+|[01]\.?\d*', line)
-                            if numbers:
-                                try:
-                                    score = float(numbers[0])
-                                    scores.append(max(0.0, min(1.0, score)))
-                                    logger.debug(f"Extracted score {score} from line: {line}")
-                                except ValueError:
-                                    logger.warning(f"Could not parse score from line {line_num}: {line}")
-                                    continue
+                    import json
+                    import re
+                    
+                    score_map = {}
+                    
+                    # Use the centralized helper to clean and parse JSON
+                    data = clean_and_parse_json(score_text)
+                    
+                    if data is not None:
+                        # Handle different possible JSON structures
+                        items = []
+                        if isinstance(data, dict):
+                            if "scores" in data and isinstance(data["scores"], list):
+                                items = data["scores"]
                             else:
-                                logger.warning(f"No number found in line {line_num}: {line}")
-                                continue
+                                # Maybe the dict itself is the list or has other keys?
+                                # Try to find any list in values
+                                for val in data.values():
+                                    if isinstance(val, list):
+                                        items = val
+                                        break
+                        elif isinstance(data, list):
+                            items = data
+                            
+                        # Process items
+                        for item in items:
+                            idx = -1
+                            score_val = -1.0
+                            
+                            if isinstance(item, dict):
+                                # Try to find index
+                                if "index" in item:
+                                    idx = int(item["index"]) - 1  # Convert 1-based to 0-based
+                                elif "pair" in item:
+                                    idx = int(item["pair"]) - 1
+                                    
+                                # Try to find score
+                                if "score" in item:
+                                    score_val = float(item["score"])
+                                elif "relevance" in item:
+                                    score_val = float(item["relevance"])
+                            elif isinstance(item, (int, float)):
+                                # Simple list of scores?
+                                # We can't be sure of index, but let's assume sequential if we have to
+                                pass
+                                
+                            if 0 <= idx < len(sentence_pairs) and score_val >= 0:
+                                score_map[idx] = max(0.0, min(1.0, score_val))
+                    
+                    # If JSON parsing failed or returned empty/invalid structure, try regex fallback
+                    if not score_map:
+                        logger.warning(f"JSON parsing failed or yielded no scores. Trying regex fallback.")
+                        # Fallback to regex parsing if JSON fails
+                        lines = score_text.split('\n')
+                        for line in lines:
+                            line = line.strip()
+                            if not line: continue
+                            
+                            # Try to match "Pair N: score" or similar patterns inside JSON-like text
+                            pair_match = re.search(r'(?:index|pair)["\s:]+(\d+).*?(?:score|relevance)["\s:]+([\d\.]+)', line, re.IGNORECASE)
+                            if pair_match:
+                                try:
+                                    idx = int(pair_match.group(1)) - 1
+                                    score_val = float(pair_match.group(2))
+                                    if 0 <= idx < len(sentence_pairs):
+                                        score_map[idx] = max(0.0, min(1.0, score_val))
+                                except ValueError:
+                                    pass
 
-                    # If we got the right number of scores, return them
-                    if len(scores) == len(sentence_pairs):
+                    # Check if we have scores for all pairs
+                    scores = []
+                    missing_indices = []
+                    
+                    for i in range(len(sentence_pairs)):
+                        if i in score_map:
+                            scores.append(score_map[i])
+                        else:
+                            missing_indices.append(i)
+                            
+                    # If we have all scores, return them
+                    if not missing_indices:
                         logger.info(f"✓ LLM reranker: Successfully scored {len(scores)} pairs in ONE batch call")
                         set_generation_output(
                             generation,
@@ -345,13 +401,13 @@ Respond with ONLY the scores, one per line, in order. Example format:
                         )
                         return np.array(scores)
                     else:
-                        logger.warning(f"✗ LLM batch scoring returned {len(scores)} scores, expected {len(sentence_pairs)}")
+                        logger.warning(f"✗ LLM batch scoring missing {len(missing_indices)} scores. Found: {len(scores)}")
                         logger.warning(f"Response was: {score_text[:200]}...")
                         logger.warning(f"Falling back to individual scoring for {len(sentence_pairs)} pairs")
                         record_generation_error(
                             generation,
-                            ValueError(f"Expected {len(sentence_pairs)} scores, got {len(scores)}"),
-                            metadata={"expected": len(sentence_pairs), "actual": len(scores)},
+                            ValueError(f"Batch scoring incomplete. Missing indices: {missing_indices}"),
+                            metadata={"expected": len(sentence_pairs), "found": len(scores), "missing": missing_indices},
                         )
 
                 except Exception as e:

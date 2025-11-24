@@ -59,11 +59,75 @@ def display_tools_column(results_with_real_analysis: List, tools_col):
         # Container for tools
         with st.container():
             # SmartChat Expander
-            with st.expander("💬 SmartChat (Multi-Document Chat)", expanded=False):
-                st.caption("Chat with multiple documents simultaneously to get cross-referenced answers and insights.")
-                if not st.session_state.get("preprocessed_data"):
-                    st.info("Upload and process documents to enable chat.")
+            with st.expander("💬 SmartChat (Multi-Document Chat)", expanded=False):                
+                # Initialize chat specific data if not exists
+                if "chat_specific_data" not in st.session_state:
+                    st.session_state.chat_specific_data = {}
+                
+                # Get available documents
+                main_docs = list(st.session_state.get("preprocessed_data", {}).keys())
+                chat_docs = list(st.session_state.chat_specific_data.keys())
+                all_docs = sorted(list(set(main_docs + chat_docs)))
+                
+                # Document Selection and Upload Row
+                sel_col, add_col = st.columns([0.85, 0.15])
+                
+                with sel_col:
+                    selected_docs = st.multiselect(
+                        "Select documents for chat context:",
+                        options=all_docs,
+                        default=all_docs,
+                        key="smart_chat_doc_selection",
+                        label_visibility="collapsed",
+                        placeholder="Select documents for chat..."
+                    )
+                
+                with add_col:
+                    # Document Upload for Chat
+                    with st.popover("➕", use_container_width=True, help="Add chat-only documents"):
+                        st.markdown("Upload documents **only for this chat session**. These will not affect the main analysis.")
+                        uploaded_chat_files = st.file_uploader(
+                            "Upload PDF or Word documents", 
+                            type=["pdf", "docx"], 
+                            accept_multiple_files=True,
+                            key="chat_file_uploader"
+                        )
+                        
+                        if uploaded_chat_files:
+                            # Import here to avoid circular dependency
+                            from ..app import preprocess_file
+                            files_processed = False
+                            for uploaded_file in uploaded_chat_files:
+                                if uploaded_file.name not in st.session_state.chat_specific_data:
+                                    with st.spinner(f"Processing {uploaded_file.name}..."):
+                                        file_bytes = uploaded_file.read()
+                                        # Reset file pointer just in case
+                                        uploaded_file.seek(0)
+                                        result = preprocess_file(
+                                            file_bytes, 
+                                            uploaded_file.name, 
+                                            storage_key="chat_specific_data"
+                                        )
+                                        if result["status"] == "success":
+                                            st.success(f"Added {uploaded_file.name}")
+                                            files_processed = True
+                                        else:
+                                            st.error(f"Failed to add {uploaded_file.name}: {result['message']}")
+                            
+                            if files_processed:
+                                st.rerun()
+
+                if not selected_docs:
+                    st.info("Please select or upload documents to start chatting.")
                 else:
+                    # Construct combined data for retrieval
+                    combined_data = {}
+                    for doc_name in selected_docs:
+                        if doc_name in st.session_state.get("preprocessed_data", {}):
+                            combined_data[doc_name] = st.session_state.preprocessed_data[doc_name]
+                        elif doc_name in st.session_state.chat_specific_data:
+                            combined_data[doc_name] = st.session_state.chat_specific_data[doc_name]
+
                     chat_container = st.container(height=400, border=True)
                     with chat_container:
                         # Use enumerate to get the index of each message in the session state list
@@ -130,7 +194,7 @@ def display_tools_column(results_with_real_analysis: List, tools_col):
                                         top_k_per_doc=RAG_TOP_K,
                                         embedding_model=embedding_model,
                                         reranker_model=reranker_model,  # Use local reranker model
-                                        preprocessed_data=st.session_state.get("preprocessed_data", {})
+                                        preprocessed_data=combined_data
                                     )
                                     analyzer = DocumentAnalyzer()
                                     logger.info(f"Generating chat response for: {prompt[:50]}...")
@@ -142,13 +206,16 @@ def display_tools_column(results_with_real_analysis: List, tools_col):
                                         )
                                     )
                                     logger.info("Chat response generated.")
-                                    processed_chat_text, chat_citation_details = process_chat_response_for_numbered_citations(raw_ai_response_content)
-
-                                    # Refresh PDF highlighting to reflect the new RAG chunks
+                                    
+                                    # Refresh PDF highlighting to reflect the new RAG chunks BEFORE processing citations
+                                    # This ensures that find_annotated_pdf_for_filename can find the newly generated/updated PDF
+                                    # in analysis_results, especially for chat-only documents.
                                     try:
                                         regenerate_annotated_pdfs_from_chat_chunks(relevant_chunks)
                                     except Exception as _e:
                                         logger.warning(f"Could not refresh PDF highlights for chat: {_e}")
+
+                                    processed_chat_text, chat_citation_details = process_chat_response_for_numbered_citations(raw_ai_response_content)
 
                                 # Record span output
                                 set_span_output(

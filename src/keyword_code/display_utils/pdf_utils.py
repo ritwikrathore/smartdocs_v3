@@ -33,6 +33,13 @@ def restore_original_bytes_if_needed(filename: str) -> Optional[bytes]:
     if orig_bytes:
         return orig_bytes
 
+    # Check chat_specific_data as well
+    chat_doc = st.session_state.get("chat_specific_data", {}).get(filename, {})
+    orig_bytes = chat_doc.get("original_bytes")
+
+    if orig_bytes:
+        return orig_bytes
+
     # If not found, try to restore from analysis_results
     logger.info(f"Original PDF bytes not in preprocessed_data for {filename}; attempting to restore from analysis_results.")
 
@@ -90,6 +97,7 @@ def regenerate_annotated_pdfs_from_chat_chunks(relevant_chunks: List[Dict[str, A
             chunks_by_file.setdefault(fname, []).append(rc)
 
         pre = st.session_state.get("preprocessed_data", {}) or {}
+        chat_data = st.session_state.get("chat_specific_data", {}) or {}
 
         for filename, file_chunks in chunks_by_file.items():
             # Try to get or restore original_bytes
@@ -98,7 +106,7 @@ def regenerate_annotated_pdfs_from_chat_chunks(relevant_chunks: List[Dict[str, A
                 logger.warning(f"Original PDF bytes not found for {filename}; skipping re-annotation.")
                 continue
 
-            pre_doc = pre.get(filename, {}) or {}
+            pre_doc = pre.get(filename) or chat_data.get(filename) or {}
 
             # Map chunk_id -> chunk metadata to access page_num and bboxes
             meta_chunks: List[Dict[str, Any]] = pre_doc.get("chunks", []) or []

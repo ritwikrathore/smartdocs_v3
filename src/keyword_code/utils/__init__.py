@@ -7,7 +7,7 @@ from ..display_utils import display_analysis_results, display_pdf_viewer, update
 from .file_manager import (
     create_temp_file, create_temp_dir,
     remove_temp_file, remove_temp_dir,
-    cleanup_session_files, cleanup_all_temp_files,
+    cleanup_session_files, cleanup_all_temp_files, cleanup_pycache,
     create_session_temp_file, get_session_id,
     update_session_access, cleanup_expired_sessions
 )
@@ -24,7 +24,7 @@ __all__ = [
     'clear_session_for_new_query',
     'display_analysis_results', 'display_pdf_viewer', 'update_pdf_view',
     'create_temp_file', 'create_temp_dir', 'remove_temp_file', 'remove_temp_dir',
-    'cleanup_session_files', 'cleanup_all_temp_files', 'create_session_temp_file',
+    'cleanup_session_files', 'cleanup_all_temp_files', 'cleanup_pycache', 'create_session_temp_file',
     'get_session_id', 'update_session_access', 'cleanup_expired_sessions',
     'get_memory_usage', 'check_memory_usage', 'cleanup_memory',
     'monitor_memory_usage', 'format_bytes',

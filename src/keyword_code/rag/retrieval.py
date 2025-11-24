@@ -6,7 +6,14 @@ import asyncio
 import re
 import numpy as np
 from typing import Any, Dict, List, Tuple, Optional, Set, Callable
-from ..config import logger, RAG_TOP_K, RAG_CANDIDATE_POOL_SIZE, RAG_WORKERS
+from ..config import (
+    logger,
+    RAG_TOP_K,
+    RAG_CANDIDATE_POOL_SIZE,
+    RAG_WORKERS,
+    RERANKER_MIN_SEND,
+    RERANKER_HIGH_SCORE_THRESHOLD,
+)
 from ..utils.async_utils import run_tasks_in_parallel, run_in_threadpool
 from ..utils.interaction_logger import (
     log_bm25_results,
@@ -137,6 +144,34 @@ def _summarize_chunk(
     return summary
 
 
+
+
+def _get_chunk_search_text(chunk: Dict[str, Any]) -> str:
+    """Return the canonical search text for a chunk.
+
+    Prefers the precomputed `search_text` field (used at embedding time) and
+    falls back to `format_chunk_with_metadata` or raw `text`. This keeps
+    BM25, semantic search, and reranking aligned with the same underlying
+    string that embeddings were built from.
+    """
+    try:
+        text = (chunk.get("search_text") or "").strip()
+    except Exception:
+        text = ""
+    if text:
+        return text
+
+    # Fallback: rebuild with hierarchical metadata
+    try:
+        formatted = (format_chunk_with_metadata(chunk) or "").strip()
+    except Exception:
+        formatted = ""
+    if formatted:
+        return formatted
+
+    # Final fallback: raw text only
+    return (chunk.get("text") or "").strip()
+
 def get_bm25_results(
     prompt: str,
     chunks: List[Dict[str, Any]],
@@ -151,7 +186,7 @@ def get_bm25_results(
     if BM25Okapi is None:
         logger.warning("BM25Okapi not available. BM25 retrieval will be skipped.")
         return []
-    
+
     term_list: List[str] = []
     if bm25_terms:
         for term in bm25_terms:
@@ -160,19 +195,31 @@ def get_bm25_results(
                 if cleaned:
                     term_list.append(cleaned)
 
-    query_text = " ".join(term_list) if term_list else prompt
-    if not query_text:
-        query_text = prompt
+    # For tracing: show if we're doing per-term or single-query search
+    if term_list:
+        query_label = f"per-term search: {term_list}"
+        trace_query = " OR ".join(term_list)[:200]
+    else:
+        query_label = "single query"
+        trace_query = prompt[:200]
 
     with optional_context(
         start_span(
             name="rag.bm25_retrieval",
-            input_data={"query": query_text[:200], "num_chunks": len(chunks), "top_k": top_k},
+            input_data={
+                "query": trace_query,
+                "num_chunks": len(chunks),
+                "top_k": top_k,
+                "search_mode": "per-term" if term_list else "single-query",
+                "num_terms": len(term_list) if term_list else 0,
+            },
             metadata={"operation": "rag.bm25"},
         )
     ) as span:
         try:
-            chunk_texts = [chunk.get("text", "").strip() for chunk in chunks]
+            # Build canonical search texts for BM25 using the same string used for embeddings
+            # Prefer the precomputed `search_text` field (if present) to keep everything aligned.
+            chunk_texts = [_get_chunk_search_text(chunk) for chunk in chunks]
             valid_indices = [i for i, text in enumerate(chunk_texts) if text]
             valid_texts = [chunk_texts[i] for i in valid_indices]
             if not valid_texts:
@@ -183,23 +230,85 @@ def get_bm25_results(
                     metadata={"num_results": 0, "error": "no_valid_texts"},
                 )
                 return []
-            
+
             tokenized_corpus = [text.lower().split() for text in valid_texts]
-            normalized_query = re.sub(r"\bOR\b", " ", query_text, flags=re.IGNORECASE)
-            normalized_query = re.sub(r"\bAND\b", " ", normalized_query, flags=re.IGNORECASE)
-            normalized_query = normalized_query.replace('"', ' ')
-            normalized_query = normalized_query.replace('(', ' ').replace(')', ' ')
-            tokenized_query = normalized_query.lower().split()
             bm25 = BM25Okapi(tokenized_corpus)
-            scores = bm25.get_scores(tokenized_query)
+
+            # If explicit bm25_terms were provided, run BM25 separately per-term
+            # and merge results. This ensures each term is independently searched
+            # (rather than joining them into one long query), which avoids
+            # diluting term-specific matches.
+            if term_list:
+                per_term_scores = []
+                term_to_scores = {}
+                for term_idx, term in enumerate(term_list):
+                    # Normalize term into tokens similar to corpus tokenization
+                    normalized_term = re.sub(r"\bOR\b", " ", term, flags=re.IGNORECASE)
+                    normalized_term = re.sub(r"\bAND\b", " ", normalized_term, flags=re.IGNORECASE)
+                    normalized_term = normalized_term.replace('"', ' ')
+                    normalized_term = normalized_term.replace('(', ' ').replace(')', ' ')
+                    tokenized_query = normalized_term.lower().split()
+
+                    # Create sub-span for each term search
+                    with optional_context(
+                        start_span(
+                            name="rag.bm25_term_search",
+                            input_data={
+                                "term": term,
+                                "normalized_tokens": tokenized_query[:10],  # Show first 10 tokens
+                                "term_index": term_idx + 1,
+                                "total_terms": len(term_list),
+                            },
+                            metadata={"operation": "rag.bm25_term_search"},
+                        )
+                    ) as term_span:
+                        try:
+                            scores = bm25.get_scores(tokenized_query)
+                        except Exception:
+                            # Fallback: treat term as raw tokens
+                            scores = bm25.get_scores(normalized_term.lower().split())
+
+                        per_term_scores.append(scores)
+                        term_to_scores[term] = scores
+
+                        # Log top-scoring chunks for this term
+                        if term_span is not None:
+                            top_indices_for_term = np.argsort(scores)[-min(3, len(scores)):][::-1]
+                            top_scores_for_term = scores[top_indices_for_term]
+                            set_span_output(
+                                term_span,
+                                output={
+                                    "num_chunks_scored": len(scores),
+                                    "top_score": float(top_scores_for_term[0]) if len(top_scores_for_term) > 0 else 0.0,
+                                },
+                                metadata={"term_index": term_idx + 1},
+                            )
+
+                # Merge per-term scores by taking the max score per document index
+                if per_term_scores:
+                    stacked = np.vstack(per_term_scores)
+                    merged_scores = np.max(stacked, axis=0)
+                else:
+                    merged_scores = np.zeros(len(valid_texts))
+
+                scores = merged_scores
+            else:
+                # No explicit terms provided — use prompt as a single query
+                normalized_query = re.sub(r"\bOR\b", " ", prompt, flags=re.IGNORECASE)
+                normalized_query = re.sub(r"\bAND\b", " ", normalized_query, flags=re.IGNORECASE)
+                normalized_query = normalized_query.replace('"', ' ')
+                normalized_query = normalized_query.replace('(', ' ').replace(')', ' ')
+                tokenized_query = normalized_query.lower().split()
+                scores = bm25.get_scores(tokenized_query)
+
             top_k_actual = min(top_k, len(scores))
             top_indices = np.argpartition(scores, -top_k_actual)[-top_k_actual:]
             top_scores = scores[top_indices]
             sorted_pairs = sorted(zip(top_indices, top_scores), key=lambda x: x[1], reverse=True)
-            results = [(valid_indices[idx], score) for idx, score in sorted_pairs]
+            results = [(valid_indices[idx], float(score)) for idx, score in sorted_pairs]
 
             # Log BM25 results
-            log_bm25_results(query_text, results, chunks)
+            log_bm25_results(trace_query, results, chunks)
 
             span_results = [
                 _summarize_chunk(
@@ -212,11 +321,27 @@ def get_bm25_results(
                 for position, (idx, score) in enumerate(results)
             ]
 
+            # Build full score map for all valid chunks so we can inspect BM25 scores in Langfuse
+            score_map = [
+                {"index": int(valid_indices[i]), "score": float(scores[i])}
+                for i in range(len(valid_indices))
+            ]
+
+            # Include truncated chunk texts (with metadata) in Langfuse trace output so
+            # we can inspect the exact inputs used for BM25 matching without flooding traces.
+            # Limit to top `top_k_actual` items to keep traces small.
+            search_texts = [
+                {"index": int(valid_indices[i]), "text": _truncate_text(valid_texts[i], limit=500)}
+                for i in range(min(top_k_actual, len(valid_indices)))
+            ]
+
             set_span_output(
                 span,
                 output={
                     "num_results": len(results),
                     "results": span_results,
+                    "search_texts": search_texts,
+                    "score_map": score_map,
                 },
                 metadata={
                     "num_results": len(results),
@@ -260,7 +385,8 @@ async def get_semantic_search_results(
         )
     ) as span:
         try:
-            chunk_texts = [chunk.get("text", "") for chunk in chunks]
+            # Use canonical search text (aligned with embeddings) for semantic search
+            chunk_texts = [_get_chunk_search_text(chunk) for chunk in chunks]
             use_precomputed = False
             if precomputed_embeddings is not None and valid_chunk_indices is not None:
                 test_embedding = await run_in_threadpool(
@@ -373,11 +499,26 @@ async def get_semantic_search_results(
 
             log_semantic_search_results(prompt, semantic_indices, chunks, semantic_scores)
 
+            # Build full semantic score map (index -> score) for all valid chunks
+            semantic_score_map = [
+                {"index": int(idx), "score": float(cosine_scores_np[i])}
+                for i, idx in enumerate(semantic_valid_indices)
+            ]
+
             set_span_output(
                 span,
                 output={
                     "num_results": len(semantic_indices),
                     "results": span_results,
+                    # Include a truncated view of the texts that were used for semantic embeddings/search.
+                    # We include the valid texts aligned with `semantic_valid_indices` so the trace shows
+                    # the same inputs that were encoded.
+                    "search_texts": [
+                        {"index": int(idx), "text": _truncate_text(chunk_texts[idx], limit=500)}
+                        for idx in (semantic_valid_indices or [])[: min(len(semantic_valid_indices or []), top_k)]
+                    ],
+                    # New: full semantic score map for all valid chunks
+                    "score_map": semantic_score_map,
                 },
                 metadata={
                     "num_results": len(semantic_indices),
@@ -392,13 +533,53 @@ async def get_semantic_search_results(
             return set(), [], np.array([]), []
 
 
+def format_chunk_with_metadata(chunk: Dict[str, Any]) -> str:
+    """
+    Prepends hierarchical metadata (Article/Section context) to chunk text
+    in a clean, readable format for better search relevance.
+    Format: "Article Title - Article X Section Y: {text}"
+    """
+    text = chunk.get("text", "")
+    metadata = chunk.get("metadata", {})
+
+    if not metadata or not isinstance(metadata, dict):
+        return text
+
+    # Build context string: prioritize titles, fallback to numbers
+    art_title = metadata.get("article_title", "")
+    art_num = metadata.get("article_number", "")
+    sec_title = metadata.get("section_title", "")
+    sec_num = metadata.get("section_number", "")
+
+    # Build context label
+    context_parts = []
+
+    # Add Article info
+    if art_title:
+        context_parts.append(art_title)
+    elif art_num:
+        context_parts.append(f"Article {art_num}")
+
+    # Add Section info (exclude verbose section_title from search text to avoid noisy embeddings)
+    if sec_num:
+        # Keep only the section number (e.g., "Section 5.01") and omit the section title
+        sec_label = f"Section {sec_num}"
+        context_parts.append(sec_label)
+
+    if not context_parts:
+        return text
+
+    # Format: "Title - Article X Section Y: {text}"
+    context_str = " - ".join(context_parts)
+    return f"{context_str}: {text}"
+
+
 async def rerank_results(
     prompt: str,
     chunks: List[Dict[str, Any]],
     combined_indices: List[int],
     reranker_model,
     top_k: int,
-    hyde_boosted_indices: Optional[Set[int]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Reranks the combined results using a reranker model.
@@ -428,48 +609,80 @@ async def rerank_results(
                 )
                 return []
 
-            # Prepare pairs for reranking
+            # Prepare pairs for reranking using the same canonical search text used for embeddings
             rerank_pairs = []
             for chunk_index in combined_indices:
-                chunk_text = chunks[chunk_index].get("text", "")
-                rerank_pairs.append([prompt, chunk_text])
+                chunk_text_with_context = _get_chunk_search_text(chunks[chunk_index])
+                rerank_pairs.append([prompt, chunk_text_with_context])
 
             # Run reranking - works with both CrossEncoder and DatabricksRerankerModel
             # as they both implement the predict method with the same interface
             # NOTE: Run synchronously to preserve Langfuse trace context
             rerank_scores = reranker_model.predict(rerank_pairs)
 
-            # Sort by score
+            # Sort by score (descending)
             reranked_pairs = list(zip(combined_indices, rerank_scores))
             reranked_pairs.sort(key=lambda x: x[1], reverse=True)
 
-            # Format results - IMPORTANT: Preserve ALL chunk data including bboxes for highlighting
-            results = []
-            for i in range(min(top_k, len(reranked_pairs))):
-                chunk_index, score = reranked_pairs[i]
+            # Build full list of reranked result chunks (preserve all fields)
+            all_results: List[Dict[str, Any]] = []
+            for position, (chunk_index, score) in enumerate(reranked_pairs):
                 chunk = chunks[chunk_index]
-                # Create a copy of the original chunk to preserve all fields (especially bboxes)
                 result_chunk = chunk.copy()
-                # Update with reranking score and method
                 result_chunk["score"] = float(score)
                 result_chunk["retrieval_method"] = "hybrid"
-                if hyde_boosted_indices and chunk_index in hyde_boosted_indices:
-                    result_chunk["hyde_boosted"] = True
-                results.append(result_chunk)
+                result_chunk["rank"] = position + 1
+                all_results.append(result_chunk)
 
-            # Log reranker results
-            log_reranker_results(prompt, results)
+            # Selection policy:
+            # - Minimum target: 15 non-zero scored items (if available)
+            # - If fewer than 15 non-zero scores exist, send only those
+            # - If many items have high reranker confidence (> 0.75), include ALL items with score > 0.75 (even if > 15)
+            MIN_SEND = RERANKER_MIN_SEND
+            HIGH_SCORE_THRESHOLD = RERANKER_HIGH_SCORE_THRESHOLD
+
+            nonzero_results = [r for r in all_results if (r.get("score") or 0.0) > 0.0]
+            high_results = [r for r in all_results if (r.get("score") or 0.0) > HIGH_SCORE_THRESHOLD]
+
+            selected: List[Dict[str, Any]] = []
+
+            if high_results and len(high_results) >= MIN_SEND:
+                # Many high-confidence items: return all above the high threshold
+                selected = high_results
+            else:
+                # Start with all high-confidence items (if any)
+                selected = list(high_results)
+                # Fill up to MIN_SEND using the highest-scoring non-zero items not already included
+                remaining_needed = max(0, MIN_SEND - len(selected))
+                if remaining_needed > 0:
+                    candidates_to_fill = [r for r in nonzero_results if r not in selected]
+                    selected.extend(candidates_to_fill[:remaining_needed])
+
+                # If there were no high-confidence items and non-zero count is less than MIN_SEND,
+                # return whatever non-zero results exist (could be less than MIN_SEND)
+                if not selected:
+                    # Fallback: if there are non-zero results, return them; otherwise return top-scoring items up to top_k
+                    if nonzero_results:
+                        selected = nonzero_results[:min(len(nonzero_results), MIN_SEND)]
+                    else:
+                        selected = all_results[:min(len(all_results), top_k)]
+
+            # Ensure deterministic ordering by score descending
+            selected.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+
+            # Log and trace the selected reranker results
+            log_reranker_results(prompt, selected)
 
             set_span_output(
                 span,
-                output={"num_results": len(results)},
+                output={"num_results": len(selected)},
                 metadata={
-                    "num_results": len(results),
-                    "top_score": results[0]["score"] if results else 0.0,
-                    "mean_score": float(np.mean([r["score"] for r in results])) if results else 0.0,
+                    "num_results": len(selected),
+                    "top_score": selected[0]["score"] if selected else 0.0,
+                    "mean_score": float(np.mean([r["score"] for r in selected])) if selected else 0.0,
                 },
             )
-            return results
+            return selected
 
         except Exception as e:
             logger.error(f"Error in reranking: {e}", exc_info=True)
@@ -489,8 +702,6 @@ async def retrieve_relevant_chunks_async(
     bm25_weight: float = 0.5,
     semantic_weight: float = 0.5,
     bm25_terms: Optional[List[str]] = None,
-    alternate_hyde_queries: Optional[List[str]] = None,
-    alternate_hyde_top_k: int = 5,
     candidate_pool_size: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     """
@@ -509,8 +720,7 @@ async def retrieve_relevant_chunks_async(
         bm25_weight: Weight for BM25 scores in hybrid combination (0-1)
         semantic_weight: Weight for semantic scores in hybrid combination (0-1)
         bm25_terms: Ordered list of lexical phrases that should be OR'ed together for BM25
-        alternate_hyde_queries: Optional list of speculative HYDE phrases to seed additional semantic retrieval
-        alternate_hyde_top_k: Number of HYDE-based semantic hits to request per speculative query
+        (Note: speculative HYDE seeding was disabled in this configuration.)
         candidate_pool_size: Number of candidates to retrieve before reranking (if None, uses RAG_CANDIDATE_POOL_SIZE or top_k)
     """
     if not chunks or not prompt or model is None:
@@ -525,7 +735,7 @@ async def retrieve_relevant_chunks_async(
     # Determine candidate pool size: use provided value, else RAG_CANDIDATE_POOL_SIZE if reranker available, else top_k
     if candidate_pool_size is None:
         candidate_pool_size = RAG_CANDIDATE_POOL_SIZE if reranker_model is not None else top_k
-    
+
     logger.info(
         f"RAG: Retrieving {candidate_pool_size} candidates for reranking, will return top {top_k} after reranking"
     )
@@ -572,51 +782,12 @@ async def retrieve_relevant_chunks_async(
         semantic_scores_dict: Dict[int, float] = {idx: score for idx, score in semantic_ranked}
         bm25_indices = {idx for idx, _ in bm25_results}
 
-        hyde_queries_cleaned: List[str] = []
-        if alternate_hyde_queries:
-            for query in alternate_hyde_queries:
-                if isinstance(query, str):
-                    cleaned_query = query.strip()
-                    if cleaned_query:
-                        hyde_queries_cleaned.append(cleaned_query)
-
-        hyde_scores_dict: Dict[int, float] = {}
-        hyde_ranked_results: List[Tuple[int, float]] = []
-        if hyde_queries_cleaned:
-            # HYDE still uses smaller top_k since it's for injection/boosting, not the main candidate pool
-            hyde_top_k = max(1, min(alternate_hyde_top_k, candidate_pool_size if candidate_pool_size > 0 else alternate_hyde_top_k))
-            hyde_debug_summary: List[Dict[str, Any]] = []
-            for hyde_query in hyde_queries_cleaned:
-                hyde_indices, hyde_valid_indices, hyde_cosine_scores, hyde_ranked = await get_semantic_search_results(
-                    prompt=hyde_query,
-                    chunks=chunks,
-                    model=model,
-                    top_k=hyde_top_k,
-                    precomputed_embeddings=precomputed_embeddings,
-                    valid_chunk_indices=valid_chunk_indices,
-                )
-                hyde_debug_summary.append({"query": hyde_query, "results": hyde_ranked})
-                for idx, score in hyde_ranked:
-                    existing = hyde_scores_dict.get(idx)
-                    if existing is None or score > existing:
-                        hyde_scores_dict[idx] = score
-
-            if hyde_scores_dict:
-                hyde_ranked_results = sorted(hyde_scores_dict.items(), key=lambda x: x[1], reverse=True)
-                hyde_ranked_results = hyde_ranked_results[:hyde_top_k]
-                for idx, score in hyde_ranked_results:
-                    semantic_scores_dict[idx] = max(semantic_scores_dict.get(idx, 0.0), score)
-
-            logger.info(
-                "RAG: HYDE alternate semantic search produced %d candidates across %d queries",
-                len(hyde_scores_dict),
-                len(hyde_queries_cleaned),
-            )
-            logger.debug("HYDE retrieval detail: %s", hyde_debug_summary)
+        # HyDE speculative semantic seeding has been disabled in this branch.
+        hyde_candidate_indices: Set[int] = set()
 
         combined_candidate_indices = set(bm25_indices) | set(semantic_scores_dict.keys())
         if not combined_candidate_indices:
-            logger.warning("RAG: No candidates returned from BM25, semantic, or HYDE searches.")
+            logger.warning("RAG: No candidates returned from BM25 or semantic searches.")
             return []
 
         candidate_scores: Dict[int, float] = {}
@@ -629,37 +800,10 @@ async def retrieve_relevant_chunks_async(
         # Use candidate_pool_size to get MORE candidates before reranking
         initial_candidates = [idx for idx, _ in sorted_candidates[:candidate_pool_size]] if sorted_candidates else []
 
-        hyde_ranked_indices = [idx for idx, _ in hyde_ranked_results]
-        hyde_boosted_indices: Set[int] = set(hyde_ranked_indices)
-        hyde_injected_indices: Set[int] = set()
+        # HyDE injection disabled — use initial candidates only
+        candidate_indices = list(initial_candidates)
 
-        if initial_candidates and hyde_ranked_indices:
-            hyde_new_candidates = [idx for idx in hyde_ranked_indices if idx not in initial_candidates]
-            if hyde_new_candidates:
-                # Calculate replacement limit based on candidate_pool_size, not final top_k
-                replace_limit = max(1, int(round(candidate_pool_size * 0.2))) if candidate_pool_size > 0 else 1
-                replace_count = min(len(initial_candidates), len(hyde_new_candidates), replace_limit)
-                if replace_count > 0:
-                    replaced_slice = initial_candidates[-replace_count:]
-                    initial_candidates = initial_candidates[:-replace_count] + hyde_new_candidates[:replace_count]
-                    hyde_injected_indices = set(hyde_new_candidates[:replace_count])
-                    logger.info(
-                        "RAG: Injected %d HYDE candidates replacing lowest-ranked originals for prompt '%s'",
-                        replace_count,
-                        prompt[:60],
-                    )
-                    logger.debug(
-                        "HYDE injected indices %s replacing %s",
-                        hyde_new_candidates[:replace_count],
-                        replaced_slice,
-                    )
-        elif not initial_candidates and hyde_ranked_indices:
-            initial_candidates = hyde_ranked_indices[:candidate_pool_size] if candidate_pool_size > 0 else hyde_ranked_indices
-            hyde_injected_indices = set(initial_candidates)
-
-        candidate_indices = list(dict.fromkeys(initial_candidates))
-
-        # Ensure we have candidate_pool_size candidates for reranking
+        # Ensure we have candidate_pool_size candidates for reranking (fill from sorted_candidates if needed)
         if len(candidate_indices) < candidate_pool_size:
             for idx, _ in sorted_candidates:
                 if idx not in candidate_indices:
@@ -667,21 +811,12 @@ async def retrieve_relevant_chunks_async(
                 if len(candidate_indices) >= candidate_pool_size:
                     break
 
-        if len(candidate_indices) < candidate_pool_size and hyde_ranked_indices:
-            for idx in hyde_ranked_indices:
-                if idx not in candidate_indices:
-                    candidate_indices.append(idx)
-                if len(candidate_indices) >= candidate_pool_size:
-                    break
-
         combined_indices = candidate_indices
         logger.info(
-            "RAG: Candidate pool assembled with %d items (BM25=%d, semantic=%d, hyde=%d, injected=%d)",
+            "RAG: Candidate pool assembled with %d items (BM25=%d, semantic=%d)",
             len(combined_indices),
             len(bm25_indices),
             len(semantic_scores_dict),
-            len(hyde_ranked_indices),
-            len(hyde_injected_indices),
         )
 
         # --- Step 4: Reranking of Combined Results ---
@@ -695,7 +830,6 @@ async def retrieve_relevant_chunks_async(
                 combined_indices=combined_indices,
                 reranker_model=reranker_model,
                 top_k=top_k,  # Return final top_k after reranking
-                hyde_boosted_indices=hyde_boosted_indices,
             )
         else:
             logger.warning("RAG: Reranker not available, using combined scores without reranking.")
@@ -712,8 +846,6 @@ async def retrieve_relevant_chunks_async(
                 # Update with computed score and method
                 result_chunk["score"] = score
                 result_chunk["retrieval_method"] = "hybrid_no_rerank"
-                if chunk_index in hyde_boosted_indices:
-                    result_chunk["hyde_boosted"] = True
                 results.append(result_chunk)
 
             # Sort results by score
@@ -739,8 +871,6 @@ def retrieve_relevant_chunks(
     bm25_weight: float = 0.5,
     semantic_weight: float = 0.5,
     bm25_terms: Optional[List[str]] = None,
-    alternate_hyde_queries: Optional[List[str]] = None,
-    alternate_hyde_top_k: int = 5,
     candidate_pool_size: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     """
@@ -761,8 +891,6 @@ def retrieve_relevant_chunks(
             bm25_weight=bm25_weight,
             semantic_weight=semantic_weight,
             bm25_terms=bm25_terms,
-            alternate_hyde_queries=alternate_hyde_queries,
-            alternate_hyde_top_k=alternate_hyde_top_k,
             candidate_pool_size=candidate_pool_size,
         )
     )

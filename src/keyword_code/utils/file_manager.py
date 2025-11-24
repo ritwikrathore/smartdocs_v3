@@ -183,6 +183,60 @@ def cleanup_all_temp_files() -> None:
     logger.info(f"Cleaned up {len(temp_files)} temporary files and {len(temp_dirs)} temporary directories")
 
 
+def cleanup_pycache() -> None:
+    """
+    Clean up all __pycache__ directories in the project source code.
+    This helps ensure fresh Python bytecode on each run.
+    Excludes virtual environments and external packages.
+    """
+    cache_dirs_removed = 0
+    cache_files_removed = 0
+    
+    try:
+        # Start from the project root (3 levels up from this file)
+        project_root = Path(__file__).parent.parent.parent.parent
+        
+        # Directories to exclude from cleanup (virtual environments, external packages, etc.)
+        exclude_dirs = {'.venv', 'venv', 'env', 'node_modules', '.git', 'site-packages'}
+        
+        # Find and remove all __pycache__ directories in project source
+        for pycache_dir in project_root.rglob("__pycache__"):
+            try:
+                # Skip if any parent directory is in exclude list
+                if any(excluded in pycache_dir.parts for excluded in exclude_dirs):
+                    logger.debug(f"Skipping excluded directory: {pycache_dir}")
+                    continue
+                    
+                if pycache_dir.is_dir():
+                    # Count files before removal
+                    file_count = len(list(pycache_dir.iterdir()))
+                    shutil.rmtree(pycache_dir, ignore_errors=True)
+                    cache_dirs_removed += 1
+                    cache_files_removed += file_count
+                    logger.debug(f"Removed __pycache__ directory: {pycache_dir}")
+            except Exception as e:
+                logger.error(f"Error removing __pycache__ directory {pycache_dir}: {str(e)}")
+        
+        # Also remove .pyc files that might exist outside __pycache__ (only in project source)
+        for pyc_file in project_root.rglob("*.pyc"):
+            try:
+                # Skip if any parent directory is in exclude list
+                if any(excluded in pyc_file.parts for excluded in exclude_dirs):
+                    continue
+                    
+                if pyc_file.is_file():
+                    os.remove(pyc_file)
+                    cache_files_removed += 1
+                    logger.debug(f"Removed .pyc file: {pyc_file}")
+            except Exception as e:
+                logger.error(f"Error removing .pyc file {pyc_file}: {str(e)}")
+        
+        if cache_dirs_removed > 0 or cache_files_removed > 0:
+            logger.info(f"Cleaned up {cache_dirs_removed} __pycache__ directories and {cache_files_removed} cache files")
+    except Exception as e:
+        logger.error(f"Error during Python cache cleanup: {str(e)}")
+
+
 def update_session_access(session_id: str) -> None:
     """
     Update the last access time for a session.
@@ -294,6 +348,9 @@ def _cleanup_at_exit():
     """Clean up all temporary files and directories when the application exits."""
     # First clean up registered files
     cleanup_all_temp_files()
+
+    # Clean up Python cache directories and .pyc files
+    cleanup_pycache()
 
     # Then clean up any old files that might have been missed
     cleanup_old_files()

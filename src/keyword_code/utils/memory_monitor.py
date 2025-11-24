@@ -7,7 +7,7 @@ import psutil
 import gc
 import logging
 import streamlit as st
-from typing import Dict, Any, Optional, List, Tuple
+from typing import Dict, Any, Optional, List, Tuple, Set
 from ..config import logger
 
 # Default memory thresholds (in percentage)
@@ -186,22 +186,63 @@ def _clear_large_session_objects() -> int:
     
     # List of keys for large objects that can be safely cleared
     large_object_keys = [
-        "chunk_embeddings",
+        # "chunk_embeddings", # Excluded to prevent re-computation during retries
         "original_bytes"
     ]
     
+    active_filenames = _get_active_filenames()
     cleared_count = 0
     
     # Check preprocessed_data for large objects
     if "preprocessed_data" in st.session_state and isinstance(st.session_state.preprocessed_data, dict):
         for filename, data in st.session_state.preprocessed_data.items():
             if isinstance(data, dict):
+                normalized_name = str(filename).strip()
+                if normalized_name in active_filenames:
+                    continue  # Skip active documents so retries do not lose embeddings
                 for key in large_object_keys:
-                    if key in data:
+                    if key in data and data[key] is not None:
                         data[key] = None
                         cleared_count += 1
     
     return cleared_count
+
+
+def _get_active_filenames() -> Set[str]:
+    """Return filenames that are currently in use and should retain cached assets."""
+    active: Set[str] = set()
+    if not hasattr(st, "session_state"):
+        return active
+
+    def _add_filename(value: Any):
+        if isinstance(value, str) and value.strip():
+            active.add(value.strip())
+
+    analysis_results = st.session_state.get("analysis_results")
+    if isinstance(analysis_results, list):
+        for item in analysis_results:
+            if isinstance(item, dict):
+                _add_filename(item.get("filename"))
+
+    _add_filename(st.session_state.get("current_pdf_name"))
+
+    rag_retry_requests = st.session_state.get("rag_retry_requests")
+    if isinstance(rag_retry_requests, dict):
+        for request in rag_retry_requests.values():
+            if isinstance(request, dict):
+                result_meta = request.get("result")
+                if isinstance(result_meta, dict):
+                    _add_filename(result_meta.get("filename"))
+
+    context_approvals = st.session_state.get("context_request_approvals")
+    if isinstance(context_approvals, dict):
+        for approval in context_approvals.values():
+            if isinstance(approval, dict):
+                result_meta = approval.get("result")
+                if isinstance(result_meta, dict):
+                    _add_filename(result_meta.get("filename"))
+
+    return active
 
 
 def monitor_memory_usage(

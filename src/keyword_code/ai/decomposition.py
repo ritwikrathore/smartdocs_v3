@@ -40,7 +40,6 @@ Each sub-prompt object must include:
 1. "title": concise descriptor (max 5-6 words)
 2. "sub_prompt": the exact question/analysis task text
 3. "rag_params": object with retrieval guidance
-4. "hyde": list (0-2) of hypothetical document excerpts for semantic search priming
 
 ## Retrieval Guidance (rag_params)
 - Set "retrieval_mode" to one of ["hybrid", "semantic", "bm25_dominant"]
@@ -48,26 +47,6 @@ Each sub-prompt object must include:
 - Emit "bm25_terms" as an array of literal phrases for lexical matching (e.g., ["investment number", "investment #"])
 - Explain choices in "reasoning"
 - Use "hybrid" (0.5/0.5) for balanced questions, "semantic" (0.3/0.7) for interpretive analysis, "bm25_dominant" (0.65/0.35) for precise term lookups
-
-## HYDE (Hypothetical Document Embeddings)
-CRITICAL: HYDE phrases are NOT answers. They are imaginary document excerpts used to prime semantic search.
-
-Your role: Generate 0-2 short phrases that resemble how the actual document MIGHT phrase the answer.
-- Write as if you're drafting a clause in the document style (formal legal/financial language)
-- Use realistic sample values (e.g., "$500 million", "24 months", "3.50% per annum") NOT placeholders like [amount] or [X]
-- Do NOT reference the document preview (e.g., don't say "on the first page" or "explicitly stated as")
-- Do NOT provide factual answers or make assertions
-- Focus on TERMINOLOGY and PHRASING patterns typical for this document type
-- Leave empty if you cannot imagine plausible document phrasing
-
-BAD HYDE (answering the question): "The Investment Number is explicitly stated as 51200 on the first page of the document."
-GOOD HYDE (document-like phrasing): "This facility is assigned Investment Number 51200."
-
-BAD HYDE (referencing preview): "As shown in Section 3.1, the borrower must..."
-GOOD HYDE (generic clause style): "The Borrower shall maintain a maximum leverage ratio of 3.50:1.00 as set forth in Schedule II."
-
-BAD HYDE (using placeholders): "The aggregate principal amount shall not exceed [amount] in [currency]."
-GOOD HYDE (realistic sample values): "The aggregate principal amount of the Loans shall not exceed $500,000,000 in U.S. dollars."
 
 Do not output any text outside the JSON object.
 
@@ -88,10 +67,7 @@ Example JSON Output:
                 "bm25_weight": 0.4,
                 "semantic_weight": 0.6,
                 "bm25_terms": ["lawful loan currency", "legal loan currency", "currency of the loan"],
-                "reasoning": "Definition clauses use varied terminology; semantic search helps find conceptually related terms",
-                "hyde": [
-                    "All amounts payable hereunder shall be denominated and paid in U.S. dollars, being the Lawful Loan Currency as defined in Article I."
-                ]
+                "reasoning": "Definition clauses use varied terminology; semantic search helps find conceptually related terms"
             }
         },
         {
@@ -102,10 +78,7 @@ Example JSON Output:
                 "bm25_weight": 0.5,
                 "semantic_weight": 0.5,
                 "bm25_terms": ["availability period", "commitment period", "drawdown period"],
-                "reasoning": "Standard loan timing term with consistent phrasing benefits from balanced retrieval",
-                "hyde": [
-                    "The Availability Period shall commence on the Closing Date and terminate on the date falling 24 months thereafter."
-                ]
+                "reasoning": "Standard loan timing term with consistent phrasing benefits from balanced retrieval"
             }
         }
     ]
@@ -128,10 +101,7 @@ Example JSON Output:
                 "bm25_weight": 0.3,
                 "semantic_weight": 0.7,
                 "bm25_terms": ["event of default", "default remedies", "acceleration"],
-                "reasoning": "Remedy language varies significantly; prioritize semantic matching to capture concept variations",
-                "hyde": [
-                    "Upon the occurrence of an Event of Default, the Lender may declare all outstanding amounts immediately due and payable."
-                ]
+                "reasoning": "Remedy language varies significantly; prioritize semantic matching to capture concept variations"
             }
         }
     ]
@@ -155,9 +125,6 @@ Example JSON Output:
                 "semantic_weight": 0.35,
                 "bm25_terms": ["applicable margin", "drawn margin"],
                 "reasoning": "Margin percentages appear verbatim in fee schedules; prioritize exact keyword hits",
-                "hyde": [
-                    "The applicable margin on drawn loans is 2.25 percent per annum, subject to leverage-based step downs as set forth in Schedule 1."
-                ]
             },
             "keywords": ["applicable margin", "drawn margin"]
         },
@@ -170,9 +137,6 @@ Example JSON Output:
                 "semantic_weight": 0.35,
                 "bm25_terms": ["applicable margin", "drawn margin", "margin on advances"],
                 "reasoning": "Margin percentages appear verbatim in fee schedules; prioritize exact keyword hits",
-                "hyde": [
-                    "The Applicable Margin for Loans shall be 3.50% per annum, subject to adjustment based on the Leverage Ratio."
-                ]
             }
         },
         {
@@ -184,9 +148,6 @@ Example JSON Output:
                 "semantic_weight": 0.3,
                 "bm25_terms": ["commitment fee", "undrawn commitment", "unutilized commitment"],
                 "reasoning": "Fee tables list exact phrasing; BM25 should lead with minimal semantic support",
-                "hyde": [
-                    "The Commitment Fee shall accrue at 0.35% per annum on the daily unused portion of the Commitments."
-                ]
             }
         }
     ]
@@ -210,9 +171,6 @@ Example JSON Output:
                 "semantic_weight": 0.3,
                 "bm25_terms": ["investment number", "investment no", "investment #"],
                 "reasoning": "Specific identifier requires precise lexical matching",
-                "hyde": [
-                    "This Investment Agreement is assigned Investment Number 51200."
-                ]
             }
         }
     ]
@@ -260,7 +218,7 @@ Example JSON Output:
                 "semantic_weight": 0.5,
                 "bm25_terms": [],
                 "reasoning": "Default balanced weights due to decomposition failure",
-                "hyde": []
+                
             },
             "bm25_terms": []
         }]
@@ -411,51 +369,6 @@ Example JSON Output:
 
         return normalized_terms
 
-    def _normalize_hyde_field(value: Any) -> List[str]:
-        phrases: List[str] = []
-
-        def _append_phrase(candidate: Any) -> None:
-            if isinstance(candidate, str):
-                cleaned = candidate.strip()
-                if cleaned:
-                    phrases.append(cleaned)
-            elif candidate is not None and not isinstance(candidate, (list, tuple, set, dict)):
-                cleaned = str(candidate).strip()
-                if cleaned:
-                    phrases.append(cleaned)
-
-        if isinstance(value, str):
-            _append_phrase(value)
-        elif isinstance(value, (list, tuple, set)):
-            for entry in value:
-                if isinstance(entry, (list, tuple, set)):
-                    for nested in entry:
-                        _append_phrase(nested)
-                else:
-                    _append_phrase(entry)
-        elif isinstance(value, dict):
-            for key in ("hyde", "phrases", "sentences", "text", "values"):
-                if key not in value:
-                    continue
-                candidate = value[key]
-                if isinstance(candidate, (list, tuple, set)):
-                    for nested in candidate:
-                        _append_phrase(nested)
-                else:
-                    _append_phrase(candidate)
-        elif value is not None:
-            _append_phrase(value)
-
-        normalized: List[str] = []
-        seen_local: Set[str] = set()
-        for phrase in phrases:
-            lowered = phrase.lower()
-            if lowered in seen_local:
-                continue
-            seen_local.add(lowered)
-            normalized.append(phrase)
-
-        return normalized[:2]
 
     try:
         parsed_json: Any = None
@@ -636,11 +549,9 @@ Example JSON Output:
                     rag_params["bm25_terms"] = bm25_terms
                     item["bm25_terms"] = bm25_terms
 
-                    hyde_phrases = _normalize_hyde_field(rag_params.get("hyde"))
-                    if not hyde_phrases and isinstance(item.get("hyde"), (list, tuple, set, dict, str)):
-                        hyde_phrases = _normalize_hyde_field(item.get("hyde"))
-                    rag_params["hyde"] = hyde_phrases
-                    item["hyde"] = hyde_phrases
+                    # HyDE output disabled: remove any 'hyde' fields provided by the model
+                    rag_params.pop("hyde", None)
+                    item.pop("hyde", None)
 
                     valid_items.append(item)
 

@@ -31,6 +31,7 @@ from ..utils.langfuse_tracing import (
     record_span_error,
     get_langfuse_client_cached,
 )
+# from ..app import process_followup_question  # Moved to local import to avoid circular dependency
 
 def _get_embedding_model():
     """Lazily retrieve the shared embedding model."""
@@ -205,6 +206,9 @@ def display_analysis_results(results: List[Dict[str, Any]]):
                             if re.match(r'^section_\d+_', section_key):
                                 # Extract just the title part after section_N_
                                 section_title = re.sub(r'^section_\d+_', '', section_key)
+                            elif re.match(r'^followup_\d+_\d+_', section_key):
+                                # Extract just the title part after followup_TIMESTAMP_N_
+                                section_title = re.sub(r'^followup_\d+_\d+_', '', section_key)
 
                             # Format section name for display
                             display_section_name = section_title.replace("_", " ").title()
@@ -583,171 +587,113 @@ def display_analysis_results(results: List[Dict[str, Any]]):
                                             st.caption("No supporting citations provided or found for this section.")
 
                             # Facts display removed per request (use Export Results > Export Facts)
+
+                        # --- Follow-up Question UI (Per Document) ---
+                        st.markdown('<hr style="margin: 20px 0; border: 0; border-top: 2px solid #e0e0e0;">', unsafe_allow_html=True)
+                        st.markdown('<div class="header-title" style="font-size: 1.3rem;">Follow-up Questions</div>', unsafe_allow_html=True)
+                        
+                        # Input for follow-up
+                        followup_key = f"followup_input_{i}_{filename}"
+                        followup_btn_key = f"followup_btn_{i}_{filename}"
+                        
+                        input_col, button_col = st.columns([0.90, 0.10], gap="small")
+                        with input_col:
+                            followup_q = st.text_input(
+                                "Ask a follow-up question for this document:",
+                                placeholder="e.g., Can you provide more details about the investment timeline?",
+                                key=followup_key
+                            )
+                        with button_col:
+                            st.markdown('<div style="margin-top: 28px;"></div>', unsafe_allow_html=True)
+                            ask_btn = st.button("➤", key=followup_btn_key, type="primary", disabled=not followup_q.strip(), use_container_width=True)
+                            
+                        if ask_btn and followup_q.strip():
+                            with st.spinner("Processing follow-up question..."):
+                                try:
+                                    # Import here to avoid circular dependency
+                                    from ..app import process_followup_question
+
+                                    # Get preprocessed data
+                                    preprocessed_data = st.session_state.get("preprocessed_data", {}).get(filename)
+                                    if not preprocessed_data:
+                                        st.error("Preprocessing data not found for this file.")
+                                    else:
+                                        # Call the new pipeline
+                                        new_results = process_followup_question(filename, followup_q, preprocessed_data)
+                                        
+                                        # Merge results
+                                        # 1. Merge analysis sections
+                                        current_analysis_json = result.get("ai_analysis", "{}")
+                                        try:
+                                            current_analysis = json.loads(current_analysis_json)
+                                        except json.JSONDecodeError:
+                                            current_analysis = {}
+                                            
+                                        if "analysis_sections" not in current_analysis:
+                                            current_analysis["analysis_sections"] = {}
+                                        
+                                        current_analysis["analysis_sections"].update(new_results["analysis_sections"])
+                                        result["ai_analysis"] = json.dumps(current_analysis)
+                                        
+                                        # 2. Merge verification results and phrase locations
+                                        if "verification_results" not in result:
+                                            result["verification_results"] = {}
+                                        result["verification_results"].update(new_results["verification_results"])
+                                        
+                                        if "phrase_locations" not in result:
+                                            result["phrase_locations"] = {}
+                                        result["phrase_locations"].update(new_results["phrase_locations"])
+                                        
+                                        # 3. Merge sub_prompt_results
+                                        if "sub_prompt_results" not in result:
+                                            result["sub_prompt_results"] = []
+                                        # Append new ones
+                                        result["sub_prompt_results"].extend(new_results.get("sub_prompt_results", []))
+                                        
+                                        # 4. Regenerate PDF
+                                        # We need to regenerate the PDF with ALL annotations
+                                        from ..processors.pdf_processor import PDFProcessor
+                                        original_bytes = preprocessed_data.get("original_bytes")
+                                        # Coerce common representations to raw bytes (base64 str, memoryview, bytearray)
+                                        if isinstance(original_bytes, str):
+                                            try:
+                                                original_bytes = base64.b64decode(original_bytes)
+                                            except Exception:
+                                                logger.warning("original_bytes for %s is a string but not valid base64; skipping annotation", filename)
+                                        elif isinstance(original_bytes, memoryview):
+                                            original_bytes = bytes(original_bytes)
+                                        elif isinstance(original_bytes, bytearray):
+                                            original_bytes = bytes(original_bytes)
+
+                                        # Try to restore if missing
+                                        if not isinstance(original_bytes, (bytes, bytearray)):
+                                            try:
+                                                from .pdf_utils import restore_original_bytes_if_needed
+
+                                                original_bytes = restore_original_bytes_if_needed(filename)
+                                            except Exception:
+                                                original_bytes = None
+
+                                        if original_bytes:
+                                            processor = PDFProcessor(original_bytes)
+                                            annotated_pdf_bytes = processor.add_annotations(result["phrase_locations"])
+                                            result["annotated_pdf"] = base64.b64encode(annotated_pdf_bytes).decode('utf-8')
+                                            
+                                            # Update PDF view if this file is currently being viewed
+                                            if st.session_state.get("current_pdf_name") == filename:
+                                                update_pdf_view(annotated_pdf_bytes, filename=filename)
+                                        
+                                        st.success("Follow-up analysis added!")
+                                        st.rerun()
+                                        
+                                except Exception as e:
+                                    logger.error(f"Error processing follow-up: {e}", exc_info=True)
+                                    st.error(f"Error: {str(e)}")
             else:  # No results_with_real_analysis
                 st.info("Processing complete, but no analysis sections were generated or found.")
 
-            # Add Follow-up Question Interface at the bottom of the analysis results
-            st.markdown('<hr style="margin: 20px 0; border: 0; border-top: 2px solid #e0e0e0;">', unsafe_allow_html=True)
-            st.markdown('<div class="header-title" style="font-size: 1.3rem;">Follow-up Questions [Beta]</div>', unsafe_allow_html=True)
+            # Old follow-up section removed
 
-            # Display existing follow-up Q&A if any
-            if st.session_state.get("followup_qa"):
-                for i, qa_pair in enumerate(st.session_state.get("followup_qa", [])):
-                    # Question
-                    st.markdown(f"""
-                    <div style='background-color: #e3f2fd; padding: 12px; border-radius: 8px; margin: 8px 0; border-left: 4px solid #1976d2;'>
-                        <strong>Q{i+1}:</strong> {qa_pair['question']}
-                    </div>
-                    """, unsafe_allow_html=True)
-
-                    # Answer with citations
-                    with st.container(border=True):
-                        processed_text = qa_pair.get("processed_text", qa_pair.get("answer", ""))
-                        citation_details = qa_pair.get("citation_details", [])
-
-                        # Display the answer text with Markdown rendering
-                        rendered_answer = render_limited_markdown(processed_text)
-                        st.markdown(f"""
-                        <div style='background-color: #f8f9fa; padding: 12px; border-radius: 8px; margin-bottom: 8px;'>
-                            <div style='color: #424242; line-height: 1.6;'>{rendered_answer}</div>
-                        </div>
-                        """, unsafe_allow_html=True)
-
-                        # Display citations if any
-                        if citation_details:
-                            with st.expander("Supporting Citations", expanded=False):
-                                # Use processed_text which contains the citation numbers [1], [2], etc.
-                                processed_answer_text = qa_pair.get("processed_text", qa_pair.get("answer", ""))
-                                relevant_chunks = qa_pair.get("relevant_chunks", [])
-                                display_followup_citations_like_main_analysis(citation_details, i, processed_answer_text, relevant_chunks)
-
-            # Follow-up question input with inline arrow button
-            input_col, button_col = st.columns([0.90, 0.10], gap="small")
-            with input_col:
-                followup_question = st.text_input(
-                    "Ask follow-up questions to get more specific insights about your documents. AI will use the same document context to provide detailed answers:",
-                    placeholder="e.g., Can you provide more details about the investment timeline?",
-                    key="followup_question_input"
-                )
-            with button_col:
-                # Add spacing to align button with input field
-                st.markdown('<div style="margin-top: 28px;"></div>', unsafe_allow_html=True)
-                ask_followup = st.button(
-                    "➤",
-                    key="ask_followup_button",
-                    type="primary",
-                    disabled=not followup_question.strip(),
-                    use_container_width=True,
-                    help="Submit follow-up question"
-                )
-
-            # Process follow-up question
-            if ask_followup and followup_question.strip():
-                with st.spinner("Processing your follow-up question..."):
-                    try:
-                        logger.info(f"Processing follow-up question: {followup_question[:50]}...")
-
-                        # Get trace_id from the first available result to link follow-up to parent trace
-                        parent_trace_id = None
-                        for result in results_with_real_analysis:
-                            result_dict = result[0] if isinstance(result, tuple) else result
-                            if isinstance(result_dict, dict):
-                                parent_trace_id = result_dict.get("trace_id")
-                                if parent_trace_id:
-                                    logger.debug(f"Using parent trace_id for follow-up: {parent_trace_id}")
-                                    break
-
-                        # Create trace_context for linking to parent trace
-                        trace_context_dict = None
-                        if parent_trace_id:
-                            trace_context_dict = {"trace_id": parent_trace_id}
-
-                        # Wrap follow-up processing in a span linked to the parent trace
-                        span_metadata = {
-                            "question_length": len(followup_question),
-                            "parent_trace_id": parent_trace_id,
-                        }
-
-                        with start_span(
-                            name="follow-up-question",
-                            input_data={"question": followup_question},
-                            metadata=span_metadata,
-                        ) as followup_span:
-                            try:
-                                # If we have a parent trace, manually link this span
-                                if trace_context_dict and followup_span:
-                                    try:
-                                        langfuse_client = get_langfuse_client_cached()
-                                        if langfuse_client:
-                                            # The span is already created, but we log that it should be under the parent
-                                            logger.debug(f"Follow-up span created, intended parent trace: {parent_trace_id}")
-                                    except Exception as link_err:
-                                        logger.debug(f"Could not link span to parent trace: {link_err}")
-
-                                # Use the same RAG pipeline as chat with same retrieval depth as main analysis
-                                relevant_chunks = retrieve_relevant_chunks_for_chat(
-                                    prompt=followup_question,
-                                    top_k_per_doc=RAG_TOP_K,
-                                    embedding_model=embedding_model,
-                                    reranker_model=reranker_model,
-                                    preprocessed_data=st.session_state.get("preprocessed_data", {})
-                                )
-
-                                # Generate response using the same analyzer
-                                # The generate_chat_response function now has its own generation span
-                                analyzer = DocumentAnalyzer()
-                                raw_response = run_async(
-                                    generate_chat_response(
-                                        analyzer,
-                                        followup_question,
-                                        relevant_chunks
-                                    )
-                                )
-
-                                # Process response for citations
-                                processed_text, citation_details = process_chat_response_for_numbered_citations(raw_response)
-
-                                # Refresh PDF highlighting to reflect the new RAG chunks
-                                try:
-                                    regenerate_annotated_pdfs_from_chat_chunks(relevant_chunks)
-                                except Exception as _e:
-                                    logger.warning(f"Could not refresh PDF highlights for follow-up: {_e}")
-
-                                # Store the Q&A pair with relevant chunks for score information
-                                qa_pair = {
-                                    "question": followup_question,
-                                    "answer": raw_response,
-                                    "processed_text": processed_text,
-                                    "citation_details": citation_details,
-                                    "relevant_chunks": relevant_chunks,  # Store chunks for score information
-                                    "timestamp": datetime.now().isoformat()
-                                }
-
-                                # Record span output
-                                set_span_output(
-                                    followup_span,
-                                    output={"answer_length": len(raw_response), "num_citations": len(citation_details)},
-                                    metadata={"num_chunks_used": len(relevant_chunks)},
-                                )
-
-                                # Ensure followup_qa exists before appending
-                                if "followup_qa" not in st.session_state:
-                                    st.session_state.followup_qa = []
-                                st.session_state.followup_qa.append(qa_pair)
-                                logger.info("Follow-up question processed successfully")
-
-                            except Exception as span_err:
-                                logger.error(f"Error in follow-up span: {span_err}", exc_info=True)
-                                if followup_span:
-                                    record_span_error(followup_span, span_err)
-                                raise
-
-                        # Clear the input and rerun to show the new Q&A
-                        st.rerun()
-
-                    except Exception as e:
-                        logger.error(f"Error processing follow-up question: {e}", exc_info=True)
-                        st.error(f"Sorry, an error occurred while processing your follow-up question: {str(e)}")
 
     # Right Column: Tools & PDF Viewer
     from .tools_column import display_tools_column

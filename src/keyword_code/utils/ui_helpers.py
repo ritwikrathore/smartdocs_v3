@@ -13,8 +13,9 @@ from .file_manager import (
 import logging
 
 
-def apply_ui_styling():
-    """Apply CSS styling for the app UI"""
+@st.cache_data(show_spinner=False)
+def _get_ui_css():
+    """Generate and cache the CSS for the UI."""
     # Get the base64-encoded font data for local Material Icons
     import os
     import base64
@@ -82,7 +83,7 @@ def apply_ui_styling():
     else:
         logger.warning(f"Material Icons Outlined font file not found at: {font_outlined_path}")
     
-    st.markdown(f"""
+    return f"""
     <style>
         {material_icons_css}
         
@@ -158,7 +159,12 @@ def apply_ui_styling():
         .file-icon {{ color: #1976d2; margin-right: 8px; }}
         .stButton > button {{ margin-top: 0 !important; padding-top: 2px !important; padding-bottom: 2px !important; line-height: 1.2 !important; }}
     </style>
-    """, unsafe_allow_html=True)
+    """
+
+
+def apply_ui_styling():
+    """Apply CSS styling for the app UI"""
+    st.markdown(_get_ui_css(), unsafe_allow_html=True)
 
 
 def render_branding():

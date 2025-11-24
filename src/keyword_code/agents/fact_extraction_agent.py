@@ -9,16 +9,20 @@ from typing import Dict, List, Any, Optional, Union
 from enum import Enum
 from pydantic import BaseModel, Field, field_validator, ValidationError
 from pydantic_ai import Agent, RunContext
-from pydantic_ai.models.openai import OpenAIChatModel
+from pydantic_ai.models.openai import OpenAIModel
+from pydantic_ai.providers.openai import OpenAIProvider
 import os
 import re
 
 from ..config import logger
 from ..ai.databricks_llm import DatabricksLLMClient, DATABRICKS_BASE_URL, DATABRICKS_LLM_MODEL
+from ..text_utils import clean_and_parse_json
 
 
 def strip_markdown_json(response: str) -> str:
     """
+    DEPRECATED: Use text_utils.clean_and_parse_json instead.
+    
     Strip markdown code block formatting from JSON responses.
 
     LLMs often wrap JSON in ```json ... ``` blocks, which breaks JSON parsing.
@@ -183,10 +187,14 @@ class FactTypeIdentificationAgent:
         self.databricks_client = databricks_client
         self.model = self._create_databricks_model()
         
+        # Ensure model was created successfully
+        if self.model is None:
+            raise RuntimeError("Failed to create Databricks model for fact type identification agent. Check logs for details.")
+        
         # Create the agent for fact type identification
         self.agent = Agent(
             model=self.model,
-            result_type=FactTypeAnalysis,
+            output_type=FactTypeAnalysis,
             system_prompt="""You are an expert at analyzing queries to identify what types of facts should be extracted.
 
 Your job is to analyze a user's query or sub-prompt and determine what types of factual information they are looking for.
@@ -220,16 +228,20 @@ Analyze the query and identify the expected fact types."""
             if not api_key:
                 raise RuntimeError("DATABRICKS_API_KEY is not set in environment variables")
 
-            # Use OpenAIModel without structured output constraints
-            # Databricks doesn't support all JSON schema features
-            return OpenAIChatModel(
-                model_name=DATABRICKS_LLM_MODEL,
+            # Use OpenAIModel without structured output constraints via a Databricks-aware provider
+            provider = OpenAIProvider(
                 base_url=DATABRICKS_BASE_URL,
-                api_key=api_key
+                api_key=api_key,
             )
+            model = OpenAIModel(
+                model_name=DATABRICKS_LLM_MODEL,
+                provider=provider,
+            )
+            logger.info(f"Successfully created Databricks model for fact type identification: {DATABRICKS_LLM_MODEL}")
+            return model
         except Exception as e:
-            logger.error(f"Error creating Databricks model: {e}")
-            return None
+            logger.error(f"Error creating Databricks model for fact type identification: {e}")
+            raise
     
     async def identify_fact_types(self, query: str, context: str = "") -> FactTypeAnalysis:
         """
@@ -274,16 +286,27 @@ Analyze the query and identify the expected fact types."""
                 {"role": "user", "content": prompt}
             ]
 
-            response = self.databricks_client.get_completion(messages, max_tokens=1000)
+            response_data = self.databricks_client.get_completion(messages, max_tokens=1000)
 
-            if not response:
+            if not response_data or not response_data.get("content"):
                 raise ValueError("No response from LLM")
 
-            # Strip markdown code blocks if present
-            response_clean = strip_markdown_json(response)
+            response = response_data["content"]
 
-            # Parse JSON response
-            response_json = json.loads(response_clean)
+            # Parse JSON response using centralized helper
+            response_json = clean_and_parse_json(response)
+            
+            if not response_json:
+                logger.error("Failed to parse JSON from response")
+                logger.error(f"Original response: {response[:500]}...")
+                # Return default analysis
+                return FactTypeAnalysis(
+                    query=query,
+                    expected_fact_types=[FactType.DEFINITION],
+                    reasoning="Default to definition type due to JSON parsing error",
+                    confidence=0.3,
+                    extraction_hints=[]
+                )
 
             # Convert to FactTypeAnalysis
             return FactTypeAnalysis(
@@ -294,20 +317,6 @@ Analyze the query and identify the expected fact types."""
                 extraction_hints=response_json.get("extraction_hints", [])
             )
 
-        except json.JSONDecodeError as e:
-            logger.error(f"JSON parsing error in fact type identification: {e}")
-            if 'response' in locals():
-                logger.error(f"Original response: {response[:500]}...")
-            if 'response_clean' in locals():
-                logger.error(f"Cleaned response: {response_clean[:500]}...")
-            # Return default analysis
-            return FactTypeAnalysis(
-                query=query,
-                expected_fact_types=[FactType.DEFINITION],
-                reasoning="Default to definition type due to JSON parsing error",
-                confidence=0.3,
-                extraction_hints=[]
-            )
         except Exception as e:
             logger.error(f"Error in fact type identification: {e}", exc_info=True)
             # Return default analysis
@@ -329,10 +338,14 @@ class FactExtractionAgent:
         self.databricks_client = databricks_client
         self.model = self._create_databricks_model()
         
+        # Ensure model was created successfully
+        if self.model is None:
+            raise RuntimeError("Failed to create Databricks model for fact extraction agent. Check logs for details.")
+        
         # Create the agent for fact extraction
         self.agent = Agent(
             model=self.model,
-            result_type=FactExtractionResult,
+            output_type=FactExtractionResult,
             system_prompt="""You are an expert at extracting structured facts from analysis text.
 
 Your job is to extract specific facts from analysis text based on the expected fact types.
@@ -367,15 +380,20 @@ Be thorough and accurate in your extractions."""
             api_key = os.environ.get("DATABRICKS_API_KEY")
             if not api_key:
                 raise RuntimeError("DATABRICKS_API_KEY is not set in environment variables")
-            
-            return OpenAIChatModel(
-                model_name=DATABRICKS_LLM_MODEL,
+
+            provider = OpenAIProvider(
                 base_url=DATABRICKS_BASE_URL,
-                api_key=api_key
+                api_key=api_key,
             )
+            model = OpenAIModel(
+                model_name=DATABRICKS_LLM_MODEL,
+                provider=provider,
+            )
+            logger.info(f"Successfully created Databricks model for fact extraction: {DATABRICKS_LLM_MODEL}")
+            return model
         except Exception as e:
-            logger.error(f"Error creating Databricks model: {e}")
-            return None
+            logger.error(f"Error creating Databricks model for fact extraction: {e}")
+            raise
     
     async def extract_facts(
         self,
@@ -467,16 +485,18 @@ Be thorough and accurate in your extractions."""
                     {"role": "user", "content": prompt}
                 ]
 
-                response = self.databricks_client.get_completion(messages, max_tokens=4000)
+                response_data = self.databricks_client.get_completion(messages, max_tokens=4000)
 
-                if not response:
+                if not response_data or not response_data.get("content"):
                     raise ValueError("No response from LLM")
 
-                # Strip markdown code blocks if present
-                response_clean = strip_markdown_json(response)
+                response = response_data["content"]
 
-                # Parse JSON response
-                response_json = json.loads(response_clean)
+                # Parse JSON response using centralized helper
+                response_json = clean_and_parse_json(response)
+                
+                if not response_json:
+                    raise ValueError(f"Failed to parse JSON from response: {response[:100]}...")
 
                 # Convert to FactExtractionResult
                 extracted_facts = []
@@ -562,14 +582,12 @@ Be thorough and accurate in your extractions."""
 
                 return extraction_result
 
-            except json.JSONDecodeError as e:
-                logger.error(f"JSON parsing error on attempt {attempt + 1}: {e}")
+            except Exception as e:
+                logger.error(f"Error on attempt {attempt + 1}: {e}")
                 if 'response' in locals():
                     logger.error(f"Original response: {response[:500]}...")
-                if 'response_clean' in locals():
-                    logger.error(f"Cleaned response: {response_clean[:500]}...")
-                last_error = f"JSON parsing error: {str(e)}"
-                validation_errors.append(f"JSON parsing error: {str(e)}")
+                last_error = str(e)
+                validation_errors.append(str(e))
                 attempt += 1
 
             except ValidationError as e:

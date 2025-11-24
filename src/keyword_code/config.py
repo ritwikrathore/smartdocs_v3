@@ -30,7 +30,7 @@ if ENABLE_APP_LOGGING:
 
 # Configure root logger
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format="%(asctime)s - %(threadName)s - %(name)s - %(levelname)s - %(message)s",
     handlers=handlers
 )
@@ -76,7 +76,18 @@ ADAPTIVE_CHUNK_MIN_CHARS = int(os.environ.get("ADAPTIVE_CHUNK_MIN_CHARS", 450))
 ADAPTIVE_CHUNK_MAX_CHARS = int(os.environ.get("ADAPTIVE_CHUNK_MAX_CHARS", 900))
 ADAPTIVE_CHUNK_MIN_SENTENCES = int(os.environ.get("ADAPTIVE_CHUNK_MIN_SENTENCES", 3))
 ADAPTIVE_CHUNK_MAX_SENTENCES = int(os.environ.get("ADAPTIVE_CHUNK_MAX_SENTENCES", 8))
-ADAPTIVE_CHUNK_OVERLAP_SENTENCES = int(os.environ.get("ADAPTIVE_CHUNK_OVERLAP_SENTENCES", 2))
+ADAPTIVE_CHUNK_OVERLAP_SENTENCES = int(os.environ.get("ADAPTIVE_CHUNK_OVERLAP_SENTENCES", 1))
+
+# --- Chunk Overlap Configuration ---
+# If set, chunkers will use this overlap ratio (0.0-1.0) as the default percentage overlap
+# between consecutive chunks. If None, legacy integer-based `overlap_sentences` applies.
+CHUNK_OVERLAP_RATIO = 0.2
+try:
+    env_val = os.environ.get("CHUNK_OVERLAP_RATIO")
+    if env_val is not None and env_val != "":
+        CHUNK_OVERLAP_RATIO = float(env_val)
+except Exception:
+    CHUNK_OVERLAP_RATIO = None
 
 # --- Model Paths ---
 # Using Databricks for all models, no local models needed
@@ -85,11 +96,11 @@ RERANKER_MODEL_PATH = os.environ.get("RERANKER_MODEL_PATH", "src/keyword_code/re
 
 # --- Interaction Logging Configuration ---
 # Set to True to enable detailed logging of BM25, semantic search, reranker, and LLM interactions
-ENABLE_INTERACTION_LOGGING = True  # Disabled by default
+ENABLE_INTERACTION_LOGGING = False  # Disabled by default
 
 # --- Highlight Debug Logging Configuration ---
 # Set to True to enable detailed logging of phrase matching attempts for highlight debugging
-ENABLE_HIGHLIGHT_DEBUG_LOGGING = True  # Disabled by default
+ENABLE_HIGHLIGHT_DEBUG_LOGGING = False  # Disabled by default
 
 # Create highlight debug logger if enabled
 highlight_debug_logger = None
@@ -119,10 +130,24 @@ RERANKER_MAX_TOKENS = 512  # Maximum token length for the reranker model
 RERANKER_API_TIMEOUT = 60  # Timeout in seconds for reranker API calls at startup
 ENABLE_LLM_RERANKER_FALLBACK = True  # Enable automatic fallback to LLM-based reranker on API failure
 
+# Reranker selection thresholds (configurable)
+RERANKER_MIN_SEND = int(os.environ.get("RERANKER_MIN_SEND", 15))
+RERANKER_HIGH_SCORE_THRESHOLD = float(os.environ.get("RERANKER_HIGH_SCORE_THRESHOLD", 0.75))
+
 # --- LLM Configuration ---
 # Using Databricks LLM
 DECOMPOSITION_MODEL_NAME = "databricks-llama-4-maverick"  # Databricks model name
 ANALYSIS_MODEL_NAME = "databricks-llama-4-maverick"  # Databricks model name
+
+# --- Search Text Configuration ---
+# When building `search_text` for chunks, optionally truncate the chunk body to this many characters.
+# Set to 0 (default) to keep full chunk text. Truncation applies after prepending context metadata.
+# NOTE: This value is now a fixed default (not driven by environment variables).
+SEARCH_TEXT_TRUNCATE_CHARS = 0
+
+# Toggle whether to include hierarchical context when building search text (default: True)
+# NOTE: This value is now a fixed default (not driven by environment variables).
+INCLUDE_CONTEXT_IN_SEARCH = True
 
 # --- LLM Retry Configuration ---
 LLM_MAX_RETRIES = int(os.environ.get("LLM_MAX_RETRIES", 3))

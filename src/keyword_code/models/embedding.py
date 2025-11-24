@@ -31,6 +31,7 @@ def load_embedding_model():
         return None
 
 # --- Load Reranker Model (Shared) ---
+@st.cache_resource(show_spinner="Calibrating the reranker ⚙️…")
 def load_reranker_model():
     """
     Loads the reranker model (Databricks API or LLM fallback) and returns it, or None if not available.

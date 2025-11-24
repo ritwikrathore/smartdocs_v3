@@ -21,7 +21,7 @@ from typing import List
 
 # Import necessary components directly from the modules
 from src.keyword_code.models.embedding import load_embedding_model
-from src.keyword_code.app import preprocess_file, process_file_wrapper
+from src.keyword_code.app import preprocess_file, process_file_wrapper, get_reranker_model
 from src.keyword_code.display_utils import display_analysis_results, display_pdf_viewer, update_pdf_view
 from src.keyword_code.display_utils.pdf_utils import restore_original_bytes_if_needed
 from src.keyword_code.utils.async_utils import run_async
@@ -82,7 +82,14 @@ with _center_col:
     </style>
     """, unsafe_allow_html=True)
 
-    new_mode = st.radio("", ["Ask", "Review"], index=(0 if st.session_state.smartdocs_mode == "Ask" else 1), horizontal=True, key="mode_switch_main")
+    new_mode = st.radio(
+        "Mode",  # Non-empty label for accessibility
+        ["Ask", "Review"],
+        index=(0 if st.session_state.smartdocs_mode == "Ask" else 1),
+        horizontal=True,
+        key="mode_switch_main",
+        label_visibility="collapsed"  # Hide label visually
+    )
 if new_mode != st.session_state.smartdocs_mode:
     st.session_state.smartdocs_mode = new_mode
     st.rerun()
@@ -458,6 +465,7 @@ def process_rag_requests(results: list[dict[str, any]]) -> tuple[list[dict[str, 
         if hasattr(st.session_state, 'rag_retry_requests'):
             from src.keyword_code.rag.retrieval import retrieve_relevant_chunks_async
             from src.keyword_code.models.embedding import load_reranker_model
+            from src.keyword_code.utils.langfuse_tracing import continue_trace
 
             for section_key, request_data in st.session_state.rag_retry_requests.items():
                 if request_data.get("status") == "requested":
@@ -553,7 +561,7 @@ def process_rag_requests(results: list[dict[str, any]]) -> tuple[list[dict[str, 
 
                         # Models
                         emb_model = get_embedding_model()
-                        reranker_model = load_reranker_model()
+                        reranker_model = get_reranker_model()
 
                         # Compute a baseline set of current results to inform the agent
                         current_results = run_async(
@@ -589,7 +597,19 @@ def process_rag_requests(results: list[dict[str, any]]) -> tuple[list[dict[str, 
                         )
 
                         # Run retry with optimization
-                        new_results, analysis = run_async(retry_tool.retry_with_optimization(context))
+                        # Find trace_id for this file
+                        trace_id = None
+                        if hasattr(st.session_state, 'analysis_results'):
+                            for res in st.session_state.analysis_results:
+                                if isinstance(res, dict) and res.get("filename") == filename:
+                                    trace_id = res.get("trace_id")
+                                    break
+                        
+                        if trace_id:
+                            with continue_trace(trace_id, name="rag.retry", input={"query": query, "section": section_key}) as span:
+                                new_results, analysis = run_async(retry_tool.retry_with_optimization(context))
+                        else:
+                            new_results, analysis = run_async(retry_tool.retry_with_optimization(context))
 
                         # Persist base retrieval results for UI consumption
                         st.session_state.rag_retry_results[section_key] = {

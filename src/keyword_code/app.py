@@ -44,7 +44,8 @@ import streamlit_pills as stp # For clickable prompt suggestions
 # Import from our modules
 from .config import (
     logger, MAX_WORKERS, ENABLE_PARALLEL, RAG_TOP_K, RERANKER_MODEL_PATH,
-    USE_DATABRICKS_RERANKER, ENABLE_INTERACTION_LOGGING, SAVED_PROMPTS
+    USE_DATABRICKS_RERANKER, ENABLE_INTERACTION_LOGGING, SAVED_PROMPTS,
+    INCLUDE_CONTEXT_IN_SEARCH, SEARCH_TEXT_TRUNCATE_CHARS,
 )
 from .utils.helpers import get_base64_encoded_image, normalize_text, remove_markdown_formatting
 from .utils.async_utils import run_async
@@ -76,7 +77,7 @@ from .utils.langfuse_tracing import (
 from .models.embedding import load_embedding_model, load_reranker_model
 from .processors.pdf_processor import PDFProcessor
 from .processors.word_processor import WordProcessor
-from .rag.retrieval import retrieve_relevant_chunks, retrieve_relevant_chunks_for_chat
+from .rag.retrieval import retrieve_relevant_chunks, retrieve_relevant_chunks_for_chat, format_chunk_with_metadata
 from .ai.analyzer import DocumentAnalyzer
 from .ai.chat import generate_chat_response
 from .services.keyword_mode_service import KeywordModeService
@@ -192,6 +193,13 @@ def _build_chunk_trace_payload(chunks: Sequence[Dict[str, Any]]) -> List[Dict[st
             "char_count": len(text) if isinstance(text, str) else None,
             "text": _truncate_chunk_text(text),
         }
+
+        # Include search_text: either from cache or generate it with hierarchical context
+        search_text = chunk.get("search_text")
+        if not search_text:
+            search_text = format_chunk_with_metadata(chunk)
+        if search_text:
+            chunk_entry["search_text"] = _truncate_chunk_text(search_text)
 
         if isinstance(metadata, dict):
             sanitized_metadata: Dict[str, Any] = {}
@@ -317,7 +325,7 @@ def enable_interaction_logging():
         return None
 
 # Function to preprocess files when uploaded
-def preprocess_file(file_data: bytes, filename: str, use_advanced_extraction: bool = False):
+def preprocess_file(file_data: bytes, filename: str, use_advanced_extraction: bool = False, storage_key: str = "preprocessed_data"):
     """
     Preprocesses a file by extracting chunks and computing their embeddings.
     Stores the results in session state for later use during prompt processing.
@@ -326,6 +334,7 @@ def preprocess_file(file_data: bytes, filename: str, use_advanced_extraction: bo
         file_data: Raw bytes of the uploaded file
         filename: Name of the file
         use_advanced_extraction: Optional flag for advanced extraction features
+        storage_key: The key in st.session_state to store the preprocessed data. Defaults to "preprocessed_data".
 
     Returns:
         dict: Dictionary with preprocessing status and message
@@ -391,9 +400,21 @@ def preprocess_file(file_data: bytes, filename: str, use_advanced_extraction: bo
                 "message": "Error processing the PDF - possibly due to it being a scanned document. Please upload an OCR-converted version of the document."
             }
 
-        # Generate embeddings for all chunks
-        logger.info(f"Generating embeddings for {len(chunks)} chunks from {filename}")
-        chunk_texts = [chunk.get("text", "") for chunk in chunks]
+        # Build canonical `search_text` for each chunk (include hierarchical metadata)
+        logger.info(f"Building search_text and generating embeddings for {len(chunks)} chunks from {filename}")
+
+        # config values are imported at module level; no local import required
+
+
+        # Populate `search_text` on each chunk and collect texts for embedding
+        chunk_texts = []
+        for chunk in chunks:
+            search_text = format_chunk_with_metadata(chunk)
+            # Fallback to raw text if formatting produced empty string
+            if not search_text.strip():
+                search_text = chunk.get("text", "") or ""
+            chunk["search_text"] = search_text
+            chunk_texts.append(search_text)
         valid_chunk_indices = [i for i, text in enumerate(chunk_texts) if text.strip()]
         valid_chunk_texts = [chunk_texts[i] for i in valid_chunk_indices]
 
@@ -408,11 +429,15 @@ def preprocess_file(file_data: bytes, filename: str, use_advanced_extraction: bo
             valid_chunk_texts, convert_to_tensor=True, show_progress_bar=False
         )
 
-        # Store preprocessed data in session state
-        if "preprocessed_data" not in st.session_state:
-            st.session_state.preprocessed_data = {}
+        # Attach embeddings back to corresponding chunks (preserve indices mapping)
+        for idx, emb in zip(valid_chunk_indices, chunk_embeddings):
+            chunks[idx]["embedding"] = emb
 
-        st.session_state.preprocessed_data[filename] = {
+        # Store preprocessed data in session state
+        if storage_key not in st.session_state:
+            st.session_state[storage_key] = {}
+
+        st.session_state[storage_key][filename] = {
             "chunks": chunks,
             "chunk_embeddings": chunk_embeddings,
             "valid_chunk_indices": valid_chunk_indices,
@@ -605,6 +630,13 @@ def process_file_wrapper(args):
                 raise ValueError(f"Unsupported file type: {file_extension}")
 
             chunk_source = "fresh_extraction"
+            
+            # Populate search_text with hierarchical context on fresh extraction chunks
+            # so they appear in Langfuse preprocessing.chunking traces
+            for chunk in chunks:
+                if "search_text" not in chunk:
+                    chunk["search_text"] = format_chunk_with_metadata(chunk)
+            
             _record_chunking_trace(
                 chunks=chunks,
                 source=chunk_source,
@@ -771,20 +803,7 @@ def process_file_wrapper(args):
 
             rag_params["bm25_terms"] = bm25_terms
 
-            hyde_queries: List[str] = []
-            raw_hyde = sub_prompt_data.get("hyde")
-            if isinstance(raw_hyde, str):
-                raw_hyde = [raw_hyde]
-            if isinstance(raw_hyde, (list, tuple)):
-                for candidate in raw_hyde:
-                    if not isinstance(candidate, str):
-                        continue
-                    cleaned_candidate = candidate.strip()
-                    if cleaned_candidate:
-                        hyde_queries.append(cleaned_candidate)
-            rag_params["hyde"] = hyde_queries
-            if hyde_queries:
-                logger.info(f"HYDE semantic prompts for '{sub_prompt_title}': {hyde_queries}")
+            # HyDE speculative phrases disabled; ignore any 'hyde' field from decomposition
 
             logger.info(f"Retrieving relevant chunks for sub-prompt '{sub_prompt_title}' for {filename}")
             logger.info(f"Using RAG weights - BM25: {bm25_weight:.2f}, Semantic: {semantic_weight:.2f}")
@@ -818,7 +837,6 @@ def process_file_wrapper(args):
                     bm25_weight=bm25_weight,  # Use optimized weight from decomposition
                     semantic_weight=semantic_weight,  # Use optimized weight from decomposition
                     bm25_terms=bm25_terms,
-                    alternate_hyde_queries=hyde_queries,
                 )
             else:
                 relevant_chunks = retrieve_relevant_chunks(
@@ -830,7 +848,6 @@ def process_file_wrapper(args):
                     bm25_weight=bm25_weight,  # Use optimized weight from decomposition
                     semantic_weight=semantic_weight,  # Use optimized weight from decomposition
                     bm25_terms=bm25_terms,
-                    alternate_hyde_queries=hyde_queries,
                 )
 
             # Store sub-prompt data with its relevant chunks and RAG params
@@ -839,7 +856,6 @@ def process_file_wrapper(args):
                 "sub_prompt": sub_prompt,
                 "relevant_chunks": relevant_chunks,
                 "rag_params": rag_params,  # Store for potential retry use
-                "hyde": hyde_queries,
             })
 
             logger.info(f"Retrieved {len(relevant_chunks)} chunks for sub-prompt '{sub_prompt_title}' in {filename} using optimized RAG weights")
@@ -1533,3 +1549,258 @@ if __name__ == "__main__":
         # If the model failed, display_page() will show an error,
         # but we can add a log here just in case.
         logger.critical("Application cannot start because the embedding model failed to load.")
+
+def process_followup_question(filename: str, user_prompt: str, preprocessed_data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Process a follow-up question for a specific file using the main RAG pipeline.
+    Returns the new analysis sections, verification results, and phrase locations.
+    """
+    logger.info(f"Processing follow-up question for {filename}: {user_prompt[:50]}...")
+    
+    embedding_model = get_embedding_model()
+    reranker_model = get_reranker_model()
+    
+    # 1. Decompose
+    analyzer = DocumentAnalyzer()
+    from src.keyword_code.ai.decomposition import decompose_ask_mode_prompt
+    
+    # Get previews for decomposition context
+    chunks = preprocessed_data.get("chunks", [])
+    first_page_preview = ""
+    document_index_preview = ""
+    
+    if chunks:
+        first_page_number: Optional[int] = None
+        for chunk_meta in chunks:
+            page_num = chunk_meta.get("page_num")
+            if isinstance(page_num, int):
+                if first_page_number is None or page_num < first_page_number:
+                    first_page_number = page_num
+
+        if first_page_number is not None:
+            first_page_texts = [
+                chunk_meta.get("text", "")
+                for chunk_meta in chunks
+                if chunk_meta.get("page_num") == first_page_number and isinstance(chunk_meta.get("text"), str)
+            ]
+            combined_first_page = " ".join(first_page_texts).strip()
+            if combined_first_page:
+                if len(combined_first_page) > 1800:
+                    first_page_preview = combined_first_page[:1800].rstrip() + " ..."
+                else:
+                    first_page_preview = combined_first_page
+
+        for chunk_meta in chunks:
+            metadata = chunk_meta.get("metadata")
+            if not isinstance(metadata, dict):
+                continue
+            if metadata.get("document_scope") != "table_of_contents":
+                continue
+            toc_entries = metadata.get("toc_entries")
+            if not isinstance(toc_entries, list):
+                continue
+            formatted_entries: List[str] = []
+            seen_entries: Set[str] = set()
+            for entry in toc_entries:
+                entry_label: Optional[str] = None
+                entry_page: Optional[int] = None
+                if isinstance(entry, dict):
+                    entry_label_raw = entry.get("entry") or entry.get("title") or entry.get("heading")
+                    if isinstance(entry_label_raw, str):
+                        entry_label = entry_label_raw.strip()
+                    page_val = entry.get("page_number")
+                    if isinstance(page_val, int):
+                        entry_page = page_val
+                elif isinstance(entry, str):
+                    entry_label = entry.strip()
+
+                if not entry_label:
+                    continue
+
+                entry_text = entry_label
+                if entry_page is not None:
+                    entry_text = f"{entry_text} (p.{entry_page})"
+
+                lowered = entry_text.lower()
+                if lowered in seen_entries:
+                    continue
+                seen_entries.add(lowered)
+                formatted_entries.append(entry_text)
+
+                if len(formatted_entries) >= 20:
+                    break
+
+            if formatted_entries:
+                document_index_preview = "\n".join(formatted_entries)
+            break
+
+        if document_index_preview and len(document_index_preview) > 2000:
+            document_index_preview = document_index_preview[:2000].rstrip() + "\n..."
+    
+    decomposition_output = run_async(
+        decompose_ask_mode_prompt(
+            analyzer,
+            user_prompt,
+            first_page_preview=first_page_preview,
+            document_index_preview=document_index_preview,
+        )
+    )
+    
+    if isinstance(decomposition_output, dict):
+        sub_prompts = decomposition_output.get("decomposition", []) or []
+    else:
+        sub_prompts = decomposition_output or []
+        
+    # 2. Retrieve
+    sub_prompts_with_contexts = []
+    for sub_prompt_data in sub_prompts:
+        sub_prompt = sub_prompt_data["sub_prompt"]
+        sub_prompt_title = sub_prompt_data["title"]
+        rag_params = sub_prompt_data.get("rag_params", {})
+        
+        bm25_weight = rag_params.get("bm25_weight", 0.5)
+        semantic_weight = rag_params.get("semantic_weight", 0.5)
+        raw_bm25_terms = rag_params.get("bm25_terms", [])
+        if isinstance(raw_bm25_terms, str):
+            raw_bm25_terms = [raw_bm25_terms]
+        elif isinstance(raw_bm25_terms, (tuple, set)):
+            raw_bm25_terms = list(raw_bm25_terms)
+        elif not isinstance(raw_bm25_terms, list):
+            raw_bm25_terms = []
+
+        bm25_terms: List[str] = []
+        seen_terms_local: Set[str] = set()
+        for term in raw_bm25_terms:
+            if not isinstance(term, str):
+                continue
+            cleaned = term.strip()
+            if not cleaned:
+                continue
+            lowered = cleaned.lower()
+            if lowered in seen_terms_local:
+                continue
+            seen_terms_local.add(lowered)
+            bm25_terms.append(cleaned)
+            
+        # HyDE disabled: ignore any 'hyde' guidance from decomposition
+        relevant_chunks = retrieve_relevant_chunks(
+            prompt=sub_prompt,
+            chunks=chunks,
+            model=embedding_model,
+            top_k=RAG_TOP_K,
+            precomputed_embeddings=preprocessed_data.get("chunk_embeddings"),
+            valid_chunk_indices=preprocessed_data.get("valid_chunk_indices"),
+            reranker_model=reranker_model,
+            bm25_weight=bm25_weight,
+            semantic_weight=semantic_weight,
+            bm25_terms=bm25_terms,
+        )
+        
+        sub_prompts_with_contexts.append({
+            "title": sub_prompt_title,
+            "sub_prompt": sub_prompt,
+            "relevant_chunks": relevant_chunks,
+            "rag_params": rag_params,
+        })
+        
+    # 3. Analyze
+    all_sub_prompt_results = run_async(
+        analyzer.analyze_document_with_all_contexts(
+            filename=filename,
+            main_prompt=user_prompt,
+            sub_prompts_with_contexts=sub_prompts_with_contexts
+        )
+    )
+    
+    # 4. Aggregate
+    new_analysis_sections = {}
+    sub_prompt_results = []
+    timestamp = datetime.now().strftime("%H%M%S")
+    
+    for i, result in enumerate(all_sub_prompt_results):
+        try:
+            sub_analysis = json.loads(result["analysis_json"])
+            # Use a unique key prefix for follow-up sections
+            section_key = f"followup_{timestamp}_{i+1}_{result['title'].replace(' ', '_').lower()}"
+            
+            # Collect sub-prompt info
+            sub_prompt_results.append({
+                "section_key": section_key,
+                "sub_prompt": result["sub_prompt"],
+                "title": result["title"]
+            })
+
+            # Convert new format to old format for compatibility
+            if "analysis_summary" in sub_analysis and "supporting_quotes" in sub_analysis:
+                supporting_quotes = sub_analysis["supporting_quotes"]
+                if not isinstance(supporting_quotes, list):
+                    supporting_quotes = [str(supporting_quotes)]
+                supporting_quotes = [str(quote) if not isinstance(quote, str) else quote for quote in supporting_quotes]
+
+                new_analysis_sections[section_key] = {
+                    "Analysis": sub_analysis["analysis_summary"],
+                    "Supporting_Phrases": supporting_quotes,
+                    "Context": sub_analysis.get("analysis_context", f"From sub-prompt: {result['sub_prompt']}"),
+                    "analysis_json": result.get("analysis_json", json.dumps(sub_analysis))
+                }
+            else:
+                new_analysis_sections[section_key] = {
+                    "Analysis": f"Error parsing analysis for '{result['title']}'",
+                    "Supporting_Phrases": ["No relevant phrase found."],
+                    "Context": f"Error in sub-prompt: {result['sub_prompt']}",
+                    "analysis_json": result.get("analysis_json", "{}")
+                }
+        except Exception as e:
+            logger.error(f"Error aggregating results for sub-prompt '{result['title']}' in {filename}: {e}")
+            error_section_key = f"error_followup_{timestamp}_{i+1}_{result['title'].replace(' ', '_').lower()}"
+            new_analysis_sections[error_section_key] = {
+                "Analysis": f"Error processing this section: {str(e)}",
+                "Supporting_Phrases": ["No relevant phrase found."],
+                "Context": f"Error in sub-prompt: {result['sub_prompt']}"
+            }
+        
+    # 5. Verify
+    verification_input_json = json.dumps({"analysis_sections": new_analysis_sections}, indent=2)
+    
+    # Ensure we have raw bytes for the original PDF. Support a few common
+    # representations that may end up in session state (base64 string,
+    # bytearray, memoryview) and try to restore if missing.
+    original_pdf_bytes = preprocessed_data.get("original_bytes")
+    if isinstance(original_pdf_bytes, str):
+        try:
+            original_pdf_bytes = base64.b64decode(original_pdf_bytes)
+            logger.debug("Decoded original_pdf_bytes from base64 string for %s", filename)
+        except Exception:
+            logger.warning("original_bytes for %s is a string but not valid base64; leaving as-is", filename)
+    elif isinstance(original_pdf_bytes, memoryview):
+        original_pdf_bytes = bytes(original_pdf_bytes)
+    elif isinstance(original_pdf_bytes, bytearray):
+        original_pdf_bytes = bytes(original_pdf_bytes)
+
+    # If still missing, attempt to restore from annotated PDF in session state
+    if not isinstance(original_pdf_bytes, (bytes, bytearray)):
+        try:
+            from .display_utils.pdf_utils import restore_original_bytes_if_needed
+
+            restored = restore_original_bytes_if_needed(filename)
+            if restored:
+                original_pdf_bytes = restored
+                logger.info("Restored original PDF bytes for %s during follow-up processing", filename)
+        except Exception as e:
+            logger.debug("Failed to restore original bytes for %s: %s", filename, e)
+
+    if not isinstance(original_pdf_bytes, (bytes, bytearray)):
+        raise ValueError("original_pdf_bytes not available or invalid for follow-up verification; expected bytes")
+
+    processor = PDFProcessor(original_pdf_bytes)
+    
+    verification_results, phrase_locations = processor.verify_and_locate_phrases(
+        verification_input_json
+    )
+    
+    return {
+        "analysis_sections": new_analysis_sections,
+        "verification_results": verification_results,
+        "phrase_locations": phrase_locations,
+        "sub_prompt_results": sub_prompt_results
+    }

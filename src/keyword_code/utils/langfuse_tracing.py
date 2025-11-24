@@ -312,3 +312,31 @@ def optional_context(manager):
     else:
         with manager as ctx:
             yield ctx
+
+
+@contextmanager
+def continue_trace(trace_id: str, name: str, **kwargs):
+    """
+    Continue an existing trace by adding a new span to it.
+    
+    Args:
+        trace_id: The ID of the trace to continue.
+        name: The name of the new span.
+        **kwargs: Additional arguments for the span (input, metadata, etc.)
+    """
+    client = _resolve_client()
+    if client is None:
+        yield None
+        return
+
+    try:
+        # Get the trace object by ID
+        trace = client.trace(id=trace_id)
+        
+        # Create a new span within this trace
+        with trace.span(name=name, **kwargs) as span:
+            yield span
+            
+    except Exception as err:
+        logger.warning("Failed to continue trace %s: %s", trace_id, err)
+        yield None

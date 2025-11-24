@@ -4,7 +4,6 @@
 - Streamlit page `pages/1_📄_CNT_space.py` owns the UI, toggles Ask/Review modes, and calls into `src/keyword_code/app.py` for heavy lifting.
 - File uploads land in `process_file_wrapper`, which reuses `preprocess_file` results (pdf/docx -> `PDFProcessor`/`WordProcessor` -> chunks + embeddings) cached in `st.session_state`.
 - Ask mode pipeline: prompt decomposition (`ai/decomposition.py`) → per-subprompt RAG (`rag/retrieval.py`) → single-call LLM analysis (`ai/analyzer.py`) → PDF verification/annotation (`processors/pdf_processor.py`).
-- Keyword mode is triggered by decomposition metadata and handled by `KeywordModeService.run`, which skips LLM calls and highlights deterministic matches.
 
 ## RAG & Retrieval Conventions
 - Always obtain embeddings via `models.embedding.load_embedding_model()`; reranking goes through `load_reranker_model()` to keep Databricks vs fallback logic intact.
@@ -37,3 +36,8 @@
 - Install with `python -m pip install -r requirements.txt` (Python 3.11+ recommended); launch with `streamlit run Home.py` from the repo root.
 - spaCy model `en_core_web_sm` is downloaded at runtime into `models/spacy/`; ensure write access when running locally or in CI.
 - Tests folder is currently empty—manual verification relies on logs, annotated PDFs, and fact extraction outputs; add regression notebooks or Streamlit scripts near `tests/` if needed.
+
+## Langfuse Tracing
+- Tracing is centralized in `utils/langfuse_tracing.py`. Use `start_trace` for new document runs and `continue_trace` to append spans (e.g., retries) to an existing trace ID.
+- `process_file_wrapper` captures the trace ID and returns it in the result payload; `pages/1_📄_CNT_space.py` stores this ID in `st.session_state.analysis_results` to link subsequent user actions.
+- Ensure `ENABLE_LANGFUSE_TRACING` is set in config/env.

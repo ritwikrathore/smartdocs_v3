@@ -24,6 +24,7 @@ from src.keyword_code.utils.ui_helpers import (
     apply_ui_styling,
     render_branding
 )
+from src.keyword_code.text_utils import clean_and_parse_json
 
 # --- Helper Functions ---
 
@@ -73,77 +74,16 @@ async def _chat_completion_async(messages, model: Optional[str] = None, temperat
 
 
 def _parse_model_json(text: str) -> dict:
-    """Attempt to extract JSON from a model output string.
-
-    Strategies:
-    - Try direct json.loads
-    - Strip fenced code blocks (```json ... ``` or ``` ... ```)
-    - Find the first {...} JSON object in the text and parse that
-
-    Raises JSONDecodeError if parsing fails.
     """
-    if not text or not text.strip():
-        raise json.JSONDecodeError("Empty model response", text, 0)
-
-    # Try direct parse
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-    stripped = text.strip()
-
-    # If the model wrapped the JSON in fenced code blocks (e.g. ```json ... ```),
-    # try to extract any fenced blocks and parse their contents.
-    fence_blocks = []
-    fence_pattern = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
-    for m in fence_pattern.finditer(stripped):
-        fence_blocks.append(m.group(1).strip())
-
-    for block in fence_blocks:
-        try:
-            return json.loads(block)
-        except json.JSONDecodeError:
-            # try to be forgiving: sometimes models put plain text before/after
-            # the JSON inside the fence
-            start = block.find('{')
-            end = block.rfind('}')
-            if start != -1 and end != -1 and end > start:
-                candidate = block[start:end+1]
-                try:
-                    return json.loads(candidate)
-                except json.JSONDecodeError:
-                    pass
-
-    # Try to locate the first '{' and the last '}' and parse that slice.
-    # This is more reliable than regex for complex nested JSON with escaped characters.
-    start = stripped.find('{')
-    end = stripped.rfind('}')
-    if start != -1 and end != -1 and end > start:
-        candidate = stripped[start:end+1]
-        try:
-            return json.loads(candidate)
-        except json.JSONDecodeError as e:
-            logger.debug(f"JSON decode error on candidate (first {{ to last }}): {e}")
-            pass
-
-    # If that fails, try to find the first JSON object or array using regex (less reliable for complex JSON).
-    # Note: regex cannot fully validate nested JSON but works for simple model outputs.
-    obj_pattern = re.compile(r"(\{(?:[^{}]|\{[^}]*\})*\})", re.DOTALL)
-    arr_pattern = re.compile(r"(\[(?:[^\[\]]|\[[^\]]*\])*\])", re.DOTALL)
-
-    for pattern in (obj_pattern, arr_pattern):
-        for m in pattern.finditer(stripped):
-            candidate = m.group(1).strip()
-            try:
-                return json.loads(candidate)
-            except json.JSONDecodeError:
-                # try next match
-                continue
-
-    # If all attempts fail, raise with a helpful message including a short snippet
-    # of the model output to aid debugging.
-    snippet = (stripped[:1000] + '...') if len(stripped) > 1000 else stripped
-    raise json.JSONDecodeError(f"Could not parse JSON from model output. Snippet: {snippet}", text, 0)
+    DEPRECATED: Use text_utils.clean_and_parse_json instead.
+    
+    Attempt to extract JSON from a model output string.
+    """
+    result = clean_and_parse_json(text)
+    if result is None:
+        snippet = (text[:1000] + '...') if len(text) > 1000 else text
+        raise json.JSONDecodeError(f"Could not parse JSON from model output. Snippet: {snippet}", text, 0)
+    return result
 
 
 # --- Pydantic Models for Structured Data ---

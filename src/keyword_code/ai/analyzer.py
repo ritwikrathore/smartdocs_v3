@@ -7,6 +7,7 @@ import re
 import threading
 from typing import Any, Callable, Dict, List, Optional, Tuple, Set
 from ..config import logger, ANALYSIS_MODEL_NAME, USE_DATABRICKS_LLM, LLM_MAX_RETRIES
+from ..text_utils import clean_and_parse_json
 
 # Import Databricks LLM client
 from .databricks_llm import get_databricks_llm
@@ -105,58 +106,7 @@ def _summarize_relevant_chunk(chunk: Dict[str, Any], *, rank: int, fallback_inde
     return summary
 
 
-def _sanitize_unescaped_control_chars(json_str: str) -> Tuple[str, bool]:
-    """Escape control characters that appear unescaped within JSON strings."""
 
-    sanitized_chars: List[str] = []
-    in_string = False
-    escape_next = False
-    sanitized = False
-
-    for ch in json_str:
-        if in_string:
-            if escape_next:
-                sanitized_chars.append(ch)
-                escape_next = False
-                continue
-
-            if ch == "\\":
-                sanitized_chars.append(ch)
-                escape_next = True
-                continue
-
-            if ch == '"':
-                sanitized_chars.append(ch)
-                in_string = False
-                continue
-
-            code_point = ord(ch)
-            if ch == "\n":
-                sanitized_chars.append("\\n")
-                sanitized = True
-                continue
-            if ch == "\r":
-                sanitized_chars.append("\\r")
-                sanitized = True
-                continue
-            if ch == "\t":
-                sanitized_chars.append("\\t")
-                sanitized = True
-                continue
-            if code_point < 0x20:
-                sanitized_chars.append(f"\\u{code_point:04x}")
-                sanitized = True
-                continue
-
-            sanitized_chars.append(ch)
-            continue
-
-        sanitized_chars.append(ch)
-        if ch == '"':
-            in_string = True
-            escape_next = False
-
-    return "".join(sanitized_chars), sanitized
 
 
 class DocumentAnalyzer:
@@ -694,28 +644,15 @@ class DocumentAnalyzer:
 
     @staticmethod
     def _extract_json_from_response(response_content: str) -> Any:
-        """Extract the first JSON object from a model response."""
-
-        cleaned_response = response_content.strip()
-        match = re.search(r"```json\s*(\{.*?\})\s*```", cleaned_response, re.DOTALL)
-        if match:
-            json_str = match.group(1)
-        elif cleaned_response.startswith("{") and cleaned_response.endswith("}"):
-            json_str = cleaned_response
-        else:
-            first_brace = cleaned_response.find("{")
-            last_brace = cleaned_response.rfind("}")
-            if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
-                json_str = cleaned_response[first_brace:last_brace + 1]
-                logger.warning("Used brace slicing heuristic to extract JSON from model response.")
-            else:
-                raise json.JSONDecodeError("Could not locate JSON payload in response.", cleaned_response, 0)
-
-        sanitized_json_str, sanitized = _sanitize_unescaped_control_chars(json_str)
-        if sanitized:
-            logger.debug("Escaped control characters in JSON payload before parsing.")
-
-        return json.loads(sanitized_json_str)
+        """
+        DEPRECATED: Use text_utils.clean_and_parse_json instead.
+        
+        Extract the first JSON object from a model response.
+        """
+        result = clean_and_parse_json(response_content)
+        if result is None:
+            raise json.JSONDecodeError("Could not locate JSON payload in response.", response_content, 0)
+        return result
 
     @property
     def output_schema_analysis(self) -> dict:
