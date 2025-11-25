@@ -14,10 +14,16 @@ import streamlit as st
 from openai import OpenAI
 from typing import List, Union
 from ..config import logger, USE_DATABRICKS_EMBEDDING
+import httpx
 
 # Databricks endpoint URL - Make sure this exactly matches what worked in your test scripts
 DATABRICKS_BASE_URL = "https://adb-3858882779799477.17.azuredatabricks.net/serving-endpoints"
 DATABRICKS_MODEL_NAME = "databricks-gte-large-en"
+
+# Retry configuration for rate limit handling
+# 15 retries with exponential backoff to handle quota exceeded scenarios
+MAX_RETRIES = 15
+REQUEST_TIMEOUT = 120.0  # 2 minutes timeout
 
 # Debug flag to print detailed API call information
 DEBUG_API_CALLS = True
@@ -83,9 +89,11 @@ def get_databricks_client():
 
         client = OpenAI(
             api_key=clean_token,
-            base_url=DATABRICKS_BASE_URL
+            base_url=DATABRICKS_BASE_URL,
+            max_retries=MAX_RETRIES,
+            timeout=httpx.Timeout(REQUEST_TIMEOUT, connect=10.0)
         )
-        logger.info("Databricks OpenAI client created successfully")
+        logger.info(f"Databricks OpenAI client created successfully with {MAX_RETRIES} retries")
 
         # Test the client with a simple API call to verify it works
         try:

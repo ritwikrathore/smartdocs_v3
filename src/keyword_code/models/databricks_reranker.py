@@ -14,6 +14,8 @@ import streamlit as st
 import pandas as pd
 import json
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from typing import List, Tuple, Optional
 from dotenv import load_dotenv
 from pathlib import Path
@@ -32,6 +34,11 @@ from ..config import (
 DATABRICKS_BASE_URL = "https://int.api.worldbank.org/portfoliointelligence/serving-endpoints"
 DATABRICKS_RERANKER_MODEL_NAME = "cpm-marco-ms"
 DATABRICKS_RERANKER_ENDPOINT = f"{DATABRICKS_BASE_URL}/{DATABRICKS_RERANKER_MODEL_NAME}/invocations"
+
+# Retry configuration for rate limit handling
+# 15 retries with exponential backoff to handle quota exceeded scenarios
+MAX_RETRIES = 15
+RETRY_BACKOFF_FACTOR = 0.5  # Exponential backoff multiplier
 
 
 def create_tf_serving_json(data):
@@ -92,6 +99,33 @@ def get_databricks_reranker_token():
         return None
 
 
+def create_session_with_retries():
+    """
+    Create a requests session with retry configuration for handling rate limits.
+    
+    Returns:
+        requests.Session with retry adapter configured
+    """
+    session = requests.Session()
+    
+    # Configure retry strategy
+    # Retry on 429 (rate limit), 500, 502, 503, 504 (server errors)
+    retry_strategy = Retry(
+        total=MAX_RETRIES,
+        backoff_factor=RETRY_BACKOFF_FACTOR,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["POST"],  # Only retry POST requests
+        raise_on_status=False  # Don't raise exception, let us handle it
+    )
+    
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    
+    logger.debug(f"Created requests session with {MAX_RETRIES} retries for rate limit handling")
+    return session
+
+
 class DatabricksRerankerModel:
     """
     Wrapper class for Databricks reranker model to provide a similar interface
@@ -118,6 +152,9 @@ class DatabricksRerankerModel:
         # conservative character-based truncation strategy to fit inputs within
         # the model's token limit.
         self.tokenizer = None
+        # Create session with retry configuration for handling rate limits
+        self.session = create_session_with_retries()
+        logger.info(f"Databricks reranker initialized with {MAX_RETRIES} retries for rate limit handling")
 
     def _truncate_text_pair(self, query: str, document: str) -> Tuple[str, str]:
         """
@@ -211,9 +248,9 @@ class DatabricksRerankerModel:
                 'Content-Type': 'application/json'
             }
 
-            # Make the API call with timeout
+            # Make the API call with timeout and automatic retries
             logger.info(f"Calling Databricks reranker API with {len(sentence_pairs)} pairs")
-            response = requests.post(
+            response = self.session.post(
                 url=self.endpoint_url,
                 headers=headers,
                 data=data_json,

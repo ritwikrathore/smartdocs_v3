@@ -7,10 +7,17 @@ import streamlit as st
 from openai import OpenAI
 from typing import List, Dict, Any, Optional
 from ..config import logger, USE_DATABRICKS_LLM
+import httpx
 
 # Databricks endpoint URL
 DATABRICKS_BASE_URL = "https://adb-3858882779799477.17.azuredatabricks.net/serving-endpoints"
 DATABRICKS_LLM_MODEL = "databricks-llama-4-maverick"
+
+# Retry configuration for rate limit handling
+# 15 retries with exponential backoff should handle quota exceeded scenarios
+# that typically resolve within a minute
+MAX_RETRIES = 15
+REQUEST_TIMEOUT = 120.0  # 2 minutes timeout
 
 
 @st.cache_resource(show_spinner="Calling the storytelling dragons 🐉...")
@@ -36,11 +43,16 @@ def get_databricks_llm_client():
             return None
 
         # Create OpenAI client with Databricks configuration
+        # Configure retries to handle rate limit errors (429)
+        # With 15 retries and exponential backoff, we can handle quota exceeded scenarios
+        # that typically resolve within 1 minute during high load periods
         client = OpenAI(
             api_key=databricks_token,
-            base_url=DATABRICKS_BASE_URL
+            base_url=DATABRICKS_BASE_URL,
+            max_retries=MAX_RETRIES,
+            timeout=httpx.Timeout(REQUEST_TIMEOUT, connect=10.0)
         )
-        logger.info("Databricks LLM OpenAI client created successfully")
+        logger.info(f"Databricks LLM OpenAI client created successfully with {MAX_RETRIES} retries")
         return client
     except Exception as e:
         logger.error(f"Error creating Databricks LLM client: {e}")
