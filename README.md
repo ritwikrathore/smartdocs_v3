@@ -193,6 +193,7 @@ The "📄 CNT space" page should then appear in the Streamlit sidebar navigation
 *   **PDF Annotation**: Highlights verified phrases directly within the PDF viewer.
 *   **Interactive Chat**: Engage in a conversation with your uploaded documents, with responses citing specific sources (filename and page number).
 *   **Memory Management**: Implements automatic memory cleanup to prevent application slowdowns and crashes.
+*   **User Feedback Collection (Optional)**: Collect user satisfaction ratings with thumbs up/down buttons on each analysis section, logging feedback with timestamps, questions, answers, and citations to JSON for quality tracking.
 *   **Export Results**: Download the analysis findings and supporting citations in Excel (`.xlsx`) or Word (`.docx`) formats.
 *   **Export Annotated PDFs**: Download PDFs with verified phrases highlighted.
 

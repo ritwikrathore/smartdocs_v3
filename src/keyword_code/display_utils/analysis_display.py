@@ -11,8 +11,10 @@ import fitz
 from io import BytesIO
 from datetime import datetime
 from typing import Dict, List, Any, Optional
-from ..config import logger, RAG_TOP_K
+from ..config import logger, RAG_TOP_K, ENABLE_FEEDBACK
 from ..models.embedding import load_embedding_model, load_reranker_model
+from ..utils.feedback_logger import log_feedback, append_additional_feedback, log_question_answer
+from ..utils.file_manager import get_session_id
 from ..rag.retrieval import retrieve_relevant_chunks_for_chat
 from ..utils.async_utils import run_async
 from ..ai.analyzer import DocumentAnalyzer
@@ -41,6 +43,199 @@ def _get_embedding_model():
 def _get_reranker_model():
     """Lazily retrieve the reranker model."""
     return load_reranker_model()
+
+
+def display_feedback_buttons(
+    filename: str,
+    section_key: str,
+    section_title: str,
+    question: str,
+    answer: str,
+    supporting_phrases: List[Dict[str, Any]],
+):
+    """
+    Display thumbs up/down feedback buttons for a section.
+    
+    Args:
+        filename: Name of the document
+        section_key: Internal section identifier
+        section_title: Display title of the section
+        question: The decomposed prompt question
+        answer: The AI-generated answer
+        supporting_phrases: List of supporting citations
+    """
+    if not ENABLE_FEEDBACK:
+        return
+    
+    # Get session ID for tracking
+    try:
+        session_id = get_session_id()
+    except Exception as e:
+        logger.debug(f"Could not retrieve session ID for feedback: {e}")
+        session_id = None
+    
+    # Create unique keys for this section's feedback
+    feedback_key = f"feedback_{filename}_{section_key}"
+    
+    # Initialize session state for this section if not present
+    if feedback_key not in st.session_state:
+        st.session_state[feedback_key] = None
+    
+    # Add custom CSS for feedback buttons
+    st.markdown("""
+    <style>
+    .feedback-container {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin: 8px 0;
+    }
+    .feedback-btn {
+        background: none;
+        border: 1px solid #ddd;
+        border-radius: 4px;
+        padding: 4px 8px;
+        cursor: pointer;
+        font-size: 18px;
+        transition: all 0.2s;
+    }
+    .feedback-btn:hover {
+        background-color: #f0f0f0;
+        border-color: #999;
+    }
+    .feedback-status {
+        font-size: 0.85rem;
+        margin-left: 8px;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+    
+    # Create columns for the feedback buttons and optional text input
+    current_feedback = st.session_state.get(feedback_key)
+    
+    # Show additional feedback text input only when negative feedback is given
+    if current_feedback == "negative":
+        columns = st.columns([10, 10, 79, 1])
+        col1, col2, col3, col4 = columns[0], columns[1], columns[2], columns[3]
+    else:
+        columns = st.columns([10, 10, 80])
+        col1, col2, col3 = columns[0], columns[1], columns[2]
+    
+    with col1:
+        # Thumbs up button - allow changing feedback
+        if st.button(
+            "👍",
+            key=f"{feedback_key}_positive",
+            help="Mark this answer as helpful" if current_feedback != "positive" else "Already marked as helpful (click thumbs down to change)",
+            use_container_width=True,
+        ):
+            # Log feedback even if changing from negative to positive
+            st.session_state[feedback_key] = "positive"
+            log_feedback(
+                feedback_type="positive",
+                filename=filename,
+                section_key=section_key,
+                section_title=section_title,
+                question=question,
+                answer=answer,
+                citations=supporting_phrases,
+                session_id=session_id,
+            )
+            st.toast("✅ Thank you for your feedback!", icon="👍")
+            st.rerun()
+    
+    with col2:
+        # Thumbs down button - allow changing feedback
+        if st.button(
+            "👎",
+            key=f"{feedback_key}_negative",
+            help="Mark this answer as not helpful" if current_feedback != "negative" else "Already marked as not helpful (click thumbs up to change)",
+            use_container_width=True,
+        ):
+            # Log feedback even if changing from positive to negative
+            st.session_state[feedback_key] = "negative"
+            log_feedback(
+                feedback_type="negative",
+                filename=filename,
+                section_key=section_key,
+                section_title=section_title,
+                question=question,
+                answer=answer,
+                citations=supporting_phrases,
+                session_id=session_id,
+            )
+            st.toast("✅ Thank you for your feedback!", icon="👎")
+            st.rerun()
+    
+    with col3:
+        # Show feedback prompt, status, or additional feedback input
+        if current_feedback is None:
+            # Show help card before any feedback is given
+            st.markdown("""
+                <div style='background-color: #f0f7ff; padding: 8px 12px; border-radius: 6px; border-left: 3px solid #2196F3;'>
+                    <span style='color: #1976D2; font-size: 0.9rem;'>
+                        <strong>Help us improve SmartDocs</strong> — Your feedback helps us build better.
+                    </span>
+                </div>
+            """, unsafe_allow_html=True)
+        elif current_feedback == "positive":
+            st.markdown("""
+                <div style='background-color: #f1f8f4; padding: 8px 12px; border-radius: 6px; border-left: 3px solid #4caf50;'>
+                    <span style='color: #2e7d32; font-size: 0.9rem;'>
+                        ✓ <strong>Marked as helpful</strong> — Thank you for your feedback!
+                    </span>
+                </div>
+            """, unsafe_allow_html=True)
+        elif current_feedback == "negative":
+            # Show optional text input for additional feedback
+            additional_feedback_key = f"{feedback_key}_additional"
+
+            # Initialize session state for text input placeholder
+            if f"{additional_feedback_key}_submitted" not in st.session_state:
+                st.session_state[f"{additional_feedback_key}_submitted"] = False
+
+            if not st.session_state[f"{additional_feedback_key}_submitted"]:
+                additional_text = st.text_input(
+                    label="additional_feedback",
+                    placeholder="(Optional) Tell us why - Press Enter to submit",
+                    key=additional_feedback_key,
+                    label_visibility="collapsed",
+                    on_change=lambda: _handle_additional_feedback(
+                        session_id,
+                        section_key,
+                        additional_feedback_key,
+                        feedback_key
+                    )
+                )
+            else:
+                st.markdown("""
+                    <div style='background-color: #fff3f3; padding: 8px 12px; border-radius: 6px; border-left: 3px solid #f44336;'>
+                        <span style='color: #c62828; font-size: 0.9rem;'>
+                            ✓ <strong>Additional feedback submitted</strong> — Thank you!
+                        </span>
+                    </div>
+                """, unsafe_allow_html=True)
+    
+    # col4 only exists when negative feedback is shown
+    if current_feedback == "negative":
+        with col4:
+            pass
+
+
+def _handle_additional_feedback(session_id, section_key, additional_feedback_key, feedback_key):
+    """Handle submission of additional feedback text."""
+    additional_text = st.session_state.get(additional_feedback_key, "").strip()
+    
+    if additional_text:
+        success = append_additional_feedback(
+            session_id=session_id,
+            section_key=section_key,
+            additional_feedback=additional_text
+        )
+        
+        if success:
+            st.session_state[f"{additional_feedback_key}_submitted"] = True
+            st.toast("✅ Additional feedback saved!", icon="📝")
 
 
 def display_analysis_results(results: List[Dict[str, Any]]):
@@ -393,6 +588,92 @@ def display_analysis_results(results: List[Dict[str, Any]]):
                                         ])
                                     analysis_html_parts.extend(["</div></div>"])
                                     st.markdown("".join(analysis_html_parts), unsafe_allow_html=True)
+                                    
+                                    # Display feedback buttons if enabled
+                                    if ENABLE_FEEDBACK:
+                                        # Get the original question from section_prompt_map
+                                        original_question = section_prompt_map.get(section_key, display_section_name)
+                                        
+                                        # Extract citations with page numbers
+                                        supporting_phrases_list = section_data.get("Supporting_Phrases", [])
+                                        verification_results = result.get("verification_results", {})
+                                        phrase_locations = result.get("phrase_locations", {})
+                                        
+                                        formatted_citations = []
+                                        for phrase in supporting_phrases_list:
+                                            if not isinstance(phrase, str) or phrase == "No relevant phrase found.":
+                                                continue
+                                            
+                                            # Get page number from phrase locations
+                                            phrase_location_data = phrase_locations.get(phrase, {})
+                                            page_num_info = "Page unknown"
+                                            
+                                            candidate_locs = []
+                                            if isinstance(phrase_location_data, list):
+                                                candidate_locs = [loc for loc in phrase_location_data if isinstance(loc, dict)]
+                                            elif isinstance(phrase_location_data, dict):
+                                                if 'best_match' in phrase_location_data and isinstance(phrase_location_data['best_match'], dict):
+                                                    candidate_locs = [phrase_location_data['best_match']]
+                                                else:
+                                                    candidate_locs = [phrase_location_data]
+                                            
+                                            if candidate_locs:
+                                                # Get the best location (preferring exact matches)
+                                                method_priority = {
+                                                    'exact': 5,
+                                                    'exact_cleaned_search': 5,
+                                                    'special_case_quotes_handling': 3,
+                                                    'cross_page_fuzzy_match_part1': 2,
+                                                    'cross_page_fuzzy_match_part2': 2,
+                                                    'fuzzy': 2,
+                                                    'fuzzy_chunk_fallback_individual': 1,
+                                                    'fuzzy_chunk_fallback': 0
+                                                }
+                                                
+                                                def loc_key(loc):
+                                                    method = loc.get('method', '')
+                                                    score_val = loc.get('match_score', 0) or 0
+                                                    try:
+                                                        score_val = float(score_val)
+                                                    except Exception:
+                                                        score_val = 0.0
+                                                    return (method_priority.get(method, -1), score_val)
+                                                
+                                                best_location_dict = max(candidate_locs, key=loc_key)
+                                                page_num_val = best_location_dict.get("page_num")
+                                                if isinstance(page_num_val, int):
+                                                    page_num_info = str(page_num_val + 1)  # Convert to 1-based page number
+                                                elif page_num_val is not None:
+                                                    page_num_info = str(page_num_val)
+                                            
+                                            formatted_citations.append({
+                                                "text": phrase,
+                                                "page": page_num_info
+                                            })
+
+                                        # Log the question and answer first
+                                        try:
+                                            session_id = get_session_id()
+                                            log_question_answer(
+                                                session_id=session_id,
+                                                filename=filename,
+                                                section_key=section_key,
+                                                section_title=display_section_name,
+                                                question=original_question,
+                                                answer=analysis_content,
+                                                citations=formatted_citations,
+                                            )
+                                        except Exception as e:
+                                            logger.debug(f"Could not log question answer: {e}")
+
+                                        display_feedback_buttons(
+                                            filename=filename,
+                                            section_key=section_key,
+                                            section_title=display_section_name,
+                                            question=original_question,
+                                            answer=analysis_content,
+                                            supporting_phrases=formatted_citations,
+                                        )
                                 elif context_content:  # Display context even if analysis is missing
                                     # Context is NOT rendered with Markdown - keep as plain text
                                     st.markdown(f"""

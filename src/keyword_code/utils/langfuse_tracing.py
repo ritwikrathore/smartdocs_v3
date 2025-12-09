@@ -135,18 +135,23 @@ def start_trace(
         propagate_kwargs["metadata"] = trace_metadata
         trace_update_kwargs["metadata"] = trace_metadata
 
-    with client.start_as_current_span(name=name, input=input_data, metadata=metadata) as span:
-        with ExitStack() as exit_stack:
-            if propagate_kwargs and propagate_attributes is not None:
-                exit_stack.enter_context(propagate_attributes(**propagate_kwargs))
+    try:
+        with client.start_as_current_span(name=name, input=input_data, metadata=metadata) as span:
+            with ExitStack() as exit_stack:
+                if propagate_kwargs and propagate_attributes is not None:
+                    exit_stack.enter_context(propagate_attributes(**propagate_kwargs))
 
-            if trace_update_kwargs:
-                try:
-                    span.update_trace(**trace_update_kwargs)
-                except Exception as err:
-                    logger.debug("Unable to update Langfuse trace metadata: %s", err)
+                if trace_update_kwargs:
+                    try:
+                        span.update_trace(**trace_update_kwargs)
+                    except Exception as err:
+                        logger.debug("Unable to update Langfuse trace metadata: %s", err)
 
-            yield span
+                yield span
+    except Exception as err:
+        # Catch any network/timeout errors during trace lifecycle
+        logger.debug("Unable to write to Langfuse: %s", err)
+        yield None
 
 
 @contextmanager
@@ -163,8 +168,13 @@ def start_span(
         yield None
         return
 
-    with client.start_as_current_span(name=name, input=input_data, metadata=metadata) as span:
-        yield span
+    try:
+        with client.start_as_current_span(name=name, input=input_data, metadata=metadata) as span:
+            yield span
+    except Exception as err:
+        # Catch any network/timeout errors during span lifecycle
+        logger.debug("Unable to write to Langfuse: %s", err)
+        yield None
 
 
 @contextmanager
@@ -182,13 +192,18 @@ def start_generation(
         yield None
         return
 
-    with client.start_as_current_generation(
-        name=name,
-        input=input_data,
-        metadata=metadata,
-        model=model,
-    ) as generation:
-        yield generation
+    try:
+        with client.start_as_current_generation(
+            name=name,
+            input=input_data,
+            metadata=metadata,
+            model=model,
+        ) as generation:
+            yield generation
+    except Exception as err:
+        # Catch any network/timeout errors during generation lifecycle
+        logger.debug("Unable to write to Langfuse: %s", err)
+        yield None
 
 
 def update_current_trace(**kwargs: Any) -> None:

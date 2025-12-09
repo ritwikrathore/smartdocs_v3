@@ -466,6 +466,8 @@ def process_rag_requests(results: list[dict[str, any]]) -> tuple[list[dict[str, 
             from src.keyword_code.rag.retrieval import retrieve_relevant_chunks_async
             from src.keyword_code.models.embedding import load_reranker_model
             from src.keyword_code.utils.langfuse_tracing import continue_trace
+            from src.keyword_code.display_utils.pdf_utils import restore_original_bytes_if_needed
+            from src.keyword_code.processors.pdf_processor import PDFProcessor
 
             for section_key, request_data in st.session_state.rag_retry_requests.items():
                 if request_data.get("status") == "requested":
@@ -517,7 +519,6 @@ def process_rag_requests(results: list[dict[str, any]]) -> tuple[list[dict[str, 
 
                         # Derive seed retrieval parameters from prior run when available
                         seed_bm25_terms: List[str] = []
-                        seed_hyde_phrases: List[str] = []
                         rag_params = None
                         if isinstance(result_meta, dict):
                             sub_prompt_results = result_meta.get("sub_prompt_results") or []
@@ -534,13 +535,6 @@ def process_rag_requests(results: list[dict[str, any]]) -> tuple[list[dict[str, 
                                         cleaned = term.strip()
                                         if cleaned:
                                             seed_bm25_terms.append(cleaned)
-                            raw_hyde = rag_params.get("hyde")
-                            if isinstance(raw_hyde, (list, tuple)):
-                                for phrase in raw_hyde:
-                                    if isinstance(phrase, str):
-                                        cleaned_phrase = phrase.strip()
-                                        if cleaned_phrase:
-                                            seed_hyde_phrases.append(cleaned_phrase)
 
                         if not seed_bm25_terms and query:
                             seed_bm25_terms = [query]
@@ -576,7 +570,6 @@ def process_rag_requests(results: list[dict[str, any]]) -> tuple[list[dict[str, 
                                 bm25_weight=0.5,
                                 semantic_weight=0.5,
                                 bm25_terms=seed_bm25_terms or None,
-                                alternate_hyde_queries=seed_hyde_phrases or None,
                             )
                         )
 
@@ -593,7 +586,6 @@ def process_rag_requests(results: list[dict[str, any]]) -> tuple[list[dict[str, 
                             semantic_weight=0.5,
                             top_k=10,
                             bm25_terms=seed_bm25_terms,
-                            hyde_phrases=seed_hyde_phrases,
                         )
 
                         # Run retry with optimization
@@ -625,7 +617,6 @@ def process_rag_requests(results: list[dict[str, any]]) -> tuple[list[dict[str, 
                         # --- Finish the pipeline: send RAG results to LLM, validate, and fact extract ---
                         try:
                             from src.keyword_code.ai.analyzer import DocumentAnalyzer
-                            from src.keyword_code.processors.pdf_processor import PDFProcessor
                             from src.keyword_code.services.fact_extraction_service import FactExtractionService
                             import re
 

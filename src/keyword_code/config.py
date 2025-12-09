@@ -36,6 +36,42 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Suppress noisy OpenTelemetry/Langfuse connection errors
+class LangfuseErrorFilter(logging.Filter):
+    """Filter to suppress Langfuse connection timeout errors and replace with simple message."""
+    
+    def filter(self, record):
+        # Check if this is an OpenTelemetry span export error related to Langfuse
+        if (
+            record.name == "opentelemetry.sdk._shared_internal" and
+            record.levelno == logging.ERROR and
+            "Exception while exporting Span" in record.getMessage()
+        ):
+            # Suppress the full traceback and log a simple message instead
+            logger.info("Unable to write to Langfuse (connection timeout)")
+            return False
+        
+        # Check for urllib3 and requests timeout errors in the context of Langfuse
+        if (
+            ("ReadTimeout" in record.getMessage() or "TimeoutError" in record.getMessage()) and
+            ("localhost:3000" in record.getMessage() or "langfuse" in record.pathname.lower())
+        ):
+            # These are cascading errors from the above, suppress them
+            return False
+        
+        return True
+
+# Apply the filter to the root logger and all handlers
+langfuse_filter = LangfuseErrorFilter()
+logging.getLogger().addFilter(langfuse_filter)
+for handler in logging.getLogger().handlers:
+    handler.addFilter(langfuse_filter)
+
+# Suppress OpenTelemetry batch span processor errors entirely
+# These are noisy and not actionable for users
+logging.getLogger("opentelemetry.sdk._shared_internal").setLevel(logging.CRITICAL)
+logging.getLogger("opentelemetry.exporter.otlp.proto.http.trace_exporter").setLevel(logging.CRITICAL)
+
 # Load environment variables from .env file with explicit path
 load_dotenv(dotenv_path=env_path)
 
@@ -152,6 +188,10 @@ INCLUDE_CONTEXT_IN_SEARCH = True
 # --- LLM Retry Configuration ---
 LLM_MAX_RETRIES = int(os.environ.get("LLM_MAX_RETRIES", 3))
 
+# --- Feedback Configuration ---
+# Set to True to enable user feedback buttons and logging
+ENABLE_FEEDBACK = True  # Enable/disable feedback feature directly here
+
 # --- UI Configuration ---
 # Define primary colors
 PROCESS_CYAN = "#00ADE4"
@@ -183,7 +223,7 @@ SAVED_PROMPTS = {
                     "14. What are the repayment terms and can you list the full repayment schedule with dates in a table? \n"
                     "15. What are all the fees the borrower shall pay and the percentages / amounts and are there any references of a separate fee letter? \n"
                     "16. what is the commitment fee percentage on undisbursed amount of the loan? \n"
-                    "17. What are the terms for default interest? \n"
+                    "17. What are the terms for default interest for different tranches and loan types? \n"
                     "18. What is the maturity date? \n"
                     "19. When does the availability period end? \n"
                 ),
