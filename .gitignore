@@ -1,0 +1,7 @@
+.venv/
+.env
+logs/
+tmp/
+feedback/
+__pycache__/
+claude.md

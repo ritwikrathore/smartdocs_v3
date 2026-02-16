@@ -1,0 +1,203 @@
+"""
+Databricks LLM client for API calls.
+"""
+
+import os
+import streamlit as st
+from openai import OpenAI
+from typing import List, Dict, Any, Optional
+from ..config import logger, USE_DATABRICKS_LLM
+import httpx
+
+# Databricks endpoint URL
+DATABRICKS_BASE_URL = "https://adb-3858882779799477.17.azuredatabricks.net/serving-endpoints"
+DATABRICKS_LLM_MODEL = "databricks-llama-4-maverick"
+
+# Retry configuration for rate limit handling
+# 15 retries with exponential backoff should handle quota exceeded scenarios
+# that typically resolve within a minute
+MAX_RETRIES = 15
+REQUEST_TIMEOUT = 120.0  # 2 minutes timeout
+
+
+@st.cache_resource(show_spinner="Calling the storytelling dragons 🐉...")
+def get_databricks_llm_client():
+    """
+    Creates and caches an OpenAI client configured for Databricks LLM.
+
+    Returns:
+        OpenAI client or None if token is not available
+    """
+    try:
+        # Check if Databricks LLM is enabled
+        if not USE_DATABRICKS_LLM:
+            logger.info("Databricks LLM is disabled in configuration")
+            return None
+
+        # Get token from environment variables only
+        databricks_token = os.environ.get("DATABRICKS_API_KEY")
+
+        if not databricks_token:
+            logger.error("DATABRICKS_API_KEY not found in environment variables")
+            st.error("Databricks API token not found. Please add DATABRICKS_API_KEY to your .env file")
+            return None
+
+        # Create OpenAI client with Databricks configuration
+        # Configure retries to handle rate limit errors (429)
+        # With 15 retries and exponential backoff, we can handle quota exceeded scenarios
+        # that typically resolve within 1 minute during high load periods
+        client = OpenAI(
+            api_key=databricks_token,
+            base_url=DATABRICKS_BASE_URL,
+            max_retries=MAX_RETRIES,
+            timeout=httpx.Timeout(REQUEST_TIMEOUT, connect=10.0)
+        )
+        logger.info(f"Databricks LLM OpenAI client created successfully with {MAX_RETRIES} retries")
+        return client
+    except Exception as e:
+        logger.error(f"Error creating Databricks LLM client: {e}")
+        st.error(f"Failed to initialize Databricks LLM client: {e}")
+        return None
+
+
+class DatabricksLLMClient:
+    """
+    Client for interacting with Databricks LLM API.
+    """
+
+    def __init__(self):
+        self.client = get_databricks_llm_client()
+        self.model_name = DATABRICKS_LLM_MODEL
+
+    def get_completion(self, messages: List[Dict[str, str]], max_tokens: int = 8192) -> Optional[Dict[str, Any]]:
+        """
+        Get completion from Databricks LLM.
+
+        Args:
+            messages: List of message dictionaries with 'role' and 'content' keys
+            max_tokens: Maximum number of tokens to generate
+
+        Returns:
+            Dictionary with 'content' and 'usage' keys, or None if there was an error
+        """
+        if self.client is None:
+            logger.error("Cannot get completion: Databricks LLM client not initialized")
+            return None
+
+        try:
+            # Convert Anthropic-style messages to OpenAI format if needed
+            openai_messages = []
+            for msg in messages:
+                role = msg.get("role", "").lower()
+                content = msg.get("content", "")
+
+                # Map Anthropic roles to OpenAI roles
+                if role == "system":
+                    openai_messages.append({"role": "system", "content": content})
+                elif role == "user":
+                    openai_messages.append({"role": "user", "content": content})
+                elif role == "assistant":
+                    openai_messages.append({"role": "assistant", "content": content})
+                else:
+                    # Default to user for unknown roles
+                    openai_messages.append({"role": "user", "content": content})
+
+            # Log the full request in DEBUG mode
+            logger.debug("=" * 80)
+            logger.debug("AI API REQUEST")
+            logger.debug("=" * 80)
+            logger.debug(f"Model: {self.model_name}")
+            logger.debug(f"Max Tokens: {max_tokens}")
+            logger.debug("Messages:")
+            for i, msg in enumerate(openai_messages):
+                logger.debug(f"  Message {i+1} ({msg['role']}):")
+                logger.debug(f"    {msg['content']}")
+            logger.debug("=" * 80)
+
+            # Make the API call
+            response = self.client.chat.completions.create(
+                messages=openai_messages,
+                model=self.model_name,
+                max_tokens=max_tokens
+            )
+
+            # Extract the generated text and usage info
+            if response.choices and len(response.choices) > 0:
+                response_content = response.choices[0].message.content
+
+                # Extract token usage information
+                usage_info = None
+                if hasattr(response, 'usage') and response.usage:
+                    usage_info = {
+                        "prompt_tokens": response.usage.prompt_tokens,
+                        "completion_tokens": response.usage.completion_tokens,
+                        "total_tokens": response.usage.total_tokens,
+                    }
+
+                # Log the full response in DEBUG mode
+                logger.debug("=" * 80)
+                logger.debug("AI API RESPONSE")
+                logger.debug("=" * 80)
+                logger.debug(f"Response Length: {len(response_content)} characters")
+                if usage_info:
+                    logger.debug(f"Token Usage: {usage_info}")
+                logger.debug("Response Content:")
+                logger.debug(response_content)
+                logger.debug("=" * 80)
+
+                return {
+                    "content": response_content,
+                    "usage": usage_info
+                }
+            else:
+                logger.warning("Empty response from Databricks LLM API")
+                return None
+
+        except Exception as e:
+            logger.error(f"Error getting completion from Databricks LLM: {e}")
+            return None
+
+    async def get_completion_async(self, messages: List[Dict[str, str]], max_tokens: int = 8192) -> Optional[Dict[str, Any]]:
+        """
+        Async wrapper for get_completion.
+        This is a simple wrapper that calls the synchronous method, as the OpenAI client doesn't have async methods.
+        For true async, you would need to run this in a thread pool.
+
+        Args:
+            messages: List of message dictionaries with 'role' and 'content' keys
+            max_tokens: Maximum number of tokens to generate
+
+        Returns:
+            Dictionary with 'content' and 'usage' keys, or None if there was an error
+        """
+        return self.get_completion(messages, max_tokens)
+
+
+@st.cache_resource(show_spinner="Gathering the wise council 🧙‍♂️...")
+def get_databricks_llm():
+    """
+    Creates and caches a DatabricksLLMClient instance.
+
+    Returns:
+        DatabricksLLMClient instance
+    """
+    try:
+        logger.info(f"Initializing Databricks LLM client with model: {DATABRICKS_LLM_MODEL}")
+        client = DatabricksLLMClient()
+
+        # Test the client with a simple prompt
+        test_messages = [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "Hello, are you working?"}
+        ]
+        test_response = client.get_completion(test_messages, max_tokens=10)
+
+        if test_response and test_response.get("content"):
+            logger.info(f"Databricks LLM client initialized successfully. Test response: {test_response['content'][:20]}...")
+            return client
+        else:
+            logger.error("Databricks LLM client test failed: No response")
+            return None
+    except Exception as e:
+        logger.error(f"Error initializing Databricks LLM client: {e}")
+        return None

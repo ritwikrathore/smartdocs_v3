@@ -1,0 +1,685 @@
+"""
+Tools column display for analysis results.
+"""
+
+import streamlit as st
+import base64
+import json
+import zipfile
+import fitz
+import pandas as pd
+from io import BytesIO
+from datetime import datetime
+from typing import List, Dict, Any
+from ..config import logger, RAG_TOP_K
+from ..models.embedding import load_embedding_model, load_reranker_model
+from ..rag.retrieval import retrieve_relevant_chunks_for_chat
+from ..utils.async_utils import run_async
+from ..ai.analyzer import DocumentAnalyzer
+from ..ai.chat import generate_chat_response
+from .pdf_utils import update_pdf_view, regenerate_annotated_pdfs_from_chat_chunks
+from .citation_utils import (
+    process_chat_response_for_numbered_citations,
+    display_chat_message_with_citations
+)
+from .export_utils import export_to_word
+from ..utils.langfuse_tracing import (
+    start_span,
+    set_span_output,
+    record_span_error,
+    get_langfuse_client_cached,
+)
+
+def _get_embedding_model():
+    """Lazily retrieve the shared embedding model."""
+    return load_embedding_model()
+
+
+def _get_reranker_model():
+    """Lazily retrieve the reranker model."""
+    return load_reranker_model()
+
+
+def display_tools_column(results_with_real_analysis: List, tools_col):
+    """
+    Display the tools column with PDF viewer, chat, and export options.
+    
+    Args:
+        results_with_real_analysis: List of tuples containing (result, ai_analysis) pairs
+        tools_col: Streamlit column object for the tools
+    """
+    embedding_model = _get_embedding_model()
+    reranker_model = _get_reranker_model()
+
+    with tools_col:
+        # Header style from app.py.bak
+        st.markdown('<div class="header-title">Analysis Tools & PDF Viewer</div>', unsafe_allow_html=True)
+        st.markdown('<hr style="margin: 12px 0; border: 0; border-top: 1px solid #e0e0e0;">', unsafe_allow_html=True)
+
+        # Container for tools
+        with st.container():
+            # SmartChat Expander
+            with st.expander("💬 SmartChat (Multi-Document Chat)", expanded=False):                
+                # Initialize chat specific data if not exists
+                if "chat_specific_data" not in st.session_state:
+                    st.session_state.chat_specific_data = {}
+                
+                # Get available documents
+                main_docs = list(st.session_state.get("preprocessed_data", {}).keys())
+                chat_docs = list(st.session_state.chat_specific_data.keys())
+                all_docs = sorted(list(set(main_docs + chat_docs)))
+                
+                # Document Selection and Upload Row
+                sel_col, add_col = st.columns([0.85, 0.15])
+                
+                with sel_col:
+                    selected_docs = st.multiselect(
+                        "Select documents for chat context:",
+                        options=all_docs,
+                        default=all_docs,
+                        key="smart_chat_doc_selection",
+                        label_visibility="collapsed",
+                        placeholder="Select documents for chat..."
+                    )
+                
+                with add_col:
+                    # Document Upload for Chat
+                    with st.popover("➕", use_container_width=True, help="Add chat-only documents"):
+                        st.markdown("Upload documents **only for this chat session**. These will not affect the main analysis.")
+                        uploaded_chat_files = st.file_uploader(
+                            "Upload PDF or Word documents", 
+                            type=["pdf", "docx"], 
+                            accept_multiple_files=True,
+                            key="chat_file_uploader"
+                        )
+                        
+                        if uploaded_chat_files:
+                            # Import here to avoid circular dependency
+                            from ..app import preprocess_file
+                            files_processed = False
+                            for uploaded_file in uploaded_chat_files:
+                                if uploaded_file.name not in st.session_state.chat_specific_data:
+                                    with st.spinner(f"Processing {uploaded_file.name}..."):
+                                        file_bytes = uploaded_file.read()
+                                        # Reset file pointer just in case
+                                        uploaded_file.seek(0)
+                                        result = preprocess_file(
+                                            file_bytes, 
+                                            uploaded_file.name, 
+                                            storage_key="chat_specific_data"
+                                        )
+                                        if result["status"] == "success":
+                                            st.success(f"Added {uploaded_file.name}")
+                                            files_processed = True
+                                        else:
+                                            st.error(f"Failed to add {uploaded_file.name}: {result['message']}")
+                            
+                            if files_processed:
+                                st.rerun()
+
+                if not selected_docs:
+                    st.info("Please select or upload documents to start chatting.")
+                else:
+                    # Construct combined data for retrieval
+                    combined_data = {}
+                    for doc_name in selected_docs:
+                        if doc_name in st.session_state.get("preprocessed_data", {}):
+                            combined_data[doc_name] = st.session_state.preprocessed_data[doc_name]
+                        elif doc_name in st.session_state.chat_specific_data:
+                            combined_data[doc_name] = st.session_state.chat_specific_data[doc_name]
+
+                    chat_container = st.container(height=400, border=True)
+                    with chat_container:
+                        # Use enumerate to get the index of each message in the session state list
+                        for msg_idx, message in enumerate(st.session_state.chat_messages):
+                            with st.chat_message(message["role"]):
+                                if message["role"] == "assistant":
+                                    processed_text = message.get("processed_text", message["content"])
+                                    citation_details = message.get("citation_details", [])
+                                    # Pass the message index (msg_idx) to the display function
+                                    display_chat_message_with_citations(processed_text, citation_details, msg_idx)
+                                else:
+                                    # Apply the same word-wrap styling to user messages for consistency
+                                    st.markdown(
+                                        f'<div style="word-wrap: break-word; overflow-wrap: break-word; white-space: normal;">{message["content"]}</div>',
+                                        unsafe_allow_html=True
+                                    )
+
+                    if prompt := st.chat_input("Ask about the uploaded documents...", key="chat_input_main"):
+                        st.session_state.chat_messages.append({"role": "user", "content": prompt})
+                        processed_chat_text = "Error: Could not generate response."
+                        chat_citation_details = []
+                        raw_ai_response_content = ""
+                        
+                        # Get trace_id from the first available result to link chat to parent trace
+                        parent_trace_id = None
+                        for result, _ in results_with_real_analysis:
+                            if isinstance(result, dict):
+                                parent_trace_id = result.get("trace_id")
+                                if parent_trace_id:
+                                    logger.debug(f"Using parent trace_id for SmartChat: {parent_trace_id}")
+                                    break
+
+                        # Create trace_context for linking to parent trace
+                        trace_context_dict = None
+                        if parent_trace_id:
+                            trace_context_dict = {"trace_id": parent_trace_id}
+
+                        # Wrap chat processing in a span linked to the parent trace
+                        span_metadata = {
+                            "question_length": len(prompt),
+                            "parent_trace_id": parent_trace_id,
+                        }
+
+                        with start_span(
+                            name="smartchat-question",
+                            input_data={"question": prompt},
+                            metadata=span_metadata,
+                        ) as chat_span:
+                            try:
+                                # If we have a parent trace, log the linkage
+                                if trace_context_dict and chat_span:
+                                    try:
+                                        langfuse_client = get_langfuse_client_cached()
+                                        if langfuse_client:
+                                            logger.debug(f"SmartChat span created, intended parent trace: {parent_trace_id}")
+                                    except Exception as link_err:
+                                        logger.debug(f"Could not link span to parent trace: {link_err}")
+
+                                with st.spinner("Thinking..."):
+                                    logger.info(f"Chat RAG started for: {prompt[:50]}...")
+                                    # Use same retrieval depth as main analysis for consistency
+                                    relevant_chunks = retrieve_relevant_chunks_for_chat(
+                                        prompt=prompt,
+                                        top_k_per_doc=RAG_TOP_K,
+                                        embedding_model=embedding_model,
+                                        reranker_model=reranker_model,  # Use local reranker model
+                                        preprocessed_data=combined_data
+                                    )
+                                    analyzer = DocumentAnalyzer()
+                                    logger.info(f"Generating chat response for: {prompt[:50]}...")
+                                    raw_ai_response_content = run_async(
+                                        generate_chat_response(
+                                            analyzer,
+                                            prompt,
+                                            relevant_chunks
+                                        )
+                                    )
+                                    logger.info("Chat response generated.")
+                                    
+                                    # Refresh PDF highlighting to reflect the new RAG chunks BEFORE processing citations
+                                    # This ensures that find_annotated_pdf_for_filename can find the newly generated/updated PDF
+                                    # in analysis_results, especially for chat-only documents.
+                                    try:
+                                        regenerate_annotated_pdfs_from_chat_chunks(relevant_chunks)
+                                    except Exception as _e:
+                                        logger.warning(f"Could not refresh PDF highlights for chat: {_e}")
+
+                                    processed_chat_text, chat_citation_details = process_chat_response_for_numbered_citations(raw_ai_response_content)
+
+                                # Record span output
+                                set_span_output(
+                                    chat_span,
+                                    output={"answer_length": len(raw_ai_response_content), "num_citations": len(chat_citation_details)},
+                                    metadata={"num_chunks_used": len(relevant_chunks)},
+                                )
+
+                            except Exception as chat_err:
+                                logger.error(f"Error during chat processing: {chat_err}", exc_info=True)
+                                processed_chat_text = f"Sorry, an error occurred while processing your request: {str(chat_err)}"
+                                chat_citation_details = []
+                                if chat_span:
+                                    record_span_error(chat_span, chat_err)
+                        
+                        st.session_state.chat_messages.append({
+                            "role": "assistant",
+                            "content": raw_ai_response_content,
+                            "processed_text": processed_chat_text,
+                            "citation_details": chat_citation_details
+                        })
+                        st.rerun()
+
+            # Export Results Expander
+            with st.expander("📊 Export Results", expanded=False):
+                st.caption("Export analysis results in Excel or Word format for further review and documentation.")
+                # Prepare data for export
+                exportable_results_list = []
+
+                for result, ai_analysis in results_with_real_analysis:
+                    filename = result.get("filename", "Unknown File")
+                    verification_results = result.get("verification_results", {})
+                    phrase_locations = result.get("phrase_locations", {})
+
+                    # Build mapping from section_key to original sub_prompt
+                    section_to_prompt = {}
+                    sub_prompt_results = result.get("sub_prompt_results") or []
+                    for sub_prompt_entry in sub_prompt_results:
+                        if isinstance(sub_prompt_entry, dict):
+                            sec_key = sub_prompt_entry.get("section_key")
+                            sub_prompt_text = sub_prompt_entry.get("sub_prompt")
+                            if sec_key and sub_prompt_text:
+                                section_to_prompt[sec_key] = sub_prompt_text
+
+                    # Prepare a list of flattened data for this file
+                    file_data = []
+                    phrase_details: Dict[str, Any] = {}
+
+                    for section_key, section_data in ai_analysis.get("analysis_sections", {}).items():
+                        section_name = section_key.replace("_", " ").title()
+                        analysis_text = section_data.get("Analysis", "")
+                        context = section_data.get("Context", "")
+
+                        # Process each supporting phrase
+                        supporting_phrases = section_data.get("Supporting_Phrases", [])
+                        if supporting_phrases and supporting_phrases != ["No relevant phrase found."]:
+                            for phrase in supporting_phrases:
+                                phrase_verification = verification_results.get(phrase, {})
+                                phrase_location_data = phrase_locations.get(phrase, {})
+
+                                is_verified = False
+                                score = 0
+                                best_location = None
+
+                                if isinstance(phrase_verification, bool):
+                                    is_verified = phrase_verification
+                                elif isinstance(phrase_verification, dict):
+                                    is_verified = phrase_verification.get("verified", False)
+                                    score = phrase_verification.get("score", 0)
+
+                                # Find best location
+                                candidate_locs = []
+                                if isinstance(phrase_location_data, list):
+                                    candidate_locs = [loc for loc in phrase_location_data if isinstance(loc, dict)]
+                                elif isinstance(phrase_location_data, dict):
+                                    if 'best_match' in phrase_location_data:
+                                        candidate_locs = [phrase_location_data['best_match']]
+                                    else:
+                                        candidate_locs = [phrase_location_data]
+
+                                if candidate_locs:
+                                    method_priority = {
+                                        'exact': 5,
+                                        'exact_cleaned_search': 5,
+                                        'special_case_quotes_handling': 3,
+                                        'cross_page_fuzzy_match_part1': 2,
+                                        'cross_page_fuzzy_match_part2': 2,
+                                        'fuzzy': 2,
+                                        'fuzzy_chunk_fallback_individual': 1,
+                                        'fuzzy_chunk_fallback': 0
+                                    }
+
+                                    def loc_key(loc):
+                                        method = loc.get('method', '')
+                                        score_val = loc.get('match_score', 0) or 0
+                                        try:
+                                            score_val = float(score_val)
+                                        except Exception:
+                                            score_val = 0.0
+                                        return (method_priority.get(method, -1), score_val)
+
+                                    best_location = max(candidate_locs, key=loc_key)
+                                    phrase_details.setdefault(phrase, {})["candidate_locations"] = candidate_locs
+                                else:
+                                    phrase_details.setdefault(phrase, {})["candidate_locations"] = []
+
+                                # Calculate page number
+                                if isinstance(best_location, dict) and "page_num" in best_location:
+                                    page_num = best_location.get("page_num", -1) + 1
+                                else:
+                                    page_num = "Unknown"
+
+                                # Determine match score display value
+                                match_score_value = None
+                                if isinstance(best_location, dict):
+                                    match_score_value = best_location.get("match_score")
+                                if match_score_value is None:
+                                    match_score_value = score
+
+                                if match_score_value:
+                                    try:
+                                        match_score_display = f"{float(match_score_value):.1f}%"
+                                    except Exception:
+                                        match_score_display = str(match_score_value)
+                                else:
+                                    match_score_display = "N/A"
+
+                                phrase_details.setdefault(phrase, {}).update({
+                                    "verified": is_verified,
+                                    "best_location": best_location,
+                                    "match_score": match_score_value,
+                                })
+
+                                file_data.append({
+                                    "Filename": filename,
+                                    "Section": section_name,
+                                    "Analysis": analysis_text,
+                                    "Context": context,
+                                    "Supporting Phrase": phrase,
+                                    "Verified": "Yes" if is_verified else "No",
+                                    "Page": page_num,
+                                    "Match Score": match_score_display
+                                })
+
+                    # Add this file's data to the exportable results
+                    exportable_results_list.append({
+                        "filename": filename,
+                        "data": file_data,
+                        "analysis": ai_analysis,
+                        "phrase_details": phrase_details,
+                        "phrase_locations": phrase_locations,
+                        "annotated_pdf": result.get("annotated_pdf"),
+                        "section_to_prompt": section_to_prompt
+                    })
+
+                # Excel Export
+                if exportable_results_list:
+                    # Flatten all data for Excel export
+                    flat_data = []
+                    for file_result in exportable_results_list:
+                        flat_data.extend(file_result["data"])
+
+                    # Add follow-up Q&A data if any exist
+                    followup_qa = st.session_state.get("followup_qa", [])
+                    if followup_qa:
+                        for i, qa_pair in enumerate(followup_qa):
+                            flat_data.append({
+                                "Filename": "Follow-up Q&A",
+                                "Section": f"Question {i+1}",
+                                "Analysis": f"Q: {qa_pair.get('question', '')}\n\nA: {qa_pair.get('answer', '')}",
+                                "Context": f"Asked on: {qa_pair.get('timestamp', 'Unknown')}",
+                                "Supporting Phrase": f"Citations: {len(qa_pair.get('citation_details', []))} found",
+                                "Verified": "N/A",
+                                "Page": "N/A",
+                                "Match Score": "N/A"
+                            })
+
+                    # Create DataFrame and export to Excel
+                    df = pd.DataFrame(flat_data)
+                    excel_buffer = BytesIO()
+                    with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
+                        df.to_excel(writer, index=False, sheet_name='Analysis Results')
+                    excel_buffer.seek(0)
+
+                    st.download_button(
+                        label="📥 Download Excel",
+                        data=excel_buffer.getvalue(),
+                        file_name=f"analysis_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="download_excel",
+                        use_container_width=True
+                    )
+
+                # Word Export
+                if exportable_results_list:
+                    word_bytes = export_to_word(exportable_results_list)
+                    st.download_button(
+                        label="📥 Download Word",
+                        data=word_bytes,
+                        file_name=f"analysis_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx",
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        key="download_word",
+                        use_container_width=True
+                    )
+
+            # Fact Extraction (beta) Expander - Separate expander as in original
+            with st.expander("🧪 Fact Extraction (beta)", expanded=False):
+                st.caption("Identify fact types and extract structured information from analysis text.")
+
+                if st.button("Generate Facts", key="compute_fact_definitions_beta"):
+                    with st.spinner("Extracting facts using LLM-based analysis..."):
+                        try:
+                            from src.keyword_code.services.fact_extraction_service import FactExtractionService
+
+                            # Initialize the fact extraction service
+                            fact_service = FactExtractionService()
+
+                            # Show progress and debug info
+                            st.info(f"Processing {len(results_with_real_analysis)} document(s)...")
+
+                            # Debug: Show what sections we're processing
+                            total_sections = 0
+                            for res, ai in results_with_real_analysis:
+                                sections = (ai or {}).get("analysis_sections", {}) or {}
+                                total_sections += len([s for s in sections.values() if s.get("Analysis")])
+                            st.info(f"Found {total_sections} sections with analysis text")
+
+                            # Extract facts using the new service
+                            rows = fact_service.extract_fact_definitions_for_results(results_with_real_analysis)
+
+                            if rows:
+                                try:
+                                    # Use the new multi-sheet export helper from the service
+                                    from src.keyword_code.services.fact_extraction_service import export_fact_definitions_to_excel_bytes
+
+                                    excel_bytes = export_fact_definitions_to_excel_bytes(rows)
+                                    st.session_state["facts_defs_excel"] = excel_bytes
+                                    st.success(f"✅ Extracted {len(rows)} facts using intelligent LLM-based analysis.")
+
+                                    # Show a preview (first 10 facts across all rows)
+                                    st.subheader("Preview (first 10 facts)")
+                                    preview_df = pd.DataFrame([
+                                        {"Fact": r.get("Fact", ""), "Definition": r.get("Definition", "")}
+                                        for r in rows[:10]
+                                    ])
+                                    st.dataframe(preview_df, use_container_width=True)
+                                except Exception as _exp:
+                                    logger.error(f"Error creating multi-sheet Excel for facts: {_exp}", exc_info=True)
+                                    st.error(f"❌ Error preparing Excel export: {_exp}")
+                                    # Fallback to previous single-sheet behavior
+                                    df_two = pd.DataFrame([{"Fact": r.get("Fact", ""), "Definition": r.get("Definition", "")} for r in rows])
+                                    buf = BytesIO()
+                                    df_two.to_excel(buf, index=False, engine="openpyxl")
+                                    buf.seek(0)
+                                    st.session_state["facts_defs_excel"] = buf.getvalue()
+                                    st.warning("⚠️ Export used fallback single-sheet format due to an error creating multi-sheet workbook.")
+
+                            else:
+                                st.warning("⚠️ No facts extracted. This could be due to:")
+                                st.write("- No analysis text in the selected documents")
+                                st.write("- LLM extraction did not identify any facts")
+                                st.write("- Analysis text may not contain extractable factual information")
+
+                        except Exception as _fd_err:
+                            st.error(f"❌ Error extracting facts: {_fd_err}")
+                            logger.error(f"Fact extraction error: {_fd_err}", exc_info=True)
+
+                if st.session_state.get("facts_defs_excel"):
+                    st.download_button(
+                        label="📥 Export Fact Definitions (Excel)",
+                        data=st.session_state.get("facts_defs_excel"),
+                        file_name=f"fact_definitions_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="download_fact_defs_excel"
+                    )
+
+            # Report Issue Expander
+            with st.expander("🐞 Report Issue", expanded=False):
+                st.markdown("""
+                ### Report an Issue
+
+                If you encounter any problems with the analysis or have feedback, please describe the issue below.
+                A report package will be generated that you can send to the CNT Automations team.
+
+                Positive feedback is good, negative feedback is even better!
+
+                """)
+
+                # Issue description input
+                issue_description = st.text_area(
+                    "Issue Description",
+                    placeholder="Please describe the issue you're experiencing...",
+                    height=150
+                )
+
+                # Create report package filename
+                report_filename = f'smartdocs_report_{datetime.now().strftime("%Y%m%d_%H%M%S")}.zip'
+
+                # Check if description is provided
+                download_disabled = not issue_description.strip()
+
+                # Create the report package content
+                try:
+                    # Generate package content only if description is provided
+                    if not download_disabled:
+                        # Create a function to generate the report package
+                        def create_report_package_for_download(desc):
+                            try:
+                                report_data = {
+                                    "timestamp": datetime.now().isoformat(),
+                                    "issue_description": desc,
+                                    "user_inputs": {
+                                        "prompt": st.session_state.get('user_prompt', ''),
+                                    },
+                                    "analysis_results": st.session_state.get('analysis_results', None),
+                                    "current_document": st.session_state.get('current_pdf_name', None),
+                                    "preprocessed_data_keys": list(st.session_state.get('preprocessed_data', {}).keys()),
+                                    "chat_history_summary": [
+                                        {"role": msg.get("role"), "content_preview": msg.get("content", "")[:100]+"..."}
+                                        for msg in st.session_state.get("chat_messages", [])
+                                    ],
+                                    "followup_qa": st.session_state.get("followup_qa", [])
+                                }
+
+                                zip_buffer = BytesIO()
+                                with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+                                    # Write report data as JSON
+                                    try:
+                                        zip_file.writestr('report_data.json', json.dumps(report_data, indent=2, default=str))
+                                    except Exception as json_err:
+                                        zip_file.writestr('report_data_error.txt', f"Error serializing report data: {json_err}")
+                                        logger.error(f"Error serializing report_data.json: {json_err}", exc_info=True)
+
+                                    # Write original uploaded files
+                                    uploaded_file_objs = st.session_state.get('uploaded_file_objects')
+                                    if uploaded_file_objs:
+                                        for uploaded_file in uploaded_file_objs:
+                                            try:
+                                                if hasattr(uploaded_file, 'name') and hasattr(uploaded_file, 'getvalue'):
+                                                    zip_file.writestr(f'original_docs/{uploaded_file.name}', uploaded_file.getvalue())
+                                                else:
+                                                    logger.warning(f"Skipping invalid file object in uploaded_file_objects during report creation: {type(uploaded_file)}")
+                                            except Exception as file_read_err:
+                                                zip_file.writestr(f'original_docs/ERROR_{uploaded_file.name}.txt', f"Error reading file: {file_read_err}")
+                                                logger.error(f"Error reading file {uploaded_file.name} for report package: {file_read_err}", exc_info=True)
+
+                                    # Write annotated PDFs
+                                    analysis_results_list = st.session_state.get('analysis_results')
+                                    if analysis_results_list:
+                                        for result in analysis_results_list:
+                                            if isinstance(result, dict) and 'annotated_pdf' in result and result.get('annotated_pdf'):
+                                                try:
+                                                    pdf_bytes = base64.b64decode(result['annotated_pdf'])
+                                                    pdf_filename = result.get('filename', f'unknown_annotated_{result.get("timestamp", "ts")}.pdf')
+                                                    zip_file.writestr(f'annotated_pdfs/{pdf_filename}', pdf_bytes)
+                                                except Exception as pdf_err:
+                                                    zip_file.writestr(f'annotated_pdfs/ERROR_{result.get("filename", "unknown")}.txt', f"Error decoding/writing PDF: {pdf_err}")
+                                                    logger.error(f"Error writing annotated PDF {result.get('filename')} to report: {pdf_err}", exc_info=True)
+
+                                zip_buffer.seek(0)
+                                return zip_buffer.getvalue()
+                            except Exception as zip_e:
+                                logger.error(f"Error creating report package zip file: {zip_e}", exc_info=True)
+                                # Create a simple error zip as fallback
+                                zip_buffer = BytesIO()
+                                with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+                                    zip_file.writestr('error_creating_report.txt', f"Failed to create full report package: {zip_e}")
+                                zip_buffer.seek(0)
+                                return zip_buffer.getvalue()
+
+                        # Create the download button
+                        st.download_button(
+                            label="📥 Download Report Package",
+                            data=create_report_package_for_download(issue_description),
+                            file_name=report_filename,
+                            mime='application/zip',
+                            disabled=download_disabled,
+                            help="Download the report package to attach to your email.",
+                            key="download_report_button",
+                            use_container_width=True
+                        )
+
+                        st.success("""
+                        Report package created successfully. Please download and email it to cnt_automations@ifc.org.
+
+                        The package includes:
+                        - Your issue description
+                        - Analysis results
+                        - Original documents
+                        - Annotated PDFs
+                        - Chat history
+                        """)
+                    else:
+                        # Show disabled button with message
+                        st.button(
+                            "📥 Download Report Package",
+                            disabled=True,
+                            key="disabled_download_button",
+                            help="Please provide an issue description first",
+                            use_container_width=True
+                        )
+                        st.info("Please provide a description of the issue before downloading the report package.")
+                except Exception as e:
+                    st.error(f"Error preparing report package: {str(e)}")
+                    logger.error(f"Error preparing report package for download button: {str(e)}", exc_info=True)
+
+                st.info("Note: The report package will include the uploaded documents and analysis results to help diagnose the issue.")
+
+            # PDF Viewer Expander
+            with st.expander("📄 PDF Viewer", expanded=st.session_state.get("show_pdf", False)):
+                # Add an anchor for scrolling to PDF viewer
+                st.markdown('<div id="pdf-viewer-anchor"></div>', unsafe_allow_html=True)
+
+                if st.session_state.get("pdf_bytes") and st.session_state.get("show_pdf", False):
+                    fitz_doc = None  # Initialize fitz_doc
+                    try:
+                        pdf_bytes = st.session_state.pdf_bytes
+                        current_page = st.session_state.get("pdf_page", 1)
+                        filename = st.session_state.get("current_pdf_name", "Document")
+
+                        # Display filename
+                        st.caption(f"**{filename}**")
+
+                        # Render the current page using PyMuPDF
+                        fitz_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+                        page_count = len(fitz_doc)
+
+                        if page_count == 0:
+                            st.warning("The PDF document appears to have 0 pages.")
+                        else:
+                            # Ensure current page is valid
+                            current_page = max(1, min(current_page, page_count))
+
+                            # Page navigation
+                            nav_key = f"pdf_nav_{filename}_{page_count}_{hash(pdf_bytes)}"
+                            new_page = st.number_input(
+                                "Page",
+                                min_value=1,
+                                max_value=page_count,
+                                value=current_page,
+                                step=1,
+                                key=nav_key,
+                                help=f"Enter page number (1-{page_count})"
+                            )
+                            if new_page != current_page:
+                                update_pdf_view(pdf_bytes, new_page, filename)
+                                st.rerun()
+
+                            st.caption(f"Page {current_page} of {page_count}")
+
+                            # Render the page
+                            page = fitz_doc.load_page(current_page - 1)  # 0-indexed
+                            pix = page.get_pixmap(dpi=150)
+                            img_bytes = pix.tobytes("png")
+
+                            # Display the page image
+                            st.image(img_bytes, use_container_width=True)
+
+                    except Exception as e:
+                        logger.error(f"Error displaying PDF: {e}")
+                        st.error(f"Error displaying PDF: {e}")
+                    finally:
+                        if fitz_doc:
+                            fitz_doc.close()
+                else:
+                    st.info("Select a document to view by clicking on a 'Go' button in the analysis or using the 'View' button.")
+
