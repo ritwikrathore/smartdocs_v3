@@ -142,6 +142,31 @@ All codes are also logged with prefix `UI Patch Error` or `UI Patch Warning` for
 grep "UI Patch" logs/app_*.log
 ```
 
+### Saved Prompts (Pills) Toast Codes
+When a user clicks on a saved prompt pill, a toast notification appears confirming the action.
+
+#### Success Codes (2xx)
+| Code | Toast Message | Meaning |
+|------|---------------|---------|
+| PILL-200 | Loaded '{pill_name}' | Saved prompt successfully loaded into text area |
+| PILL-201 | (logged only) | Prompt selection cleared (no toast shown) |
+
+#### Error Codes (1xx)
+| Code | Toast Message | Meaning | Action |
+|------|---------------|---------|--------|
+| PILL-100 | Failed to load prompt | Unexpected error loading saved prompt | Check logs for stack trace |
+| PILL-101 | Prompt not found | Pill label not found in suggestion list | Verify prompt configuration |
+
+#### Expected Behavior
+- **Normal operation**: You should see `PILL-200: Loaded '{prompt_name}'` when clicking a pill
+- **Errors (1xx)**: Indicates a configuration or code issue that needs investigation
+
+#### Log Correlation
+All pill codes are also logged for searching:
+```bash
+grep "PILL-" logs/app_*.log
+```
+
 ## File Size Impact
 - MaterialSymbolsRounded.woff2: ~291 KB (primary font)
 - MaterialIcons-Regular.woff2: ~125 KB (legacy fallback)

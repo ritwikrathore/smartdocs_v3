@@ -1382,15 +1382,40 @@ else:
                 label_visibility="visible"
             )
 
+            # Track pill selection changes to show toast only on new selections
+            previous_pill = st.session_state.get("_last_selected_pill")
+
             if selected_pill:
                 try:
                     idx = suggestion_labels.index(selected_pill)
-                    st.session_state["user_prompt"] = suggestion_prompts[idx]
+                    prompt_text = suggestion_prompts[idx]
+                    st.session_state["user_prompt"] = prompt_text
                     exp_cat = explanations_map.get(selected_pill)
                     if exp_cat and exp_cat[0]:
                         st.caption(f"{exp_cat[1]} • {exp_cat[0]}")
-                except ValueError:
-                    logger.warning(f"Selected pill '{selected_pill}' not found in suggestion labels.")
+
+                    # Show toast only when pill selection changes (not on every rerun)
+                    if selected_pill != previous_pill:
+                        st.session_state["_last_selected_pill"] = selected_pill
+                        # PILL-200: Successfully copied prompt to text area
+                        prompt_preview = prompt_text[:50] + "..." if len(prompt_text) > 50 else prompt_text
+                        st.toast(f"PILL-200: Loaded '{selected_pill}'", icon="✅")
+                        logger.info(f"PILL-200: Saved prompt '{selected_pill}' loaded into text area ({len(prompt_text)} chars)")
+
+                except ValueError as ve:
+                    # PILL-101: Pill label not found in suggestion list
+                    st.toast(f"PILL-101: Prompt not found", icon="⚠️")
+                    logger.warning(f"PILL-101: Selected pill '{selected_pill}' not found in suggestion labels. Error: {ve}")
+                except Exception as e:
+                    # PILL-100: Unexpected error loading prompt
+                    st.toast(f"PILL-100: Failed to load prompt", icon="❌")
+                    logger.error(f"PILL-100: Unexpected error loading saved prompt '{selected_pill}': {e}", exc_info=True)
+            else:
+                # Clear tracking when no pill is selected
+                if previous_pill is not None:
+                    st.session_state["_last_selected_pill"] = None
+                    # PILL-201: Prompt selection cleared
+                    logger.debug("PILL-201: Saved prompt selection cleared")
 
             label = "Analysis Prompt" if st.session_state.smartdocs_mode == "Ask" else "Validation Rules"
             st.session_state.user_prompt = st.text_area(
