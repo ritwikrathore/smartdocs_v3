@@ -1,0 +1,1603 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SmartDocs RAG Pipeline - Chunk to Highlight Journey</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        :root {
+            --bg-primary: #0d1117;
+            --bg-secondary: #161b22;
+            --bg-tertiary: #21262d;
+            --text-primary: #c9d1d9;
+            --text-secondary: #8b949e;
+            --accent-blue: #58a6ff;
+            --accent-green: #3fb950;
+            --accent-purple: #a371f7;
+            --accent-orange: #d29922;
+            --accent-red: #f85149;
+            --accent-cyan: #39c5cf;
+            --border-color: #30363d;
+            --glow-blue: rgba(88, 166, 255, 0.3);
+            --glow-green: rgba(63, 185, 80, 0.3);
+            --glow-purple: rgba(163, 113, 247, 0.3);
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            min-height: 100vh;
+            line-height: 1.6;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 2rem;
+        }
+
+        header {
+            text-align: center;
+            margin-bottom: 3rem;
+            padding: 2rem;
+            background: linear-gradient(135deg, var(--bg-secondary) 0%, var(--bg-tertiary) 100%);
+            border-radius: 16px;
+            border: 1px solid var(--border-color);
+        }
+
+        h1 {
+            font-size: 2.5rem;
+            background: linear-gradient(90deg, var(--accent-blue), var(--accent-purple));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            margin-bottom: 0.5rem;
+        }
+
+        .subtitle {
+            color: var(--text-secondary);
+            font-size: 1.1rem;
+        }
+
+        /* Pipeline Navigation */
+        .pipeline-nav {
+            display: flex;
+            justify-content: center;
+            flex-wrap: wrap;
+            gap: 0.5rem;
+            margin-bottom: 2rem;
+            padding: 1rem;
+            background: var(--bg-secondary);
+            border-radius: 12px;
+            border: 1px solid var(--border-color);
+        }
+
+        .nav-btn {
+            padding: 0.75rem 1.25rem;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            color: var(--text-secondary);
+            cursor: pointer;
+            font-size: 0.9rem;
+            transition: all 0.3s ease;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .nav-btn:hover {
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            border-color: var(--accent-blue);
+        }
+
+        .nav-btn.active {
+            background: var(--accent-blue);
+            color: white;
+            border-color: var(--accent-blue);
+            box-shadow: 0 0 20px var(--glow-blue);
+        }
+
+        .nav-btn .step-num {
+            background: rgba(255,255,255,0.1);
+            padding: 0.2rem 0.5rem;
+            border-radius: 4px;
+            font-weight: bold;
+            font-size: 0.8rem;
+        }
+
+        .nav-btn.active .step-num {
+            background: rgba(255,255,255,0.2);
+        }
+
+        /* Main Content Area */
+        .content-wrapper {
+            display: grid;
+            grid-template-columns: 1fr 350px;
+            gap: 2rem;
+        }
+
+        @media (max-width: 1200px) {
+            .content-wrapper {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        /* Step Content */
+        .step-content {
+            display: none;
+            animation: fadeIn 0.4s ease;
+        }
+
+        .step-content.active {
+            display: block;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .step-card {
+            background: var(--bg-secondary);
+            border-radius: 16px;
+            border: 1px solid var(--border-color);
+            overflow: hidden;
+        }
+
+        .step-header {
+            padding: 1.5rem 2rem;
+            background: linear-gradient(135deg, var(--bg-tertiary) 0%, var(--bg-secondary) 100%);
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .step-header h2 {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+            font-size: 1.5rem;
+        }
+
+        .step-icon {
+            width: 48px;
+            height: 48px;
+            border-radius: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.5rem;
+        }
+
+        .step-body {
+            padding: 2rem;
+        }
+
+        .step-description {
+            font-size: 1.1rem;
+            color: var(--text-secondary);
+            margin-bottom: 2rem;
+            line-height: 1.8;
+        }
+
+        /* Code Block */
+        .code-block {
+            background: var(--bg-primary);
+            border-radius: 12px;
+            border: 1px solid var(--border-color);
+            margin: 1.5rem 0;
+            overflow: hidden;
+        }
+
+        .code-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 0.75rem 1rem;
+            background: var(--bg-tertiary);
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .code-title {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+        }
+
+        .code-title .dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+        }
+
+        .code-content {
+            padding: 1rem 1.5rem;
+            font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+            font-size: 0.85rem;
+            line-height: 1.7;
+            overflow-x: auto;
+        }
+
+        .code-content .keyword { color: var(--accent-purple); }
+        .code-content .string { color: var(--accent-green); }
+        .code-content .function { color: var(--accent-blue); }
+        .code-content .comment { color: var(--text-secondary); font-style: italic; }
+        .code-content .number { color: var(--accent-orange); }
+        .code-content .type { color: var(--accent-cyan); }
+
+        /* Data Flow Diagram */
+        .flow-diagram {
+            background: var(--bg-primary);
+            border-radius: 12px;
+            border: 1px solid var(--border-color);
+            padding: 2rem;
+            margin: 1.5rem 0;
+        }
+
+        .flow-item {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+            padding: 1rem;
+            background: var(--bg-secondary);
+            border-radius: 8px;
+            margin-bottom: 0.75rem;
+            border-left: 3px solid var(--accent-blue);
+            transition: all 0.3s ease;
+        }
+
+        .flow-item:hover {
+            transform: translateX(5px);
+            border-left-color: var(--accent-green);
+        }
+
+        .flow-item .icon {
+            width: 40px;
+            height: 40px;
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.2rem;
+            flex-shrink: 0;
+        }
+
+        .flow-arrow {
+            text-align: center;
+            color: var(--accent-blue);
+            font-size: 1.5rem;
+            margin: 0.5rem 0;
+        }
+
+        /* Metadata Table */
+        .metadata-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 1.5rem 0;
+        }
+
+        .metadata-table th,
+        .metadata-table td {
+            padding: 0.75rem 1rem;
+            text-align: left;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .metadata-table th {
+            background: var(--bg-tertiary);
+            color: var(--text-primary);
+            font-weight: 600;
+        }
+
+        .metadata-table td {
+            color: var(--text-secondary);
+        }
+
+        .metadata-table tr:hover td {
+            background: var(--bg-tertiary);
+        }
+
+        .badge {
+            display: inline-block;
+            padding: 0.25rem 0.5rem;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            font-weight: 600;
+        }
+
+        .badge-blue { background: rgba(88, 166, 255, 0.2); color: var(--accent-blue); }
+        .badge-green { background: rgba(63, 185, 80, 0.2); color: var(--accent-green); }
+        .badge-purple { background: rgba(163, 113, 247, 0.2); color: var(--accent-purple); }
+        .badge-orange { background: rgba(210, 153, 34, 0.2); color: var(--accent-orange); }
+
+        /* Sidebar - Pipeline Overview */
+        .sidebar {
+            position: sticky;
+            top: 2rem;
+            height: fit-content;
+        }
+
+        .sidebar-card {
+            background: var(--bg-secondary);
+            border-radius: 16px;
+            border: 1px solid var(--border-color);
+            overflow: hidden;
+        }
+
+        .sidebar-header {
+            padding: 1rem 1.5rem;
+            background: var(--bg-tertiary);
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .sidebar-header h3 {
+            font-size: 1rem;
+            color: var(--text-primary);
+        }
+
+        .pipeline-visual {
+            padding: 1.5rem;
+        }
+
+        .pipeline-step {
+            display: flex;
+            align-items: flex-start;
+            gap: 1rem;
+            padding: 0.75rem 0;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+
+        .pipeline-step:hover {
+            background: var(--bg-tertiary);
+            margin: 0 -1.5rem;
+            padding-left: 1.5rem;
+            padding-right: 1.5rem;
+        }
+
+        .pipeline-step.current {
+            background: rgba(88, 166, 255, 0.1);
+            margin: 0 -1.5rem;
+            padding-left: 1.5rem;
+            padding-right: 1.5rem;
+        }
+
+        .pipeline-dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: var(--border-color);
+            margin-top: 0.3rem;
+            flex-shrink: 0;
+            position: relative;
+        }
+
+        .pipeline-dot::after {
+            content: '';
+            position: absolute;
+            left: 50%;
+            top: 100%;
+            width: 2px;
+            height: 30px;
+            background: var(--border-color);
+            transform: translateX(-50%);
+        }
+
+        .pipeline-step:last-child .pipeline-dot::after {
+            display: none;
+        }
+
+        .pipeline-step.current .pipeline-dot {
+            background: var(--accent-blue);
+            box-shadow: 0 0 10px var(--glow-blue);
+        }
+
+        .pipeline-step.completed .pipeline-dot {
+            background: var(--accent-green);
+        }
+
+        .pipeline-info h4 {
+            font-size: 0.9rem;
+            margin-bottom: 0.25rem;
+        }
+
+        .pipeline-info p {
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+        }
+
+        /* Key Points */
+        .key-points {
+            margin-top: 2rem;
+        }
+
+        .key-point {
+            display: flex;
+            gap: 1rem;
+            padding: 1rem;
+            background: var(--bg-primary);
+            border-radius: 8px;
+            margin-bottom: 0.75rem;
+            border: 1px solid var(--border-color);
+        }
+
+        .key-point-icon {
+            width: 32px;
+            height: 32px;
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-shrink: 0;
+        }
+
+        .key-point-text h5 {
+            font-size: 0.9rem;
+            margin-bottom: 0.25rem;
+        }
+
+        .key-point-text p {
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+        }
+
+        /* Visual Diagrams */
+        .visual-box {
+            background: linear-gradient(135deg, var(--bg-tertiary) 0%, var(--bg-secondary) 100%);
+            border-radius: 12px;
+            padding: 2rem;
+            margin: 1.5rem 0;
+            border: 1px solid var(--border-color);
+        }
+
+        .visual-title {
+            font-size: 0.9rem;
+            color: var(--accent-blue);
+            margin-bottom: 1rem;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        .chunk-example {
+            background: var(--bg-primary);
+            border-radius: 8px;
+            padding: 1rem;
+            font-family: 'SF Mono', monospace;
+            font-size: 0.8rem;
+            margin-bottom: 1rem;
+            border: 1px solid var(--border-color);
+        }
+
+        .chunk-example .highlight {
+            background: rgba(255, 213, 0, 0.3);
+            padding: 0 0.25rem;
+            border-radius: 2px;
+        }
+
+        /* Score Visualization */
+        .score-bar {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            margin: 0.5rem 0;
+        }
+
+        .score-label {
+            width: 100px;
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+        }
+
+        .score-track {
+            flex: 1;
+            height: 8px;
+            background: var(--bg-tertiary);
+            border-radius: 4px;
+            overflow: hidden;
+        }
+
+        .score-fill {
+            height: 100%;
+            border-radius: 4px;
+            transition: width 0.5s ease;
+        }
+
+        .score-value {
+            width: 50px;
+            text-align: right;
+            font-size: 0.8rem;
+            font-weight: 600;
+        }
+
+        /* Animation Classes */
+        .pulse {
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        /* Footer */
+        footer {
+            text-align: center;
+            padding: 2rem;
+            margin-top: 3rem;
+            border-top: 1px solid var(--border-color);
+            color: var(--text-secondary);
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>SmartDocs RAG Pipeline</h1>
+            <p class="subtitle">Understanding How Chunks Journey from Source Documents to Highlighted Citations</p>
+        </header>
+
+        <nav class="pipeline-nav">
+            <button class="nav-btn active" onclick="showStep(1)">
+                <span class="step-num">1</span>
+                Document Upload
+            </button>
+            <button class="nav-btn" onclick="showStep(2)">
+                <span class="step-num">2</span>
+                Chunking
+            </button>
+            <button class="nav-btn" onclick="showStep(3)">
+                <span class="step-num">3</span>
+                Metadata & BBox
+            </button>
+            <button class="nav-btn" onclick="showStep(4)">
+                <span class="step-num">4</span>
+                Embeddings
+            </button>
+            <button class="nav-btn" onclick="showStep(5)">
+                <span class="step-num">5</span>
+                RAG Retrieval
+            </button>
+            <button class="nav-btn" onclick="showStep(6)">
+                <span class="step-num">6</span>
+                Reranking
+            </button>
+            <button class="nav-btn" onclick="showStep(7)">
+                <span class="step-num">7</span>
+                LLM Analysis
+            </button>
+            <button class="nav-btn" onclick="showStep(8)">
+                <span class="step-num">8</span>
+                Verification
+            </button>
+            <button class="nav-btn" onclick="showStep(9)">
+                <span class="step-num">9</span>
+                Highlighting
+            </button>
+        </nav>
+
+        <div class="content-wrapper">
+            <main>
+                <!-- Step 1: Document Upload -->
+                <div class="step-content active" id="step-1">
+                    <div class="step-card">
+                        <div class="step-header">
+                            <h2>
+                                <span class="step-icon" style="background: linear-gradient(135deg, #58a6ff, #388bfd);">📄</span>
+                                Document Upload & Processing
+                            </h2>
+                        </div>
+                        <div class="step-body">
+                            <p class="step-description">
+                                The journey begins when a user uploads a PDF or DOCX file. The document is processed
+                                through <code>process_file_wrapper</code> in <code>app.py</code>, which orchestrates the
+                                entire pipeline. The PDF bytes are passed to <code>PDFProcessor</code> for parsing.
+                            </p>
+
+                            <div class="flow-diagram">
+                                <div class="flow-item">
+                                    <span class="icon" style="background: var(--accent-blue);">📤</span>
+                                    <div>
+                                        <strong>User uploads PDF/DOCX</strong>
+                                        <p style="color: var(--text-secondary); font-size: 0.85rem;">File received via Streamlit file uploader</p>
+                                    </div>
+                                </div>
+                                <div class="flow-arrow">↓</div>
+                                <div class="flow-item">
+                                    <span class="icon" style="background: var(--accent-purple);">⚙️</span>
+                                    <div>
+                                        <strong>process_file_wrapper()</strong>
+                                        <p style="color: var(--text-secondary); font-size: 0.85rem;">Main orchestrator in app.py</p>
+                                    </div>
+                                </div>
+                                <div class="flow-arrow">↓</div>
+                                <div class="flow-item">
+                                    <span class="icon" style="background: var(--accent-green);">📑</span>
+                                    <div>
+                                        <strong>PDFProcessor(pdf_bytes)</strong>
+                                        <p style="color: var(--text-secondary); font-size: 0.85rem;">Initialized with raw PDF bytes</p>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="code-block">
+                                <div class="code-header">
+                                    <span class="code-title">
+                                        <span class="dot" style="background: var(--accent-green);"></span>
+                                        processors/pdf_processor.py
+                                    </span>
+                                </div>
+                                <div class="code-content">
+<span class="keyword">class</span> <span class="type">PDFProcessor</span>:
+    <span class="keyword">def</span> <span class="function">__init__</span>(<span class="keyword">self</span>, pdf_bytes: <span class="type">bytes</span>):
+        <span class="keyword">self</span>.pdf_bytes = pdf_bytes
+        <span class="keyword">self</span>._chunks: <span class="type">List</span>[<span class="type">Dict</span>] = []
+        <span class="keyword">self</span>._nlp = ensure_spacy_model(<span class="string">"en_core_web_sm"</span>)
+        <span class="comment"># spaCy model for sentence boundary detection</span>
+                                </div>
+                            </div>
+
+                            <div class="key-points">
+                                <div class="key-point">
+                                    <span class="key-point-icon" style="background: rgba(88, 166, 255, 0.2);">🔑</span>
+                                    <div class="key-point-text">
+                                        <h5>PyMuPDF (fitz) for PDF Parsing</h5>
+                                        <p>We use PyMuPDF to extract text blocks with their bounding box coordinates</p>
+                                    </div>
+                                </div>
+                                <div class="key-point">
+                                    <span class="key-point-icon" style="background: rgba(63, 185, 80, 0.2);">🔑</span>
+                                    <div class="key-point-text">
+                                        <h5>spaCy for NLP</h5>
+                                        <p>The en_core_web_sm model detects sentence boundaries for intelligent chunking</p>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Step 2: Chunking -->
+                <div class="step-content" id="step-2">
+                    <div class="step-card">
+                        <div class="step-header">
+                            <h2>
+                                <span class="step-icon" style="background: linear-gradient(135deg, #3fb950, #238636);">✂️</span>
+                                Adaptive Sentence-Based Chunking
+                            </h2>
+                        </div>
+                        <div class="step-body">
+                            <p class="step-description">
+                                Documents are split into semantically meaningful chunks using our <code>AdaptiveSentenceChunker</code>.
+                                Unlike fixed-size chunking, we respect sentence boundaries and adapt chunk size based on content density.
+                                This ensures chunks are coherent and don't cut off mid-sentence.
+                            </p>
+
+                            <div class="visual-box">
+                                <div class="visual-title">Chunking Parameters</div>
+                                <table class="metadata-table">
+                                    <tr>
+                                        <th>Parameter</th>
+                                        <th>Value</th>
+                                        <th>Purpose</th>
+                                    </tr>
+                                    <tr>
+                                        <td>Min Characters</td>
+                                        <td><span class="badge badge-blue">450</span></td>
+                                        <td>Minimum chunk size for meaningful context</td>
+                                    </tr>
+                                    <tr>
+                                        <td>Max Characters</td>
+                                        <td><span class="badge badge-blue">900</span></td>
+                                        <td>Maximum chunk size to avoid embedding dilution</td>
+                                    </tr>
+                                    <tr>
+                                        <td>Min Sentences</td>
+                                        <td><span class="badge badge-green">3</span></td>
+                                        <td>Ensure sufficient semantic context</td>
+                                    </tr>
+                                    <tr>
+                                        <td>Max Sentences</td>
+                                        <td><span class="badge badge-green">8</span></td>
+                                        <td>Cap to maintain chunk relevance</td>
+                                    </tr>
+                                    <tr>
+                                        <td>Overlap Ratio</td>
+                                        <td><span class="badge badge-purple">20%</span></td>
+                                        <td>Sentence overlap for context continuity</td>
+                                    </tr>
+                                </table>
+                            </div>
+
+                            <div class="code-block">
+                                <div class="code-header">
+                                    <span class="code-title">
+                                        <span class="dot" style="background: var(--accent-green);"></span>
+                                        rag/chunking.py - AdaptiveSentenceChunker
+                                    </span>
+                                </div>
+                                <div class="code-content">
+<span class="comment"># Process text with spaCy to get sentences</span>
+doc = <span class="keyword">self</span>._nlp(text)
+all_sentences = [sent <span class="keyword">for</span> sent <span class="keyword">in</span> doc.sents]
+
+<span class="comment"># Split by structural headers (ARTICLE, Section, ANNEX)</span>
+sentence_groups = <span class="keyword">self</span>._split_sentences_on_headers(all_sentences)
+
+<span class="comment"># Build chunks respecting character and sentence bounds</span>
+<span class="keyword">while</span> cursor < total_sentences:
+    <span class="comment"># Keep adding until min_chars reached</span>
+    <span class="keyword">while</span> char_count < <span class="keyword">self</span>.target_min_chars:
+        buffer.append(sentences[cursor])
+
+    chunk_payload = {
+        <span class="string">"chunk_id"</span>: f<span class="string">"chunk_{chunk_id_counter}"</span>,
+        <span class="string">"text"</span>: chunk_text,
+        <span class="string">"sentence_span"</span>: (start_idx, end_idx),
+    }
+                                </div>
+                            </div>
+
+                            <div class="key-points">
+                                <div class="key-point">
+                                    <span class="key-point-icon" style="background: rgba(163, 113, 247, 0.2);">📐</span>
+                                    <div class="key-point-text">
+                                        <h5>Header-Aware Splitting</h5>
+                                        <p>Chunks never span across ARTICLE, Section, ANNEX, or SCHEDULE boundaries</p>
+                                    </div>
+                                </div>
+                                <div class="key-point">
+                                    <span class="key-point-icon" style="background: rgba(210, 153, 34, 0.2);">🔄</span>
+                                    <div class="key-point-text">
+                                        <h5>Overlap for Continuity</h5>
+                                        <p>20% overlap ensures phrases spanning chunk boundaries can still be found</p>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Step 3: Metadata & BBox -->
+                <div class="step-content" id="step-3">
+                    <div class="step-card">
+                        <div class="step-header">
+                            <h2>
+                                <span class="step-icon" style="background: linear-gradient(135deg, #a371f7, #8957e5);">📋</span>
+                                Metadata Extraction & Bounding Boxes
+                            </h2>
+                        </div>
+                        <div class="step-body">
+                            <p class="step-description">
+                                Each chunk is enriched with hierarchical metadata (Article/Section structure) and
+                                <strong>bounding box coordinates</strong> from the original PDF. The bounding boxes are
+                                <em>critical</em> for highlighting - they tell us exactly where on the page the chunk text appears.
+                            </p>
+
+                            <div class="visual-box">
+                                <div class="visual-title">Chunk Data Structure</div>
+                                <div class="chunk-example">
+{
+  <span style="color: var(--accent-blue);">"chunk_id"</span>: "chunk_42",
+  <span style="color: var(--accent-blue);">"text"</span>: "The Borrower shall pay interest...",
+  <span style="color: var(--accent-blue);">"page_num"</span>: 5,
+  <span style="color: var(--accent-orange);">"bboxes"</span>: [
+    <span class="highlight">fitz.Rect(72.0, 234.5, 540.0, 278.3)</span>,
+    <span class="highlight">fitz.Rect(72.0, 278.3, 540.0, 312.1)</span>
+  ],
+  <span style="color: var(--accent-purple);">"metadata"</span>: {
+    "article_type": "Article",
+    "article_number": "II",
+    "article_title": "Interest and Fees",
+    "section_number": "Section 2.07",
+    "section_title": "Default Rate Interest",
+    "hierarchy_path": ["Article II - Interest", "Section 2.07"]
+  }
+}
+                                </div>
+                            </div>
+
+                            <div class="code-block">
+                                <div class="code-header">
+                                    <span class="code-title">
+                                        <span class="dot" style="background: var(--accent-purple);"></span>
+                                        BBox Mapping Logic
+                                    </span>
+                                </div>
+                                <div class="code-content">
+<span class="comment"># Extract text blocks with coordinates from PyMuPDF</span>
+blocks = page.get_text(<span class="string">"blocks"</span>, sort=<span class="keyword">True</span>)
+
+<span class="keyword">for</span> b <span class="keyword">in</span> blocks:
+    block_bbox = fitz.<span class="type">Rect</span>(b[<span class="number">0</span>], b[<span class="number">1</span>], b[<span class="number">2</span>], b[<span class="number">3</span>])
+    char_pos_to_bbox_map.append(
+        (start_offset, end_offset, block_bbox)
+    )
+
+<span class="comment"># Map sentence spans to overlapping block bboxes</span>
+<span class="keyword">for</span> block_start, block_end, block_bbox <span class="keyword">in</span> char_pos_to_bbox_map:
+    <span class="keyword">if</span> overlap(block_start, block_end, chunk_start, chunk_end):
+        chunk_associated_bboxes.append(block_bbox)
+                                </div>
+                            </div>
+
+                            <div class="key-points">
+                                <div class="key-point">
+                                    <span class="key-point-icon" style="background: rgba(248, 81, 73, 0.2);">📍</span>
+                                    <div class="key-point-text">
+                                        <h5>Character-to-BBox Mapping</h5>
+                                        <p>We track character offsets to map sentence spans back to PDF block coordinates</p>
+                                    </div>
+                                </div>
+                                <div class="key-point">
+                                    <span class="key-point-icon" style="background: rgba(57, 197, 207, 0.2);">🏛️</span>
+                                    <div class="key-point-text">
+                                        <h5>DocumentStructureTracker</h5>
+                                        <p>Parses headers to build a hierarchy: Article → Section → Subsection</p>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Step 4: Embeddings -->
+                <div class="step-content" id="step-4">
+                    <div class="step-card">
+                        <div class="step-header">
+                            <h2>
+                                <span class="step-icon" style="background: linear-gradient(135deg, #d29922, #bb8009);">🔢</span>
+                                Vector Embeddings
+                            </h2>
+                        </div>
+                        <div class="step-body">
+                            <p class="step-description">
+                                Each chunk is converted into a high-dimensional vector (embedding) using the
+                                <strong>Databricks Embedding API</strong>. These vectors capture semantic meaning,
+                                allowing us to find chunks that are conceptually similar to the user's query,
+                                not just keyword matches.
+                            </p>
+
+                            <div class="flow-diagram">
+                                <div class="flow-item">
+                                    <span class="icon" style="background: var(--accent-orange);">📝</span>
+                                    <div>
+                                        <strong>Chunk Text + Metadata Context</strong>
+                                        <p style="color: var(--text-secondary); font-size: 0.85rem;">"Article II - Section 2.07: The Borrower shall pay..."</p>
+                                    </div>
+                                </div>
+                                <div class="flow-arrow">↓</div>
+                                <div class="flow-item">
+                                    <span class="icon" style="background: var(--accent-blue);">🤖</span>
+                                    <div>
+                                        <strong>DatabricksEmbeddingModel.encode()</strong>
+                                        <p style="color: var(--text-secondary); font-size: 0.85rem;">API call to Databricks embedding endpoint</p>
+                                    </div>
+                                </div>
+                                <div class="flow-arrow">↓</div>
+                                <div class="flow-item">
+                                    <span class="icon" style="background: var(--accent-green);">📊</span>
+                                    <div>
+                                        <strong>Vector: [0.023, -0.156, 0.089, ...]</strong>
+                                        <p style="color: var(--text-secondary); font-size: 0.85rem;">High-dimensional semantic representation</p>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="code-block">
+                                <div class="code-header">
+                                    <span class="code-title">
+                                        <span class="dot" style="background: var(--accent-orange);"></span>
+                                        models/embedding.py
+                                    </span>
+                                </div>
+                                <div class="code-content">
+<span class="comment"># Embeddings are cached in session_state after first computation</span>
+chunk_embeddings = model.encode(
+    valid_chunk_texts,
+    convert_to_tensor=<span class="keyword">False</span>,  <span class="comment"># Return numpy array</span>
+    show_progress_bar=<span class="keyword">False</span>
+)
+
+<span class="comment"># Store precomputed embeddings for reuse</span>
+st.session_state[<span class="string">"chunk_embeddings"</span>] = chunk_embeddings
+st.session_state[<span class="string">"valid_chunk_indices"</span>] = valid_chunk_indices
+                                </div>
+                            </div>
+
+                            <div class="visual-box">
+                                <div class="visual-title">Why Embed Metadata?</div>
+                                <p style="color: var(--text-secondary); margin-bottom: 1rem;">
+                                    We prepend hierarchical metadata to chunk text before embedding. This helps the model
+                                    understand document structure and improves retrieval when queries reference specific sections.
+                                </p>
+                                <div class="chunk-example">
+<span style="color: var(--accent-purple);">format_chunk_with_metadata(chunk):</span>
+<span style="color: var(--text-secondary);">Input:</span>  "The Borrower shall pay interest..."
+<span style="color: var(--text-secondary);">Output:</span> <span class="highlight">"Article II - Section 2.07:</span> The Borrower shall pay interest..."
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Step 5: RAG Retrieval -->
+                <div class="step-content" id="step-5">
+                    <div class="step-card">
+                        <div class="step-header">
+                            <h2>
+                                <span class="step-icon" style="background: linear-gradient(135deg, #58a6ff, #1f6feb);">🔍</span>
+                                Hybrid RAG Retrieval (BM25 + Semantic)
+                            </h2>
+                        </div>
+                        <div class="step-body">
+                            <p class="step-description">
+                                We use a <strong>hybrid retrieval</strong> strategy combining lexical (BM25) and semantic search.
+                                BM25 excels at exact keyword matching while semantic search captures meaning.
+                                Scores are normalized and combined using configurable weights.
+                            </p>
+
+                            <div class="visual-box">
+                                <div class="visual-title">Retrieval Configuration</div>
+                                <table class="metadata-table">
+                                    <tr>
+                                        <th>Parameter</th>
+                                        <th>Value</th>
+                                        <th>Description</th>
+                                    </tr>
+                                    <tr>
+                                        <td>Candidate Pool</td>
+                                        <td><span class="badge badge-blue">25</span></td>
+                                        <td>Initial candidates retrieved before reranking</td>
+                                    </tr>
+                                    <tr>
+                                        <td>Final Top-K</td>
+                                        <td><span class="badge badge-green">15</span></td>
+                                        <td>Chunks sent to LLM after reranking</td>
+                                    </tr>
+                                    <tr>
+                                        <td>BM25 Weight</td>
+                                        <td><span class="badge badge-orange">0.5</span></td>
+                                        <td>Weight for lexical matching</td>
+                                    </tr>
+                                    <tr>
+                                        <td>Semantic Weight</td>
+                                        <td><span class="badge badge-purple">0.5</span></td>
+                                        <td>Weight for embedding similarity</td>
+                                    </tr>
+                                </table>
+                            </div>
+
+                            <div class="code-block">
+                                <div class="code-header">
+                                    <span class="code-title">
+                                        <span class="dot" style="background: var(--accent-blue);"></span>
+                                        rag/retrieval.py - Hybrid Search
+                                    </span>
+                                </div>
+                                <div class="code-content">
+<span class="comment"># 1. BM25 Lexical Search</span>
+tokenized_corpus = [text.lower().split() <span class="keyword">for</span> text <span class="keyword">in</span> chunk_texts]
+bm25 = <span class="type">BM25Okapi</span>(tokenized_corpus)
+bm25_scores = bm25.get_scores(tokenized_query)
+
+<span class="comment"># 2. Semantic Search (Cosine Similarity)</span>
+query_embedding = model.encode(prompt)
+cosine_scores = numpy_cos_sim(query_embedding, chunk_embeddings)
+
+<span class="comment"># 3. Combine with Weights</span>
+<span class="keyword">for</span> idx <span class="keyword">in</span> combined_candidates:
+    bm25_component = normalized_bm25[idx] * bm25_weight
+    semantic_component = semantic_scores[idx] * semantic_weight
+    final_score = bm25_component + semantic_component
+                                </div>
+                            </div>
+
+                            <div class="visual-box">
+                                <div class="visual-title">Score Combination Example</div>
+                                <div class="score-bar">
+                                    <span class="score-label">BM25 Score</span>
+                                    <div class="score-track">
+                                        <div class="score-fill" style="width: 72%; background: var(--accent-orange);"></div>
+                                    </div>
+                                    <span class="score-value" style="color: var(--accent-orange);">0.72</span>
+                                </div>
+                                <div class="score-bar">
+                                    <span class="score-label">Semantic Score</span>
+                                    <div class="score-track">
+                                        <div class="score-fill" style="width: 85%; background: var(--accent-purple);"></div>
+                                    </div>
+                                    <span class="score-value" style="color: var(--accent-purple);">0.85</span>
+                                </div>
+                                <div class="score-bar">
+                                    <span class="score-label">Combined</span>
+                                    <div class="score-track">
+                                        <div class="score-fill" style="width: 78.5%; background: var(--accent-green);"></div>
+                                    </div>
+                                    <span class="score-value" style="color: var(--accent-green);">0.785</span>
+                                </div>
+                                <p style="color: var(--text-secondary); font-size: 0.8rem; margin-top: 1rem;">
+                                    (0.72 × 0.5) + (0.85 × 0.5) = 0.785
+                                </p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Step 6: Reranking -->
+                <div class="step-content" id="step-6">
+                    <div class="step-card">
+                        <div class="step-header">
+                            <h2>
+                                <span class="step-icon" style="background: linear-gradient(135deg, #f85149, #da3633);">📊</span>
+                                Cross-Encoder Reranking
+                            </h2>
+                        </div>
+                        <div class="step-body">
+                            <p class="step-description">
+                                The top 25 candidates from hybrid retrieval are passed through a <strong>cross-encoder reranker</strong>
+                                (Databricks API). Unlike bi-encoders, cross-encoders jointly process the query and document together,
+                                producing more accurate relevance scores at the cost of higher latency.
+                            </p>
+
+                            <div class="flow-diagram">
+                                <div class="flow-item">
+                                    <span class="icon" style="background: var(--accent-blue);">📥</span>
+                                    <div>
+                                        <strong>25 Candidate Chunks</strong>
+                                        <p style="color: var(--text-secondary); font-size: 0.85rem;">From hybrid BM25 + Semantic retrieval</p>
+                                    </div>
+                                </div>
+                                <div class="flow-arrow">↓</div>
+                                <div class="flow-item">
+                                    <span class="icon" style="background: var(--accent-red);">⚖️</span>
+                                    <div>
+                                        <strong>Databricks Reranker API</strong>
+                                        <p style="color: var(--text-secondary); font-size: 0.85rem;">Cross-encoder with 512 token limit per pair</p>
+                                    </div>
+                                </div>
+                                <div class="flow-arrow">↓</div>
+                                <div class="flow-item">
+                                    <span class="icon" style="background: var(--accent-green);">🏆</span>
+                                    <div>
+                                        <strong>Top 15 Reranked Chunks</strong>
+                                        <p style="color: var(--text-secondary); font-size: 0.85rem;">Sorted by reranker confidence score</p>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="code-block">
+                                <div class="code-header">
+                                    <span class="code-title">
+                                        <span class="dot" style="background: var(--accent-red);"></span>
+                                        Reranking Logic
+                                    </span>
+                                </div>
+                                <div class="code-content">
+<span class="comment"># Prepare query-document pairs for reranking</span>
+rerank_pairs = []
+<span class="keyword">for</span> chunk_index <span class="keyword">in</span> combined_indices:
+    chunk_text = _get_chunk_search_text(chunks[chunk_index])
+    rerank_pairs.append([prompt, chunk_text])
+
+<span class="comment"># Get reranker scores</span>
+rerank_scores = reranker_model.predict(rerank_pairs)
+
+<span class="comment"># Selection policy: minimum 15 non-zero, all if score > 0.75</span>
+MIN_SEND = <span class="number">15</span>
+HIGH_SCORE_THRESHOLD = <span class="number">0.75</span>
+
+<span class="keyword">if</span> len(high_results) >= MIN_SEND:
+    selected = high_results  <span class="comment"># All high-confidence items</span>
+                                </div>
+                            </div>
+
+                            <div class="key-points">
+                                <div class="key-point">
+                                    <span class="key-point-icon" style="background: rgba(248, 81, 73, 0.2);">⏱️</span>
+                                    <div class="key-point-text">
+                                        <h5>Token Truncation</h5>
+                                        <p>512 token limit with proportional allocation between query and document</p>
+                                    </div>
+                                </div>
+                                <div class="key-point">
+                                    <span class="key-point-icon" style="background: rgba(88, 166, 255, 0.2);">🔄</span>
+                                    <div class="key-point-text">
+                                        <h5>LLM Fallback</h5>
+                                        <p>If Databricks API fails, we fall back to LLM-based reranking (no token limits)</p>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Step 7: LLM Analysis -->
+                <div class="step-content" id="step-7">
+                    <div class="step-card">
+                        <div class="step-header">
+                            <h2>
+                                <span class="step-icon" style="background: linear-gradient(135deg, #39c5cf, #1a7f8e);">🤖</span>
+                                LLM Analysis with Grounded Citations
+                            </h2>
+                        </div>
+                        <div class="step-body">
+                            <p class="step-description">
+                                The reranked chunks are formatted with their metadata and sent to the <strong>Databricks LLM</strong>
+                                (databricks-llama-4-maverick). The LLM is instructed to answer the query using
+                                <em>only</em> information from the provided chunks and cite supporting quotes verbatim.
+                            </p>
+
+                            <div class="visual-box">
+                                <div class="visual-title">LLM Prompt Structure</div>
+                                <div class="chunk-example">
+<span style="color: var(--accent-cyan);">SYSTEM:</span> You are a document analyst. Answer based ONLY on the
+provided document excerpts. Cite supporting phrases exactly.
+
+<span style="color: var(--accent-green);">USER:</span>
+Question: What are the default interest provisions?
+
+<span style="color: var(--accent-orange);">--- DOCUMENT EXCERPTS ---</span>
+
+<span style="color: var(--accent-purple);">CHUNK_INDEX: 42</span>
+CHUNK_ID: chunk_42
+LOCATION: Article II - Section 2.07 - Default Rate Interest
+PAGE_NUMBER: 6
+TEXT:
+Upon the occurrence of any Event of Default, the
+interest rate shall increase by 2.00% per annum...
+
+<span style="color: var(--accent-purple);">CHUNK_INDEX: 43</span>
+...
+                                </div>
+                            </div>
+
+                            <div class="code-block">
+                                <div class="code-header">
+                                    <span class="code-title">
+                                        <span class="dot" style="background: var(--accent-cyan);"></span>
+                                        Expected JSON Response
+                                    </span>
+                                </div>
+                                <div class="code-content">
+{
+  <span class="string">"analysis_summary"</span>: <span class="string">"The agreement specifies that upon..."</span>,
+  <span class="string">"supporting_quotes"</span>: [
+    <span class="string">"interest rate shall increase by 2.00% per annum"</span>,
+    <span class="string">"default rate applies to all outstanding amounts"</span>
+  ],
+  <span class="string">"analysis_context"</span>: {
+    <span class="string">"chunks_used"</span>: [<span class="number">42</span>, <span class="number">43</span>],
+    <span class="string">"confidence"</span>: <span class="string">"high"</span>
+  }
+}
+                                </div>
+                            </div>
+
+                            <div class="key-points">
+                                <div class="key-point">
+                                    <span class="key-point-icon" style="background: rgba(57, 197, 207, 0.2);">📝</span>
+                                    <div class="key-point-text">
+                                        <h5>Verbatim Quotes Required</h5>
+                                        <p>LLM must quote exact text from chunks - this enables verification later</p>
+                                    </div>
+                                </div>
+                                <div class="key-point">
+                                    <span class="key-point-icon" style="background: rgba(163, 113, 247, 0.2);">🔗</span>
+                                    <div class="key-point-text">
+                                        <h5>Chunk Index Reference</h5>
+                                        <p>Each chunk has a unique index - LLM can reference which chunks it used</p>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Step 8: Verification -->
+                <div class="step-content" id="step-8">
+                    <div class="step-card">
+                        <div class="step-header">
+                            <h2>
+                                <span class="step-icon" style="background: linear-gradient(135deg, #a371f7, #8957e5);">✅</span>
+                                Citation Verification
+                            </h2>
+                        </div>
+                        <div class="step-body">
+                            <p class="step-description">
+                                The <code>verify_and_locate_phrases()</code> method extracts all supporting quotes from the
+                                LLM response and verifies they actually exist in the source chunks. We use fuzzy matching
+                                (thefuzz library) to handle minor variations from LLM paraphrasing.
+                            </p>
+
+                            <div class="visual-box">
+                                <div class="visual-title">Verification Process</div>
+                                <div class="flow-diagram" style="padding: 1rem;">
+                                    <div class="flow-item">
+                                        <span class="icon" style="background: var(--accent-purple);">📤</span>
+                                        <div>
+                                            <strong>Extract supporting_quotes from LLM JSON</strong>
+                                        </div>
+                                    </div>
+                                    <div class="flow-arrow">↓</div>
+                                    <div class="flow-item">
+                                        <span class="icon" style="background: var(--accent-blue);">🔍</span>
+                                        <div>
+                                            <strong>For each quote: fuzzy match against all chunks</strong>
+                                            <p style="color: var(--text-secondary); font-size: 0.85rem;">Using fuzz.partial_ratio and fuzz.token_set_ratio</p>
+                                        </div>
+                                    </div>
+                                    <div class="flow-arrow">↓</div>
+                                    <div class="flow-item">
+                                        <span class="icon" style="background: var(--accent-green);">📍</span>
+                                        <div>
+                                            <strong>If match found: locate exact position in PDF</strong>
+                                            <p style="color: var(--text-secondary); font-size: 0.85rem;">Using chunk's bounding boxes as search clip region</p>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="code-block">
+                                <div class="code-header">
+                                    <span class="code-title">
+                                        <span class="dot" style="background: var(--accent-purple);"></span>
+                                        Fuzzy Matching Logic
+                                    </span>
+                                </div>
+                                <div class="code-content">
+FUZZY_MATCH_THRESHOLD = <span class="number">80</span>  <span class="comment"># Configurable threshold</span>
+
+<span class="keyword">for</span> chunk, norm_chunk_text <span class="keyword">in</span> normalized_chunks:
+    <span class="comment"># Try multiple fuzzy methods</span>
+    partial_score = fuzz.partial_ratio(normalized_phrase, norm_chunk_text)
+    token_set_score = fuzz.token_set_ratio(normalized_phrase, norm_chunk_text)
+
+    score = max(partial_score, token_set_score)
+
+    <span class="keyword">if</span> score >= FUZZY_MATCH_THRESHOLD:
+        verification_results[phrase] = <span class="keyword">True</span>
+        <span class="comment"># Now find exact location within the chunk's bboxes</span>
+        exact_hits = _find_exact_matches(
+            page=page,
+            clip_rect=clip_rect,  <span class="comment"># From chunk bboxes</span>
+            original_phrase=phrase
+        )
+                                </div>
+                            </div>
+
+                            <div class="key-points">
+                                <div class="key-point">
+                                    <span class="key-point-icon" style="background: rgba(63, 185, 80, 0.2);">🎯</span>
+                                    <div class="key-point-text">
+                                        <h5>Multi-Strategy Matching</h5>
+                                        <p>partial_ratio for substring matching, token_set_ratio for word-order variations</p>
+                                    </div>
+                                </div>
+                                <div class="key-point">
+                                    <span class="key-point-icon" style="background: rgba(210, 153, 34, 0.2);">📄</span>
+                                    <div class="key-point-text">
+                                        <h5>Cross-Page Handling</h5>
+                                        <p>If phrase spans two pages, we try combining adjacent chunks</p>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Step 9: Highlighting -->
+                <div class="step-content" id="step-9">
+                    <div class="step-card">
+                        <div class="step-header">
+                            <h2>
+                                <span class="step-icon" style="background: linear-gradient(135deg, #ffd700, #ffa500);">🖍️</span>
+                                PDF Highlighting & Annotation
+                            </h2>
+                        </div>
+                        <div class="step-body">
+                            <p class="step-description">
+                                Finally, verified phrases are highlighted in the PDF using PyMuPDF's annotation API.
+                                We try multiple search strategies to find the <em>exact</em> location within the chunk's
+                                bounding box region, then fall back to highlighting the entire chunk if needed.
+                            </p>
+
+                            <div class="visual-box">
+                                <div class="visual-title">Highlight Method Priority</div>
+                                <table class="metadata-table">
+                                    <tr>
+                                        <th>Priority</th>
+                                        <th>Method</th>
+                                        <th>Description</th>
+                                    </tr>
+                                    <tr>
+                                        <td><span class="badge badge-green">0</span></td>
+                                        <td>exact_*_search</td>
+                                        <td>Exact text match with various normalizations</td>
+                                    </tr>
+                                    <tr>
+                                        <td><span class="badge badge-blue">1</span></td>
+                                        <td>fuzzy_span_match</td>
+                                        <td>Sliding window fuzzy match within chunk</td>
+                                    </tr>
+                                    <tr>
+                                        <td><span class="badge badge-orange">2</span></td>
+                                        <td>cross_page_fuzzy_match</td>
+                                        <td>Match spans adjacent page boundary</td>
+                                    </tr>
+                                    <tr>
+                                        <td><span class="badge badge-purple">3</span></td>
+                                        <td>fuzzy_chunk_fallback_individual</td>
+                                        <td>Highlight individual chunk bboxes</td>
+                                    </tr>
+                                    <tr>
+                                        <td><span class="badge" style="background: rgba(248, 81, 73, 0.2); color: var(--accent-red);">4</span></td>
+                                        <td>fuzzy_chunk_fallback</td>
+                                        <td>Highlight combined chunk region</td>
+                                    </tr>
+                                </table>
+                            </div>
+
+                            <div class="code-block">
+                                <div class="code-header">
+                                    <span class="code-title">
+                                        <span class="dot" style="background: #ffd700;"></span>
+                                        Highlight Annotation Code
+                                    </span>
+                                </div>
+                                <div class="code-content">
+<span class="comment"># Search within chunk's bounding box region</span>
+clip_rect = fitz.<span class="type">Rect</span>()
+<span class="keyword">for</span> bbox <span class="keyword">in</span> chunk.get(<span class="string">'bboxes'</span>, []):
+    clip_rect.include_rect(bbox)
+
+<span class="comment"># Try exact search first</span>
+search_hits = page.search_for(
+    candidate,
+    clip=clip_rect,  <span class="comment"># Constrain to chunk region!</span>
+    flags=TEXT_DEHYPHENATE | TEXT_IGNORECASE
+)
+
+<span class="comment"># Add highlight annotation</span>
+<span class="keyword">if</span> search_hits:
+    highlight = page.add_highlight_annot(rect)
+    highlight.set_colors(stroke=[<span class="number">1</span>, <span class="number">0.9</span>, <span class="number">0.3</span>])  <span class="comment"># Yellow</span>
+    highlight.set_info(content=f<span class="string">"Verified: {phrase}"</span>)
+    highlight.update(opacity=<span class="number">0.4</span>)
+                                </div>
+                            </div>
+
+                            <div class="key-points">
+                                <div class="key-point">
+                                    <span class="key-point-icon" style="background: rgba(255, 215, 0, 0.2);">🎨</span>
+                                    <div class="key-point-text">
+                                        <h5>Color Coding</h5>
+                                        <p>Yellow = exact match, Light Blue = fallback (chunk region)</p>
+                                    </div>
+                                </div>
+                                <div class="key-point">
+                                    <span class="key-point-icon" style="background: rgba(57, 197, 207, 0.2);">💬</span>
+                                    <div class="key-point-text">
+                                        <h5>Annotation Info</h5>
+                                        <p>Each highlight includes the verified phrase and match score in tooltip</p>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </main>
+
+            <!-- Sidebar -->
+            <aside class="sidebar">
+                <div class="sidebar-card">
+                    <div class="sidebar-header">
+                        <h3>Pipeline Overview</h3>
+                    </div>
+                    <div class="pipeline-visual">
+                        <div class="pipeline-step current" onclick="showStep(1)">
+                            <span class="pipeline-dot"></span>
+                            <div class="pipeline-info">
+                                <h4>Document Upload</h4>
+                                <p>PDF/DOCX → PDFProcessor</p>
+                            </div>
+                        </div>
+                        <div class="pipeline-step" onclick="showStep(2)">
+                            <span class="pipeline-dot"></span>
+                            <div class="pipeline-info">
+                                <h4>Chunking</h4>
+                                <p>Adaptive sentence-based</p>
+                            </div>
+                        </div>
+                        <div class="pipeline-step" onclick="showStep(3)">
+                            <span class="pipeline-dot"></span>
+                            <div class="pipeline-info">
+                                <h4>Metadata & BBox</h4>
+                                <p>Structure + coordinates</p>
+                            </div>
+                        </div>
+                        <div class="pipeline-step" onclick="showStep(4)">
+                            <span class="pipeline-dot"></span>
+                            <div class="pipeline-info">
+                                <h4>Embeddings</h4>
+                                <p>Databricks API vectors</p>
+                            </div>
+                        </div>
+                        <div class="pipeline-step" onclick="showStep(5)">
+                            <span class="pipeline-dot"></span>
+                            <div class="pipeline-info">
+                                <h4>RAG Retrieval</h4>
+                                <p>Hybrid BM25 + Semantic</p>
+                            </div>
+                        </div>
+                        <div class="pipeline-step" onclick="showStep(6)">
+                            <span class="pipeline-dot"></span>
+                            <div class="pipeline-info">
+                                <h4>Reranking</h4>
+                                <p>Cross-encoder scoring</p>
+                            </div>
+                        </div>
+                        <div class="pipeline-step" onclick="showStep(7)">
+                            <span class="pipeline-dot"></span>
+                            <div class="pipeline-info">
+                                <h4>LLM Analysis</h4>
+                                <p>Grounded responses</p>
+                            </div>
+                        </div>
+                        <div class="pipeline-step" onclick="showStep(8)">
+                            <span class="pipeline-dot"></span>
+                            <div class="pipeline-info">
+                                <h4>Verification</h4>
+                                <p>Fuzzy citation matching</p>
+                            </div>
+                        </div>
+                        <div class="pipeline-step" onclick="showStep(9)">
+                            <span class="pipeline-dot"></span>
+                            <div class="pipeline-info">
+                                <h4>Highlighting</h4>
+                                <p>PDF annotation</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="sidebar-card" style="margin-top: 1rem;">
+                    <div class="sidebar-header">
+                        <h3>Key Insight</h3>
+                    </div>
+                    <div id="key-insight-content" style="padding: 1.5rem;">
+                        <p style="color: var(--text-secondary); font-size: 0.9rem; line-height: 1.7;">
+                            The <strong style="color: var(--accent-blue);">process_file_wrapper</strong> function
+                            orchestrates the entire pipeline. It's the single entry point that coordinates document parsing,
+                            chunking, embedding, and caching—ensuring all downstream steps have consistent data.
+                        </p>
+                        <p style="color: var(--text-secondary); font-size: 0.9rem; line-height: 1.7; margin-top: 1rem;">
+                            Using PyMuPDF for parsing gives us access to both text content and precise coordinate data
+                            from the very first step.
+                        </p>
+                    </div>
+                </div>
+            </aside>
+        </div>
+
+        <footer>
+            <p>SmartDocs RAG Pipeline Visualization | Built for technical deep-dives</p>
+        </footer>
+    </div>
+
+    <script>
+        // Key insights for each step
+        const keyInsights = {
+            1: {
+                title: "process_file_wrapper",
+                text: "orchestrates the entire pipeline. It's the single entry point that coordinates document parsing, chunking, embedding, and caching—ensuring all downstream steps have consistent data.",
+                extra: "Using PyMuPDF for parsing gives us access to both text content and precise coordinate data from the very first step."
+            },
+            2: {
+                title: "Sentence boundary detection",
+                text: "is crucial for semantic coherence. Unlike fixed-size chunking that can cut off mid-thought, our adaptive approach respects natural language boundaries and document structure.",
+                extra: "The 20% overlap ensures that important phrases spanning chunk boundaries are still discoverable during retrieval."
+            },
+            3: {
+                title: "Bounding boxes (bboxes)",
+                text: "are the critical link that enables grounding. They're captured during chunking, preserved through retrieval, and finally used to constrain where we search for phrases in the PDF.",
+                extra: "Without bboxes, we'd have to search the entire page for each phrase, leading to false positives when the same text appears multiple times."
+            },
+            4: {
+                title: "Metadata-enriched embeddings",
+                text: "improve retrieval accuracy. By prepending section hierarchy (Article/Section) to chunk text before embedding, queries referencing specific sections naturally match the right chunks.",
+                extra: "Embeddings are cached in session_state after first computation, so subsequent queries against the same document don't recompute them."
+            },
+            5: {
+                title: "Hybrid retrieval",
+                text: "combines the best of both worlds. BM25 catches exact keyword matches (dates, names, specific terms) while semantic search captures conceptual similarity even with different wording.",
+                extra: "Dynamic channeling adjusts BM25/semantic weights based on query characteristics—keyword-heavy queries get higher BM25 weight automatically."
+            },
+            6: {
+                title: "Cross-encoder reranking",
+                text: "dramatically improves precision. Unlike bi-encoders that encode query and document separately, cross-encoders process them jointly, capturing nuanced interactions between them.",
+                extra: "The 512 token limit is handled via proportional truncation—allocating tokens between query and document based on their relative lengths."
+            },
+            7: {
+                title: "Grounded generation",
+                text: "ensures factual accuracy. By requiring the LLM to cite verbatim quotes from chunks, we create an auditable trail from claim to source that can be verified programmatically.",
+                extra: "The chunk index reference in the response lets us trace exactly which chunks informed each part of the answer."
+            },
+            8: {
+                title: "Fuzzy matching",
+                text: "accounts for LLM paraphrasing. Even when the model slightly rephrases a quote, thefuzz library's partial_ratio and token_set_ratio algorithms can still find the source text.",
+                extra: "Multi-strategy matching tries exact match first, then progressively looser fuzzy matches—ensuring high precision while maximizing recall."
+            },
+            9: {
+                title: "Constrained search regions",
+                text: "prevent false highlights. By searching only within the chunk's bounding box region, we avoid highlighting the same phrase that might appear elsewhere in the document.",
+                extra: "Color coding (yellow for exact, light blue for fallback) gives users visual feedback about highlight confidence."
+            }
+        };
+
+        function updateKeyInsight(stepNum) {
+            const insight = keyInsights[stepNum];
+            const container = document.getElementById('key-insight-content');
+            container.innerHTML = `
+                <p style="color: var(--text-secondary); font-size: 0.9rem; line-height: 1.7;">
+                    The <strong style="color: var(--accent-blue);">${insight.title}</strong> ${insight.text}
+                </p>
+                <p style="color: var(--text-secondary); font-size: 0.9rem; line-height: 1.7; margin-top: 1rem;">
+                    ${insight.extra}
+                </p>
+            `;
+        }
+
+        function showStep(stepNum) {
+            // Hide all step contents
+            document.querySelectorAll('.step-content').forEach(el => {
+                el.classList.remove('active');
+            });
+
+            // Show selected step
+            document.getElementById(`step-${stepNum}`).classList.add('active');
+
+            // Update nav buttons
+            document.querySelectorAll('.nav-btn').forEach((btn, index) => {
+                btn.classList.remove('active');
+                if (index === stepNum - 1) {
+                    btn.classList.add('active');
+                }
+            });
+
+            // Update sidebar pipeline steps
+            document.querySelectorAll('.pipeline-step').forEach((step, index) => {
+                step.classList.remove('current', 'completed');
+                if (index === stepNum - 1) {
+                    step.classList.add('current');
+                } else if (index < stepNum - 1) {
+                    step.classList.add('completed');
+                }
+            });
+
+            // Update key insight
+            updateKeyInsight(stepNum);
+        }
+
+        // Keyboard navigation
+        document.addEventListener('keydown', (e) => {
+            const currentStep = document.querySelector('.step-content.active');
+            const currentNum = parseInt(currentStep.id.split('-')[1]);
+
+            if (e.key === 'ArrowRight' && currentNum < 9) {
+                showStep(currentNum + 1);
+            } else if (e.key === 'ArrowLeft' && currentNum > 1) {
+                showStep(currentNum - 1);
+            }
+        });
+    </script>
+</body>
+</html>

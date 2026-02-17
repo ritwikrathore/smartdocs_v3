@@ -11,7 +11,6 @@ requests>=2.32.2
 setuptools==78.1.0
 spacy==3.8.5
 streamlit==1.44.0
-streamlit_pills==0.3.0
 thefuzz==0.22.1
 openpyxl==3.1.5
 transformers==4.50.3

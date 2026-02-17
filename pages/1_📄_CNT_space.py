@@ -11,9 +11,8 @@ from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 import threading
-import streamlit_pills as stp
 import streamlit.components.v1 as components
-from typing import List
+from typing import Any, List
 
 # Note: Page-level `set_page_config` removed to ensure the main app
 # calls `st.set_page_config()` exactly once and as the first Streamlit
@@ -369,7 +368,7 @@ initialize_session_state()
 
 # --- Main Page Logic ---
 
-def process_rag_requests(results: list[dict[str, any]]) -> tuple[list[dict[str, any]], bool]:
+def process_rag_requests(results: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], bool]:
     """
     Process RAG analysis and retry requests from the UI.
 
@@ -1145,7 +1144,7 @@ if st.session_state.get("analysis_results"):
             }, 150); // Increased delay slightly
         </script>
         """
-        st.components.v1.html(js, height=0)
+        components.html(js, height=0)
         st.session_state.results_just_generated = False # Reset flag
 
 else:
@@ -1306,7 +1305,7 @@ else:
                         # Final status update
                         if preprocessing_failed:
                             final_label = f"Preprocessing issues. {success_count}/{len(new_files)} processed. Check messages."
-                            final_state = "warning" if success_count > 0 else "error"
+                            final_state = "error"  # st.status only accepts "running", "complete", or "error"
                         else:
                             final_label = f"Preprocessing complete! {success_count}/{len(new_files)} processed."
                             final_state = "complete"
@@ -1376,11 +1375,10 @@ else:
             suggestion_prompts = [s["prompt"] for s in prompt_suggestions]
             explanations_map = {s["label"]: (s.get("explanation"), s.get("category")) for s in prompt_suggestions}
 
-            selected_pill = stp.pills(
+            selected_pill = st.pills(
                 "Saved Prompts:",
                 suggestion_labels,
-                clearable=True,
-                index=None,  # No default selection
+                default=None,  # No default selection, allows clearing
                 label_visibility="visible"
             )
 
