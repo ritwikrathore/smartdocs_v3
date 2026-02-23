@@ -3,6 +3,7 @@ Tools column display for analysis results.
 """
 
 import streamlit as st
+from streamlit_pdf_viewer import pdf_viewer
 import base64
 import json
 import zipfile
@@ -483,10 +484,11 @@ def display_tools_column(results_with_real_analysis: List, tools_col):
                             st.error(f"❌ Error extracting facts: {_fd_err}")
                             logger.error(f"Fact extraction error: {_fd_err}", exc_info=True)
 
-                if st.session_state.get("facts_defs_excel"):
+                facts_excel_data = st.session_state.get("facts_defs_excel")
+                if facts_excel_data:
                     st.download_button(
                         label="📥 Export Fact Definitions (Excel)",
-                        data=st.session_state.get("facts_defs_excel"),
+                        data=facts_excel_data,
                         file_name=f"fact_definitions_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         key="download_fact_defs_excel"
@@ -666,13 +668,8 @@ def display_tools_column(results_with_real_analysis: List, tools_col):
 
                             st.caption(f"Page {current_page} of {page_count}")
 
-                            # Render the page
-                            page = fitz_doc.load_page(current_page - 1)  # 0-indexed
-                            pix = page.get_pixmap(dpi=150)
-                            img_bytes = pix.tobytes("png")
-
-                            # Display the page image
-                            st.image(img_bytes, use_container_width=True)
+                            # Display interactive PDF with text selection enabled
+                            pdf_viewer(pdf_bytes, height=600, pages_to_render=[current_page], render_text=True, zoom_level="auto")
 
                     except Exception as e:
                         logger.error(f"Error displaying PDF: {e}")
