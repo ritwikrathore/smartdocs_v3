@@ -128,6 +128,12 @@ USE_DATABRICKS_RERANKER = False  # Use Databricks for reranking
 # Inputs longer than this will be automatically truncated
 RERANKER_MAX_TOKENS = 512  # Maximum token length for the reranker model
 RERANKER_API_TIMEOUT = 60  # Timeout in seconds for reranker API calls at startup
+
+# --- RLM (Recursive Language Model) Configuration ---
+RLM_MAX_ITERATIONS = 15  # Maximum REPL loop iterations before forced synthesis
+RLM_MAX_ERRORS = 5  # Maximum consecutive execution errors before abort
+RLM_STDOUT_TRUNCATE = 2000  # Max chars of stdout to include in history per iteration
+RLM_CONTEXT_PREVIEW_CHARS = 500  # Chars of full_text preview in user prompt
 ENABLE_LLM_RERANKER_FALLBACK = True  # Enable automatic fallback to LLM-based reranker on API failure
 
 # Reranker selection thresholds (configurable)
